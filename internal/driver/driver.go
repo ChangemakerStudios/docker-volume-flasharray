@@ -138,9 +138,9 @@ func (d *Driver) arrayName(dockerName string) string {
 	if san != dockerName || len(name) > 63 {
 		sum := sha1.Sum([]byte(dockerName))
 		suffix := "-" + hex.EncodeToString(sum[:])[:8]
-		max := 63 - len(suffix)
-		if len(name) > max {
-			name = strings.TrimRight(name[:max], "-")
+		limit := 63 - len(suffix)
+		if len(name) > limit {
+			name = strings.TrimRight(name[:limit], "-")
 		}
 		name += suffix
 	}

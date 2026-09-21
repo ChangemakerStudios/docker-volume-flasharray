@@ -532,7 +532,7 @@ func (c *Client) Ports(ctx context.Context) ([]Port, error) {
 		if p.Portal == "" {
 			continue
 		}
-		res = append(res, Port{Name: p.Name, IQN: p.IQN, NQN: p.NQN, Portal: p.Portal})
+		res = append(res, Port(p))
 	}
 	return res, nil
 }
