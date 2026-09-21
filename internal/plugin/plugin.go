@@ -181,10 +181,10 @@ func (h *Handler) ServeUnix(ctx context.Context, name string) error {
 	return err
 }
 
-func readAll(r interface{ Read([]byte) (int, error) }, max int64) ([]byte, error) {
+func readAll(r interface{ Read([]byte) (int, error) }, limit int64) ([]byte, error) {
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
-	for int64(len(buf)) < max {
+	for int64(len(buf)) < limit {
 		n, err := r.Read(tmp)
 		buf = append(buf, tmp[:n]...)
 		if err != nil {

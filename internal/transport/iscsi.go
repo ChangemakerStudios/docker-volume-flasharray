@@ -140,7 +140,7 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 	})
 }
 
-func (t *iscsi) Detach(ctx context.Context, serial, devPath string) error {
+func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
 	wwid := WWID(serial)
 	var errs []error
 	if exists(multipathdSocket) {

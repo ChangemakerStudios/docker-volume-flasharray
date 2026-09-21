@@ -146,7 +146,7 @@ func (t *nvmeTCP) WaitForDevice(ctx context.Context, serial string) (string, err
 
 // Detach is a no-op for NVMe: namespaces vanish on rescan once the array
 // disconnects them, so the work happens in PostDisconnect.
-func (t *nvmeTCP) Detach(ctx context.Context, serial, devPath string) error {
+func (t *nvmeTCP) Detach(ctx context.Context, _, devPath string) error {
 	if devPath != "" {
 		_, _ = run(ctx, t.log, "blockdev", "--flushbufs", devPath)
 	}
