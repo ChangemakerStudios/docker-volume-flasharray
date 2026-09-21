@@ -73,11 +73,7 @@ jobs:
             --output type=local,dest=build/plugin/rootfs .
           cp plugin/config.json build/plugin/config.json
       - name: create plugin
-        # Both tags from the one rootfs, so :latest is the released plugin and
-        # not another build of the same commit.
-        run: |
-          docker plugin create ${IMAGE}:${VERSION} build/plugin
-          docker plugin create ${IMAGE}:latest build/plugin
+        run: docker plugin create ${IMAGE}:${VERSION} build/plugin
       - name: bundle plugin for the release page
         run: tar -C build -czf docker-volume-flasharray-${VERSION}-plugin.tgz plugin
       - name: upload bundle
@@ -92,8 +88,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: push
+        # Both tags from the one rootfs, so :latest is the released plugin and
+        # not another build of the same commit. The daemon refuses a second
+        # plugin with identical content, so each tag is pushed and removed first.
         run: |
           docker plugin push ${IMAGE}:${VERSION}
+          docker plugin rm ${IMAGE}:${VERSION}
+          docker plugin create ${IMAGE}:latest build/plugin
           docker plugin push ${IMAGE}:latest
 
   release:
