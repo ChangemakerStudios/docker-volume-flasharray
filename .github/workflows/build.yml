@@ -85,7 +85,6 @@ jobs:
       - name: create plugin
         run: |
           docker plugin create ${IMAGE}:${SEMVER} build/plugin
-          docker plugin create ${IMAGE}:develop build/plugin
           docker plugin ls
       - name: smoke-test rootfs
         run: |
@@ -101,6 +100,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: push
         if: github.event_name != 'pull_request'
+        # The daemon refuses a second plugin with identical content, so push and
+        # remove the first tag before creating the second.
         run: |
           docker plugin push ${IMAGE}:${SEMVER}
+          docker plugin rm ${IMAGE}:${SEMVER}
+          docker plugin create ${IMAGE}:develop build/plugin
           docker plugin push ${IMAGE}:develop
