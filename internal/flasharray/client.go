@@ -63,6 +63,10 @@ type Array interface {
 	DestroyVolume(ctx context.Context, name string, eradicate bool) error
 	SetNameTag(ctx context.Context, volume, value string) error
 	ListNameTags(ctx context.Context, valuePrefix string) (map[string]string, error)
+	// LookupNameTag returns the array volume carrying exactly this name tag, or ErrNotFound.
+	LookupNameTag(ctx context.Context, value string) (string, error)
+	// ListVolumes returns non-destroyed volumes whose array name starts with prefix.
+	ListVolumes(ctx context.Context, namePrefix string) ([]*Volume, error)
 	EnsureHost(ctx context.Context, name string, iqns, nqns []string) (string, error)
 	Connect(ctx context.Context, host, volume string) (int, error)
 	Disconnect(ctx context.Context, host, volume string) error
@@ -380,6 +384,49 @@ func (c *Client) ListNameTags(ctx context.Context, valuePrefix string) (map[stri
 			if strings.HasPrefix(t.Value, valuePrefix) {
 				res[t.Resource.Name] = t.Value
 			}
+		}
+		if !out.MoreItemsRemain || out.ContinuationToken == "" {
+			return res, nil
+		}
+		q.Set("continuation_token", out.ContinuationToken)
+	}
+}
+
+// LookupNameTag finds the volume tagged dvfa:name=<value>.
+func (c *Client) LookupNameTag(ctx context.Context, value string) (string, error) {
+	q := url.Values{
+		"namespaces": {TagNamespace},
+		"filter":     {fmt.Sprintf("key='%s' and value='%s'", TagKeyName, strings.ReplaceAll(value, "'", "\\'"))},
+		"limit":      {"2"},
+	}
+	var out page[tagItem]
+	if err := c.do(ctx, http.MethodGet, "/volumes/tags", q, nil, &out); err != nil {
+		return "", err
+	}
+	switch len(out.Items) {
+	case 0:
+		return "", ErrNotFound
+	case 1:
+		return out.Items[0].Resource.Name, nil
+	default:
+		return "", fmt.Errorf("tag %s=%q is on more than one volume (%s, %s)", TagKeyName, value, out.Items[0].Resource.Name, out.Items[1].Resource.Name)
+	}
+}
+
+// ListVolumes lists live volumes by array-name prefix.
+func (c *Client) ListVolumes(ctx context.Context, namePrefix string) ([]*Volume, error) {
+	var res []*Volume
+	q := url.Values{
+		"filter": {fmt.Sprintf("name='%s*' and destroyed='false'", namePrefix)},
+		"limit":  {"1000"},
+	}
+	for {
+		var out page[volumeItem]
+		if err := c.do(ctx, http.MethodGet, "/volumes", q, nil, &out); err != nil {
+			return nil, err
+		}
+		for _, v := range out.Items {
+			res = append(res, v.toVolume())
 		}
 		if !out.MoreItemsRemain || out.ContinuationToken == "" {
 			return res, nil
