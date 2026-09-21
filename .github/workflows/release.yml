@@ -1,80 +1,125 @@
-name: plugin
+name: Release
 
-# Builds the managed plugin and pushes it to GHCR.
-#   push to main            -> ghcr.io/<repo>:main
-#   pull request            -> ghcr.io/<repo>:pr-<n>   (same-repo PRs only)
-#   tag v1.2.3              -> ghcr.io/<repo>:1.2.3 and :latest
-#
-# Note: managed plugins are a distinct artifact type; `docker buildx --push`
-# cannot produce one. We export the rootfs with buildx, wrap it with
-# plugin/config.json via `docker plugin create`, and `docker plugin push`.
+# Cut a release by tagging main: `git tag 0.1.0 && git push origin 0.1.0`
+# (no `v` prefix, matching the other ChangemakerStudios repos). One build
+# produces both :<tag> and :latest, then a GitHub release with the binary
+# and the plugin bundle attached.
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
+    tags:
+      - '[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to release (e.g. 0.1.0)'
+        required: true
+        type: string
 
-permissions:
-  contents: read
-  packages: write
+env:
+  IMAGE: ghcr.io/changemakerstudios/docker-volume-flasharray
+  VERSION: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  plugin:
+  go:
+    name: Test Go
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout tag
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Resolve image name and tags
-        id: meta
-        shell: bash
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: install go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+      - name: build binary
+        # The binary reports this from `-version` and in its startup log;
+        # here the tag is the version.
         run: |
-          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
-            push:refs/tags/v*)  ver="${GITHUB_REF#refs/tags/v}"; tags="$ver latest" ;;
-            push:refs/heads/*)  ver="main-${GITHUB_SHA::8}"; tags="main" ;;
-            pull_request:*)     ver="pr-${{ github.event.number }}-${GITHUB_SHA::8}"; tags="pr-${{ github.event.number }}" ;;
-          esac
-          echo "repo=$repo"   >> "$GITHUB_OUTPUT"
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "tags=$tags"   >> "$GITHUB_OUTPUT"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o bin/docker-volume-flasharray ./cmd/docker-volume-flasharray
+          bin/docker-volume-flasharray -version
+      - name: upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-volume-flasharray
+          path: bin/docker-volume-flasharray
 
-      - name: Build rootfs
+  plugin:
+    name: Build and push plugin
+    runs-on: ubuntu-latest
+    needs: go
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: checkout tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: build rootfs
         run: |
           mkdir -p build/plugin/rootfs
           docker buildx build --platform linux/amd64 \
-            --build-arg VERSION=${{ steps.meta.outputs.version }} \
+            --build-arg VERSION=${VERSION} \
             --output type=local,dest=build/plugin/rootfs .
           cp plugin/config.json build/plugin/config.json
-
-      - name: Create plugin
+      - name: create plugin
+        # Both tags from the one rootfs, so :latest is the released plugin and
+        # not another build of the same commit.
         run: |
-          for t in ${{ steps.meta.outputs.tags }}; do
-            docker plugin create ${{ steps.meta.outputs.repo }}:$t build/plugin
-          done
-          docker plugin ls
-
-      - name: Smoke-test rootfs binary
-        run: |
-          docker buildx build --platform linux/amd64 --load -t dvfa-smoke:ci \
-            --build-arg VERSION=${{ steps.meta.outputs.version }} .
-          docker run --rm dvfa-smoke:ci -version
-          docker run --rm --entrypoint sh dvfa-smoke:ci -c 'iscsiadm --version && nvme version && mkfs.xfs -V && multipathd -h >/dev/null 2>&1 || true'
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+          docker plugin create ${IMAGE}:${VERSION} build/plugin
+          docker plugin create ${IMAGE}:latest build/plugin
+      - name: bundle plugin for the release page
+        run: tar -C build -czf docker-volume-flasharray-${VERSION}-plugin.tgz plugin
+      - name: upload bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-bundle
+          path: docker-volume-flasharray-${{ inputs.tag || github.ref_name }}-plugin.tgz
+      - name: login to GHCR
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push
+      - name: push
         run: |
-          for t in ${{ steps.meta.outputs.tags }}; do
-            docker plugin push ${{ steps.meta.outputs.repo }}:$t
-          done
+          docker plugin push ${IMAGE}:${VERSION}
+          docker plugin push ${IMAGE}:latest
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: plugin
+    permissions:
+      contents: write
+    steps:
+      - name: checkout tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: docker-volume-flasharray
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: plugin-bundle
+          path: dist
+      - name: create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/docker-volume-flasharray
+            dist/docker-volume-flasharray-*-plugin.tgz
+          generate_release_notes: true

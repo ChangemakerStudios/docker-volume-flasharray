@@ -1,0 +1,4 @@
+# GitVersion 6, gitflow. develop -> 0.1.0-alpha.N, release tags are bare X.Y.Z.
+next-version: 0.1.0
+mode: ContinuousDelivery
+tag-prefix: '^$'

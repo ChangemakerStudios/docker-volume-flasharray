@@ -122,8 +122,17 @@ docker volume create -d ghcr.io/changemakerstudios/docker-volume-flasharray:dev 
 ```
 
 `make rootfs` uses `docker buildx --output type=local` to produce the plugin
-rootfs directly; no `docker create`/`export` step. CI does the same and
-`docker plugin push`es to GHCR.
+rootfs directly; no `docker create`/`export` step.
+
+### Branches and releases (gitflow)
+
+- `develop` — every push runs tests and publishes a prerelease plugin tagged
+  with the [GitVersion](https://gitversion.net) semver (e.g. `0.1.0-alpha.7`)
+  plus a moving `:develop` tag; that is what to install on a staging swarm.
+- `main` — tested only. Merge `develop` into it when releasing.
+- Release: tag `main` with a bare version, `git tag 0.1.0 && git push origin 0.1.0`.
+  `release.yml` builds once, pushes `:0.1.0` and `:latest`, and creates a
+  GitHub release with the binary and plugin bundle attached.
 
 ## Status
 
