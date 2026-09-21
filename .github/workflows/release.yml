@@ -1,0 +1,80 @@
+name: plugin
+
+# Builds the managed plugin and pushes it to GHCR.
+#   push to main            -> ghcr.io/<repo>:main
+#   pull request            -> ghcr.io/<repo>:pr-<n>   (same-repo PRs only)
+#   tag v1.2.3              -> ghcr.io/<repo>:1.2.3 and :latest
+#
+# Note: managed plugins are a distinct artifact type; `docker buildx --push`
+# cannot produce one. We export the rootfs with buildx, wrap it with
+# plugin/config.json via `docker plugin create`, and `docker plugin push`.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image name and tags
+        id: meta
+        shell: bash
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            push:refs/tags/v*)  ver="${GITHUB_REF#refs/tags/v}"; tags="$ver latest" ;;
+            push:refs/heads/*)  ver="main-${GITHUB_SHA::8}"; tags="main" ;;
+            pull_request:*)     ver="pr-${{ github.event.number }}-${GITHUB_SHA::8}"; tags="pr-${{ github.event.number }}" ;;
+          esac
+          echo "repo=$repo"   >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags"   >> "$GITHUB_OUTPUT"
+
+      - name: Build rootfs
+        run: |
+          mkdir -p build/plugin/rootfs
+          docker buildx build --platform linux/amd64 \
+            --build-arg VERSION=${{ steps.meta.outputs.version }} \
+            --output type=local,dest=build/plugin/rootfs .
+          cp plugin/config.json build/plugin/config.json
+
+      - name: Create plugin
+        run: |
+          for t in ${{ steps.meta.outputs.tags }}; do
+            docker plugin create ${{ steps.meta.outputs.repo }}:$t build/plugin
+          done
+          docker plugin ls
+
+      - name: Smoke-test rootfs binary
+        run: |
+          docker buildx build --platform linux/amd64 --load -t dvfa-smoke:ci \
+            --build-arg VERSION=${{ steps.meta.outputs.version }} .
+          docker run --rm dvfa-smoke:ci -version
+          docker run --rm --entrypoint sh dvfa-smoke:ci -c 'iscsiadm --version && nvme version && mkfs.xfs -V && multipathd -h >/dev/null 2>&1 || true'
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        run: |
+          for t in ${{ steps.meta.outputs.tags }}; do
+            docker plugin push ${{ steps.meta.outputs.repo }}:$t
+          done

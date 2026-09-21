@@ -1,0 +1,42 @@
+{
+  "description": "Pure Storage FlashArray volume plugin (iSCSI / NVMe-TCP). Unofficial.",
+  "documentation": "https://github.com/ChangemakerStudios/docker-volume-flasharray",
+  "entrypoint": ["/usr/local/bin/docker-volume-flasharray"],
+  "workdir": "/",
+  "interface": {
+    "types": ["docker.volumedriver/1.0"],
+    "socket": "flasharray.sock"
+  },
+  "network": { "type": "host" },
+  "propagatedmount": "/mnt/flasharray",
+  "linux": {
+    "allowAllDevices": true,
+    "capabilities": ["CAP_SYS_ADMIN", "CAP_SYS_RESOURCE", "CAP_NET_ADMIN", "CAP_MKNOD", "CAP_SYS_MODULE"],
+    "devices": null
+  },
+  "mounts": [
+    { "name": "config", "description": "array credentials file directory", "source": "/etc/docker-volume-flasharray", "destination": "/etc/docker-volume-flasharray", "type": "bind", "options": ["rbind", "ro"], "settable": ["source"] },
+    { "name": "dev", "source": "/dev", "destination": "/dev", "type": "bind", "options": ["rbind"] },
+    { "name": "sys", "source": "/sys", "destination": "/sys", "type": "bind", "options": ["rbind"] },
+    { "name": "iscsi", "description": "host initiator name and node database", "source": "/etc/iscsi", "destination": "/etc/iscsi", "type": "bind", "options": ["rbind"] },
+    { "name": "nvme", "description": "host NQN", "source": "/etc/nvme", "destination": "/etc/nvme", "type": "bind", "options": ["rbind"] },
+    { "name": "run", "description": "iscsid lock dir and multipathd socket", "source": "/run", "destination": "/run", "type": "bind", "options": ["rbind"] },
+    { "name": "modules", "source": "/lib/modules", "destination": "/lib/modules", "type": "bind", "options": ["rbind", "ro"] }
+  ],
+  "env": [
+    { "name": "FA_CONFIG", "description": "path to credentials json", "value": "/etc/docker-volume-flasharray/flasharray.json", "settable": ["value"] },
+    { "name": "FA_NAMESPACE", "description": "prefix for array volume names; same value on every node of a cluster", "value": "docker", "settable": ["value"] },
+    { "name": "FA_HOST_NAME", "description": "FlashArray host object name for this node; defaults to hostname", "value": "", "settable": ["value"] },
+    { "name": "FA_TRANSPORT", "description": "iscsi | nvme-tcp", "value": "iscsi", "settable": ["value"] },
+    { "name": "FA_DEFAULT_SIZE", "description": "size when `-o size=` is omitted", "value": "32GiB", "settable": ["value"] },
+    { "name": "FA_FS_TYPE", "description": "xfs | ext4", "value": "xfs", "settable": ["value"] },
+    { "name": "FA_MKFS_OPTS", "description": "extra mkfs options (default: -q for xfs)", "value": "", "settable": ["value"] },
+    { "name": "FA_MOUNT_OPTS", "description": "mount -o options", "value": "", "settable": ["value"] },
+    { "name": "FA_ALLOWED_CIDRS", "description": "comma-separated CIDRs; only array portals inside these are used", "value": "", "settable": ["value"] },
+    { "name": "FA_PREEMPT_RWO", "description": "take over a volume still connected to another host (swarm reschedule)", "value": "true", "settable": ["value"] },
+    { "name": "FA_ERADICATE_ON_REMOVE", "description": "eradicate immediately instead of 24h pending", "value": "false", "settable": ["value"] },
+    { "name": "FA_CONNECT_ON_START", "description": "log in to array portals at plugin start", "value": "true", "settable": ["value"] },
+    { "name": "FA_ATTACH_TIMEOUT", "description": "how long to wait for a device to appear", "value": "60s", "settable": ["value"] },
+    { "name": "FA_LOG_LEVEL", "description": "debug | info | warn | error", "value": "info", "settable": ["value"] }
+  ]
+}
