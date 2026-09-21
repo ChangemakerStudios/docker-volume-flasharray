@@ -112,6 +112,42 @@ that died without unmounting, the new node takes the connection over
 (`FA_PREEMPT_RWO=true`). Do not rely on this to move a volume between two
 *live* nodes — that is a filesystem corruption waiting to happen.
 
+## Migrating from the Pure plugin
+
+Nothing is copied. Pure's plugin created ordinary FlashArray volumes named
+`<PURE_DOCKER_NAMESPACE>-<docker name>` with XFS on them; this driver mounts
+the same volumes once they carry its name tag. What changes is metadata: the
+tag on the array, Docker's local record of which driver owns the name, and
+`driver:` in your stack files.
+
+1. Snapshot the volumes on the array (instant, free insurance).
+2. Stop the stacks that use them.
+3. On **every** node: `docker plugin disable -f pure`, then for each volume
+   `docker volume rm -f <name>`. With the driver disabled, `rm -f` only drops
+   Docker's local reference — it cannot reach the array. Do **not** do this
+   with the Pure plugin enabled: its `Remove` destroys the array volume.
+4. Adopt the volumes (once, from any node with the credentials file):
+
+   ```bash
+   sudo FA_NAMESPACE=docker ./docker-volume-flasharray adopt --prefix sblinuxdev- --dry-run
+   sudo FA_NAMESPACE=docker ./docker-volume-flasharray adopt --prefix sblinuxdev-
+   ```
+
+   The binary is on each GitHub release (and as a build artifact of every
+   `develop` run). `--volume <array>=<docker>` handles one-offs whose Docker
+   name isn't simply the array name minus the prefix.
+5. Change `driver: pure` to `driver: flasharray` in the stack files and
+   `docker stack deploy`. `Create` is idempotent and resolves names through
+   the tag, so the services come up on their existing data.
+
+A single volume can also be imported straight from Docker:
+
+```bash
+docker volume create -d flasharray -o import=sblinuxdev-chromadb_data chromadb_data
+```
+
+Array volumes keep their original names; only the `dvfa:name` tag is written.
+
 ## Development
 
 ```bash

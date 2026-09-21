@@ -34,10 +34,12 @@ type Driver struct {
 	host  string // FlashArray host object name for this node
 	ports []flasharray.Port
 
-	mu    sync.Mutex // guards locks and mounts maps
+	mu    sync.Mutex // guards locks, mounts and names maps
 	locks map[string]*sync.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
+	// names caches dockerName -> array volume name once resolved.
+	names map[string]string
 }
 
 type mountState struct {
@@ -69,6 +71,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		log:    d.Logger.With("component", "driver"),
 		locks:  map[string]*sync.Mutex{},
 		mounts: map[string]*mountState{},
+		names:  map[string]string{},
 	}
 	iqns, nqns, err := drv.tr.InitiatorIDs()
 	if err != nil {
@@ -154,6 +157,50 @@ func (d *Driver) arrayName(dockerName string) string {
 
 func (d *Driver) tagValue(dockerName string) string { return d.cfg.Namespace + "/" + dockerName }
 
+// resolve maps a Docker volume name to its array volume name. The dvfa:name
+// tag is authoritative — that is what lets an imported volume keep whatever
+// name it already has on the array — and the computed name is the fallback
+// for volumes that don't exist yet.
+func (d *Driver) resolve(ctx context.Context, dockerName string) string {
+	d.mu.Lock()
+	an, ok := d.names[dockerName]
+	d.mu.Unlock()
+	if ok {
+		return an
+	}
+	an, err := d.array.LookupNameTag(ctx, d.tagValue(dockerName))
+	if err != nil {
+		if !flasharray.IsNotFound(err) {
+			d.log.Warn("tag lookup failed; using computed array name", "volume", dockerName, "err", err)
+		}
+		return d.arrayName(dockerName)
+	}
+	d.remember(dockerName, an)
+	return an
+}
+
+func (d *Driver) remember(dockerName, arrayName string) {
+	d.mu.Lock()
+	d.names[dockerName] = arrayName
+	d.mu.Unlock()
+}
+
+func (d *Driver) forget(dockerName string) {
+	d.mu.Lock()
+	delete(d.names, dockerName)
+	d.mu.Unlock()
+}
+
+// cachedName is resolve() without the array round-trip, for Path().
+func (d *Driver) cachedName(dockerName string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if an, ok := d.names[dockerName]; ok {
+		return an
+	}
+	return d.arrayName(dockerName)
+}
+
 func (d *Driver) lock(name string) func() {
 	d.mu.Lock()
 	l, ok := d.locks[name]
@@ -172,13 +219,11 @@ func (d *Driver) ctx() (context.Context, context.CancelFunc) {
 
 // Create implements plugin.Driver.
 func (d *Driver) Create(req *plugin.CreateRequest) error {
-	an := d.arrayName(req.Name)
-	unlock := d.lock(an)
-	defer unlock()
 	ctx, cancel := d.ctx()
 	defer cancel()
 
 	size := d.cfg.DefaultSize
+	importName := ""
 	for k, v := range req.Options {
 		switch strings.ToLower(k) {
 		case "size":
@@ -187,10 +232,19 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 				return fmt.Errorf("option size: %w", err)
 			}
 			size = s
+		case "import":
+			importName = v
 		default:
-			return fmt.Errorf("unknown option %q (supported: size)", k)
+			return fmt.Errorf("unknown option %q (supported: size, import)", k)
 		}
 	}
+	if importName != "" {
+		return d.importVolume(ctx, req.Name, importName)
+	}
+
+	an := d.resolve(ctx, req.Name)
+	unlock := d.lock(an)
+	defer unlock()
 
 	if v, err := d.array.GetVolume(ctx, an); err == nil {
 		if v.Destroyed {
@@ -209,17 +263,68 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	if err := d.array.SetNameTag(ctx, an, d.tagValue(req.Name)); err != nil {
 		d.log.Error("tagging failed; volume will not appear in list until tagged", "array_name", an, "err", err)
 	}
+	d.remember(req.Name, an)
 	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", size)
+	return nil
+}
+
+// importVolume adopts an existing array volume under a Docker name without
+// renaming or touching its data: it only writes the dvfa:name tag.
+func (d *Driver) importVolume(ctx context.Context, dockerName, arrayName string) error {
+	unlock := d.lock(arrayName)
+	defer unlock()
+	return Adopt(ctx, d.array, d.cfg.Namespace, dockerName, arrayName, d.log)
+}
+
+// Adopt tags array volume arrayName as <namespace>/<dockerName>. It refuses
+// to steal a volume already claimed by a different Docker name and is a
+// no-op if the tag is already correct. Shared by Create(import=) and the
+// `adopt` CLI subcommand.
+func Adopt(ctx context.Context, array flasharray.Array, namespace, dockerName, arrayName string, log *slog.Logger) error {
+	if dockerName == "" || arrayName == "" {
+		return errors.New("adopt: docker name and array name are required")
+	}
+	value := namespace + "/" + dockerName
+	v, err := array.GetVolume(ctx, arrayName)
+	if err != nil {
+		return fmt.Errorf("adopt %s: %w", arrayName, err)
+	}
+	if v.Destroyed {
+		return fmt.Errorf("adopt %s: volume is destroyed on the array", arrayName)
+	}
+	// Is this Docker name already pointing somewhere?
+	if existing, err := array.LookupNameTag(ctx, value); err == nil && existing != arrayName {
+		return fmt.Errorf("adopt: docker volume %q already maps to array volume %s", dockerName, existing)
+	} else if err != nil && !flasharray.IsNotFound(err) {
+		return err
+	}
+	// Is this array volume already claimed by another Docker name in this namespace?
+	tags, err := array.ListNameTags(ctx, namespace+"/")
+	if err != nil {
+		return err
+	}
+	if cur, ok := tags[arrayName]; ok {
+		if cur == value {
+			return nil
+		}
+		return fmt.Errorf("adopt: array volume %s is already tagged %q", arrayName, cur)
+	}
+	if err := array.SetNameTag(ctx, arrayName, value); err != nil {
+		return fmt.Errorf("adopt %s: %w", arrayName, err)
+	}
+	if log != nil {
+		log.Info("adopted volume", "volume", dockerName, "array_name", arrayName, "serial", v.Serial, "bytes", v.Provisioned)
+	}
 	return nil
 }
 
 // Remove implements plugin.Driver.
 func (d *Driver) Remove(req *plugin.RemoveRequest) error {
-	an := d.arrayName(req.Name)
-	unlock := d.lock(an)
-	defer unlock()
 	ctx, cancel := d.ctx()
 	defer cancel()
+	an := d.resolve(ctx, req.Name)
+	unlock := d.lock(an)
+	defer unlock()
 
 	d.mu.Lock()
 	_, mounted := d.mounts[an]
@@ -247,17 +352,18 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		}
 		return err
 	}
+	d.forget(req.Name)
 	d.log.Info("removed volume", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
 	return nil
 }
 
 // Mount implements plugin.Driver.
 func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) {
-	an := d.arrayName(req.Name)
-	unlock := d.lock(an)
-	defer unlock()
 	ctx, cancel := d.ctx()
 	defer cancel()
+	an := d.resolve(ctx, req.Name)
+	unlock := d.lock(an)
+	defer unlock()
 
 	d.mu.Lock()
 	st, ok := d.mounts[an]
@@ -346,11 +452,11 @@ func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
 
 // Unmount implements plugin.Driver.
 func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
-	an := d.arrayName(req.Name)
-	unlock := d.lock(an)
-	defer unlock()
 	ctx, cancel := d.ctx()
 	defer cancel()
+	an := d.resolve(ctx, req.Name)
+	unlock := d.lock(an)
+	defer unlock()
 
 	d.mu.Lock()
 	st, ok := d.mounts[an]
@@ -401,9 +507,10 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 
 // Path implements plugin.Driver.
 func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
+	an := d.cachedName(req.Name)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if st, ok := d.mounts[d.arrayName(req.Name)]; ok {
+	if st, ok := d.mounts[an]; ok {
 		return &plugin.PathResponse{Mountpoint: st.mountpoint}, nil
 	}
 	return &plugin.PathResponse{}, nil
@@ -411,9 +518,9 @@ func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
 
 // Get implements plugin.Driver.
 func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
-	an := d.arrayName(req.Name)
 	ctx, cancel := d.ctx()
 	defer cancel()
+	an := d.resolve(ctx, req.Name)
 	v, err := d.array.GetVolume(ctx, an)
 	if err != nil {
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
@@ -456,6 +563,7 @@ func (d *Driver) List() (*plugin.ListResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for an, val := range tags {
+		d.names[strings.TrimPrefix(val, prefix)] = an
 		v := &plugin.Volume{Name: strings.TrimPrefix(val, prefix)}
 		if st, ok := d.mounts[an]; ok {
 			v.Mountpoint = st.mountpoint

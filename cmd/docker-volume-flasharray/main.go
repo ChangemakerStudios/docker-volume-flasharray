@@ -26,9 +26,18 @@ const socketName = "flasharray"
 var version = "dev" // set by -ldflags
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
-		fmt.Println("docker-volume-flasharray", version)
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-version", "--version", "version":
+			fmt.Println("docker-volume-flasharray", version)
+			return
+		case "adopt":
+			if err := runAdopt(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			return
+		}
 	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
