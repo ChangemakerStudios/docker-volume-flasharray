@@ -33,7 +33,8 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 	// blkid exits 2 when it finds no filesystem; any other failure (device not
 	// ready, I/O error) also prints nothing, and formatting then would wipe data.
 	var ee *exec.ExitError
-	if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 2) {
+	noFilesystem := errors.As(err, &ee) && ee.ExitCode() == 2
+	if err != nil && !noFilesystem {
 		return false, fmt.Errorf("blkid %s: %w", dev, err)
 	}
 	if existing := strings.TrimSpace(string(out)); existing != "" {
