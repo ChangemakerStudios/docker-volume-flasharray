@@ -68,17 +68,28 @@ type Config struct {
 // FromEnv builds a Config from FA_* environment variables and the credentials file.
 func FromEnv() (*Config, error) {
 	c := &Config{
-		ConfigPath:        getenv("FA_CONFIG", "/etc/docker-volume-flasharray/flasharray.json"),
-		Namespace:         getenv("FA_NAMESPACE", "docker"),
-		HostName:          getenv("FA_HOST_NAME", ""),
-		Transport:         Transport(strings.ToLower(getenv("FA_TRANSPORT", string(TransportISCSI)))),
-		FSType:            getenv("FA_FS_TYPE", "xfs"),
-		MountOptions:      getenv("FA_MOUNT_OPTS", ""),
-		MountRoot:         getenv("FA_MOUNT_ROOT", "/mnt/flasharray"),
-		LogLevel:          getenv("FA_LOG_LEVEL", "info"),
-		PreemptRWO:        getenvBool("FA_PREEMPT_RWO", true),
-		EradicateOnRemove: getenvBool("FA_ERADICATE_ON_REMOVE", false),
-		ConnectOnStart:    getenvBool("FA_CONNECT_ON_START", true),
+		ConfigPath:   getenv("FA_CONFIG", "/etc/docker-volume-flasharray/flasharray.json"),
+		Namespace:    getenv("FA_NAMESPACE", "docker"),
+		HostName:     getenv("FA_HOST_NAME", ""),
+		Transport:    Transport(strings.ToLower(getenv("FA_TRANSPORT", string(TransportISCSI)))),
+		FSType:       getenv("FA_FS_TYPE", "xfs"),
+		MountOptions: getenv("FA_MOUNT_OPTS", ""),
+		MountRoot:    getenv("FA_MOUNT_ROOT", "/mnt/flasharray"),
+		LogLevel:     getenv("FA_LOG_LEVEL", "info"),
+	}
+	var err error
+	for _, b := range []struct {
+		key string
+		def bool
+		dst *bool
+	}{
+		{"FA_PREEMPT_RWO", true, &c.PreemptRWO},
+		{"FA_ERADICATE_ON_REMOVE", false, &c.EradicateOnRemove},
+		{"FA_CONNECT_ON_START", true, &c.ConnectOnStart},
+	} {
+		if *b.dst, err = getenvBool(b.key, b.def); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := ValidateNamespace(c.Namespace); err != nil {
@@ -219,14 +230,14 @@ func getenv(k, def string) string {
 	return def
 }
 
-func getenvBool(k string, def bool) bool {
+func getenvBool(k string, def bool) (bool, error) {
 	v, ok := os.LookupEnv(k)
 	if !ok || v == "" {
-		return def
+		return def, nil
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return def
+		return false, fmt.Errorf("%s: %q is not a boolean", k, v)
 	}
-	return b
+	return b, nil
 }

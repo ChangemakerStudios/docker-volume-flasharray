@@ -75,7 +75,9 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if _, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "new"); err != nil {
 			t.log.Debug("node record create", "portal", p.Portal, "err", err)
 		}
-		_, _ = run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual")
+		if _, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual"); err != nil {
+			t.log.Warn("set node.startup=manual failed; host iscsid may also log in at boot", "portal", p.Portal, "err", err)
+		}
 		_, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
 		if err != nil && exitCode(err) != iscsiadmExitSessionExists && !strings.Contains(err.Error(), "already present") {
 			errs = append(errs, err)
@@ -127,7 +129,9 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 			if len(paths) > 0 {
 				nudged = true
 				for _, p := range paths {
-					_, _ = run(ctx, t.log, "multipathd", "add", "path", p)
+					if _, err := run(ctx, t.log, "multipathd", "add", "path", p); err != nil {
+						t.log.Warn("multipathd add path failed", "path", p, "err", err)
+					}
 				}
 			}
 		}
@@ -141,6 +145,10 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 }
 
 func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
+	if serial == "" {
+		// WWID("") is the bare Pure prefix, which would match every FlashArray LUN on the host.
+		return errors.New("detach: empty volume serial; refusing to touch host SCSI devices")
+	}
 	wwid := WWID(serial)
 	var errs []error
 	if exists(multipathdSocket) {
@@ -150,7 +158,9 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
 		}
 	}
 	for _, p := range sysBlockMatching("sd*", strings.TrimPrefix(wwid, "3")) {
-		_, _ = run(ctx, t.log, "blockdev", "--flushbufs", "/dev/"+p)
+		if _, err := run(ctx, t.log, "blockdev", "--flushbufs", "/dev/"+p); err != nil {
+			t.log.Warn("flush before path delete failed", "dev", p, "err", err)
+		}
 		if err := os.WriteFile(filepath.Join("/sys/class/block", p, "device", "delete"), []byte("1"), 0o200); err != nil {
 			errs = append(errs, fmt.Errorf("delete %s: %w", p, err))
 		}

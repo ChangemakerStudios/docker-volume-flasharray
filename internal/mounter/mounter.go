@@ -4,6 +4,7 @@ package mounter
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -28,7 +29,13 @@ func New(log *slog.Logger) Mounter { return &execMounter{log: log} }
 type execMounter struct{ log *slog.Logger }
 
 func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string) (bool, error) {
-	out, _ := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
+	out, err := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
+	// blkid exits 2 when it finds no filesystem; any other failure (device not
+	// ready, I/O error) also prints nothing, and formatting then would wipe data.
+	var ee *exec.ExitError
+	if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 2) {
+		return false, fmt.Errorf("blkid %s: %w", dev, err)
+	}
 	if existing := strings.TrimSpace(string(out)); existing != "" {
 		if existing != fstype {
 			m.log.Warn("device already has a different filesystem; mounting as-is", "dev", dev, "have", existing, "want", fstype)

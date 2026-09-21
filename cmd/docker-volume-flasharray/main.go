@@ -44,7 +44,9 @@ func run() error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}))
 	slog.SetDefault(log)
 	log.Info("starting docker-volume-flasharray", "version", version, "namespace", cfg.Namespace,
-		"transport", cfg.Transport, "array", cfg.Array.Endpoint, "fs", cfg.FSType, "default_size", cfg.DefaultSize)
+		"transport", cfg.Transport, "array", cfg.Array.Endpoint, "fs", cfg.FSType, "default_size", cfg.DefaultSize,
+		"host_name", cfg.HostName, "allowed_cidrs", cfg.AllowedCIDRs, "preempt_rwo", cfg.PreemptRWO,
+		"eradicate_on_remove", cfg.EradicateOnRemove, "attach_timeout", cfg.AttachTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
