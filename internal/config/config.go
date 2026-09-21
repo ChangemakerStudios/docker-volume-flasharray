@@ -176,11 +176,15 @@ func ValidateNamespace(ns string) error {
 		return fmt.Errorf("namespace %q must be 1-32 chars", ns)
 	}
 	for _, r := range ns {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+		if !isNameRune(r) {
 			return fmt.Errorf("namespace %q may only contain [A-Za-z0-9-]", ns)
 		}
 	}
 	return nil
+}
+
+func isNameRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-'
 }
 
 // ParseSize parses "32GiB", "1G", "500MB", "1073741824" into bytes, rounded up
