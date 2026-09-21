@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -291,7 +292,7 @@ func TestCreateMountUnmountRemove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r1.Mountpoint != r2.Mountpoint || !strings.HasSuffix(r1.Mountpoint, "/data_vol") {
+	if r1.Mountpoint != r2.Mountpoint || filepath.Base(r1.Mountpoint) != "data_vol" {
 		t.Fatalf("mountpoints %q %q", r1.Mountpoint, r2.Mountpoint)
 	}
 	if len(tr.waits) != 1 {

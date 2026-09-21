@@ -109,6 +109,7 @@ func (d *Driver) ensureConnected(ctx context.Context) error {
 func (d *Driver) recoverMounts() {
 	entries, err := os.ReadDir(d.cfg.MountRoot)
 	if err != nil {
+		d.log.Error("cannot scan mount root; existing mounts will not be recovered", "mount_root", d.cfg.MountRoot, "err", err)
 		return
 	}
 	for _, e := range entries {
@@ -117,7 +118,11 @@ func (d *Driver) recoverMounts() {
 		}
 		mp := filepath.Join(d.cfg.MountRoot, e.Name())
 		ok, err := d.mnt.IsMounted(mp)
-		if err != nil || !ok {
+		if err != nil {
+			d.log.Error("cannot check mount; not recovered", "mountpoint", mp, "err", err)
+			continue
+		}
+		if !ok {
 			continue
 		}
 		an := d.arrayName(e.Name())
@@ -302,9 +307,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 
 	dev, err := d.tr.WaitForDevice(ctx, vol.Serial)
 	if err != nil {
-		_ = d.tr.Detach(ctx, vol.Serial, "")
-		_ = d.array.Disconnect(ctx, d.host, an)
-		_ = d.tr.PostDisconnect(ctx)
+		d.rollbackAttach(ctx, an, vol.Serial, "")
 		return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host: %w", req.Name, vol.Serial, err)
 	}
 
@@ -327,10 +330,18 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	return &plugin.MountResponse{Mountpoint: mp}, nil
 }
 
+// rollbackAttach is best effort; failures are logged because a leftover array
+// connection makes the next mount elsewhere preempt this host.
 func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
-	_ = d.tr.Detach(ctx, serial, dev)
-	_ = d.array.Disconnect(ctx, d.host, an)
-	_ = d.tr.PostDisconnect(ctx)
+	if err := d.tr.Detach(ctx, serial, dev); err != nil {
+		d.log.Error("rollback: host detach failed", "array_name", an, "serial", serial, "err", err)
+	}
+	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
+		d.log.Error("rollback: array disconnect failed; volume is still connected to this host", "array_name", an, "host", d.host, "err", err)
+	}
+	if err := d.tr.PostDisconnect(ctx); err != nil {
+		d.log.Warn("rollback: post-disconnect failed", "array_name", an, "err", err)
+	}
 }
 
 // Unmount implements plugin.Driver.
@@ -356,12 +367,20 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	if err := d.mnt.Unmount(ctx, st.mountpoint); err != nil {
 		return err
 	}
-	_ = os.Remove(st.mountpoint)
+	if err := os.Remove(st.mountpoint); err != nil && !os.IsNotExist(err) {
+		d.log.Warn("remove mountpoint dir", "mountpoint", st.mountpoint, "err", err)
+	}
 	serial := st.serial
 	if serial == "" { // recovered mount: look it up
-		if v, err := d.array.GetVolume(ctx, an); err == nil {
-			serial = v.Serial
+		v, err := d.array.GetVolume(ctx, an)
+		if err != nil {
+			// Filesystem is already unmounted, so drop the state; a later Mount re-attaches cleanly.
+			d.mu.Lock()
+			delete(d.mounts, an)
+			d.mu.Unlock()
+			return fmt.Errorf("volume %s unmounted but serial lookup failed, host devices and array connection left in place: %w", req.Name, err)
 		}
+		serial = v.Serial
 	}
 	var errs []error
 	if err := d.tr.Detach(ctx, serial, st.dev); err != nil {

@@ -116,7 +116,7 @@ func (t *nvmeTCP) controllers() []string {
 func (t *nvmeTCP) rescan(ctx context.Context) {
 	for _, c := range t.controllers() {
 		if _, err := run(ctx, t.log, "nvme", "ns-rescan", c); err != nil {
-			t.log.Debug("nvme ns-rescan", "ctrl", c, "err", err)
+			t.log.Warn("nvme ns-rescan failed", "ctrl", c, "err", err)
 		}
 	}
 }
@@ -148,7 +148,9 @@ func (t *nvmeTCP) WaitForDevice(ctx context.Context, serial string) (string, err
 // disconnects them, so the work happens in PostDisconnect.
 func (t *nvmeTCP) Detach(ctx context.Context, _, devPath string) error {
 	if devPath != "" {
-		_, _ = run(ctx, t.log, "blockdev", "--flushbufs", devPath)
+		if _, err := run(ctx, t.log, "blockdev", "--flushbufs", devPath); err != nil {
+			t.log.Warn("flush before disconnect failed", "dev", devPath, "err", err)
+		}
 	}
 	return nil
 }
