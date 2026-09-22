@@ -205,7 +205,7 @@ func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flashar
 }
 
 func (f *fakeArray) Ports(context.Context) ([]flasharray.Port, error) {
-	return []flasharray.Port{{Name: "CT0.ETH4", IQN: "iqn.2010-06.com.purestorage:flasharray.test", Portal: "10.10.100.154:3260"}}, nil
+	return []flasharray.Port{{Name: "CT0.ETH4", IQN: "iqn.2010-06.com.purestorage:flasharray.test", Portal: "198.51.100.10:3260"}}, nil
 }
 
 type fakeTransport struct {
@@ -322,8 +322,8 @@ func TestArrayName(t *testing.T) {
 		want       string
 		hashSuffix bool
 	}{
-		"mongodb-1":             {want: "node1-mongodb-1"},
-		"cas_store":             {want: "node1-cas_store"},
+		"db-1":             {want: "node1-db-1"},
+		"app_store":             {want: "node1-app_store"},
 		"seq.store":             {hashSuffix: true},
 		"seq-store":             {want: "node1-seq-store"},
 		"a_b":                   {want: "node1-a_b"},
@@ -490,19 +490,19 @@ func TestImportAdoptsExistingArrayVolume(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
 	// A volume the old plugin created under its own naming scheme.
-	old, _ := fa.CreateVolume(context.Background(), "sblinuxdev-chromadb_data", 32<<30)
+	old, _ := fa.CreateVolume(context.Background(), "prod-app_data", 32<<30)
 
-	if err := d.Create(&plugin.CreateRequest{Name: "chromadb_data", Options: map[string]string{"import": old.Name}}); err != nil {
+	if err := d.Create(&plugin.CreateRequest{Name: "app_data", Options: map[string]string{"import": old.Name}}); err != nil {
 		t.Fatal(err)
 	}
-	if fa.tags[old.Name] != "node1/chromadb_data" {
+	if fa.tags[old.Name] != "node1/app_data" {
 		t.Fatalf("tag = %q", fa.tags[old.Name])
 	}
 	if len(fa.vols) != 1 {
 		t.Fatalf("import must not create a new volume: %v", fa.calls)
 	}
 	// Every subsequent op resolves through the tag to the old array name.
-	r, err := d.Mount(&plugin.MountRequest{Name: "chromadb_data", ID: "c1"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "app_data", ID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,27 +512,27 @@ func TestImportAdoptsExistingArrayVolume(t *testing.T) {
 	if tr.waits[0] != old.Serial {
 		t.Fatalf("waited for serial %s, want %s", tr.waits[0], old.Serial)
 	}
-	if err := d.Unmount(&plugin.UnmountRequest{Name: "chromadb_data", ID: "c1"}); err != nil {
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "app_data", ID: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	_ = r
-	g, err := d.Get(&plugin.GetRequest{Name: "chromadb_data"})
+	g, err := d.Get(&plugin.GetRequest{Name: "app_data"})
 	if err != nil || g.Volume.Status["array_name"] != old.Name {
 		t.Fatalf("get = %+v %v", g, err)
 	}
 	// Idempotent re-import; conflicting re-import refused.
-	if err := d.Create(&plugin.CreateRequest{Name: "chromadb_data", Options: map[string]string{"import": old.Name}}); err != nil {
+	if err := d.Create(&plugin.CreateRequest{Name: "app_data", Options: map[string]string{"import": old.Name}}); err != nil {
 		t.Fatalf("re-import: %v", err)
 	}
-	other, _ := fa.CreateVolume(context.Background(), "sblinuxdev-other", 1<<30)
-	if err := d.Create(&plugin.CreateRequest{Name: "chromadb_data", Options: map[string]string{"import": other.Name}}); err == nil {
+	other, _ := fa.CreateVolume(context.Background(), "prod-other", 1<<30)
+	if err := d.Create(&plugin.CreateRequest{Name: "app_data", Options: map[string]string{"import": other.Name}}); err == nil {
 		t.Fatal("expected conflict importing a second volume under the same docker name")
 	}
 	if err := d.Create(&plugin.CreateRequest{Name: "second", Options: map[string]string{"import": old.Name}}); err == nil {
 		t.Fatal("expected conflict importing an already-claimed volume under another name")
 	}
 	// Remove goes to the adopted array volume, not the computed name.
-	if err := d.Remove(&plugin.RemoveRequest{Name: "chromadb_data"}); err != nil {
+	if err := d.Remove(&plugin.RemoveRequest{Name: "app_data"}); err != nil {
 		t.Fatal(err)
 	}
 	if !fa.vols[old.Name].Destroyed {
@@ -572,11 +572,11 @@ func TestStaleCachedNameIsResolvedAgain(t *testing.T) {
 func TestRecoveredMountOfAdoptedVolumeUnmounts(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
-	old, _ := fa.CreateVolume(context.Background(), "sblinuxdev-chromadb_data", 1<<30)
-	if err := d.Create(&plugin.CreateRequest{Name: "chromadb_data", Options: map[string]string{"import": old.Name}}); err != nil {
+	old, _ := fa.CreateVolume(context.Background(), "prod-app_data", 1<<30)
+	if err := d.Create(&plugin.CreateRequest{Name: "app_data", Options: map[string]string{"import": old.Name}}); err != nil {
 		t.Fatal(err)
 	}
-	r, err := d.Mount(&plugin.MountRequest{Name: "chromadb_data", ID: "c1"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "app_data", ID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +589,7 @@ func TestRecoveredMountOfAdoptedVolumeUnmounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d2.Unmount(&plugin.UnmountRequest{Name: "chromadb_data", ID: "c1"}); err != nil {
+	if err := d2.Unmount(&plugin.UnmountRequest{Name: "app_data", ID: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := fm.IsMounted(r.Mountpoint); ok {

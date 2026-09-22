@@ -35,7 +35,7 @@ func TestParseSize(t *testing.T) {
 }
 
 func TestValidateNamespace(t *testing.T) {
-	for _, ok := range []string{"sblinuxdev", "node-01", "A1"} {
+	for _, ok := range []string{"prod", "node-01", "A1"} {
 		if err := ValidateNamespace(ok); err != nil {
 			t.Errorf("%q: %v", ok, err)
 		}

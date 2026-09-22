@@ -77,36 +77,36 @@ func (m *memArray) Ports(context.Context) ([]flasharray.Port, error) { return ni
 func TestAdoptPrefix(t *testing.T) {
 	a := &memArray{
 		vols: map[string]*flasharray.Volume{
-			"sblinuxdev-mongodb-1":     {Name: "sblinuxdev-mongodb-1", Serial: "a", Created: time.Now()},
-			"sblinuxdev-chromadb_data": {Name: "sblinuxdev-chromadb_data", Serial: "b", Created: time.Now()},
-			"sblinuxdev-old":           {Name: "sblinuxdev-old", Serial: "c", Destroyed: true},
+			"prod-db-1":     {Name: "prod-db-1", Serial: "a", Created: time.Now()},
+			"prod-app_data": {Name: "prod-app_data", Serial: "b", Created: time.Now()},
+			"prod-old":           {Name: "prod-old", Serial: "c", Destroyed: true},
 			"unrelated":                {Name: "unrelated", Serial: "d"},
 		},
-		tags: map[string]string{"sblinuxdev-mongodb-1": "docker/mongodb-1"}, // already adopted
+		tags: map[string]string{"prod-db-1": "docker/db-1"}, // already adopted
 	}
 	var out bytes.Buffer
-	if err := adopt(context.Background(), a, "docker", "sblinuxdev-", nil, true, &out, nil); err != nil {
+	if err := adopt(context.Background(), a, "docker", "prod-", nil, true, &out, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "would   sblinuxdev-chromadb_data") || !strings.Contains(out.String(), "skip    sblinuxdev-mongodb-1") {
+	if !strings.Contains(out.String(), "would   prod-app_data") || !strings.Contains(out.String(), "skip    prod-db-1") {
 		t.Fatalf("dry-run output:\n%s", out.String())
 	}
 	if len(a.tags) != 1 {
 		t.Fatal("dry-run must not write tags")
 	}
 	out.Reset()
-	if err := adopt(context.Background(), a, "docker", "sblinuxdev-", []string{"unrelated=weird_name"}, false, &out, nil); err != nil {
+	if err := adopt(context.Background(), a, "docker", "prod-", []string{"unrelated=weird_name"}, false, &out, nil); err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
-	if a.tags["sblinuxdev-chromadb_data"] != "docker/chromadb_data" || a.tags["unrelated"] != "docker/weird_name" {
+	if a.tags["prod-app_data"] != "docker/app_data" || a.tags["unrelated"] != "docker/weird_name" {
 		t.Fatalf("tags = %v", a.tags)
 	}
-	if _, ok := a.tags["sblinuxdev-old"]; ok {
+	if _, ok := a.tags["prod-old"]; ok {
 		t.Fatal("destroyed volume must be skipped")
 	}
 	// conflict: same docker name, different array volume
 	out.Reset()
-	err := adopt(context.Background(), a, "docker", "", []string{"unrelated=chromadb_data"}, false, &out, nil)
+	err := adopt(context.Background(), a, "docker", "", []string{"unrelated=app_data"}, false, &out, nil)
 	if err == nil || !strings.Contains(out.String(), "CONFLICT") && !strings.Contains(out.String(), "FAILED") {
 		t.Fatalf("expected conflict, got %v\n%s", err, out.String())
 	}

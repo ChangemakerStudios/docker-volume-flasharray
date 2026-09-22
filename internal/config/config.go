@@ -23,7 +23,7 @@ const (
 
 // Array is one FlashArray entry from the credentials file.
 type Array struct {
-	// Endpoint is the management address, e.g. "10.50.0.5" or "array.example.com".
+	// Endpoint is the management address, e.g. "192.0.2.10" or "array.example.com".
 	Endpoint string `json:"endpoint"`
 	// APIToken is a FlashArray API token (Settings > Users > API Tokens).
 	APIToken string `json:"apiToken"`

@@ -461,7 +461,7 @@ func (c *Client) DeleteTag(ctx context.Context, volume, key string) error {
 }
 
 // ListNameTags returns arrayVolumeName -> tag value for every volume whose
-// name tag starts with valuePrefix (e.g. "sblinuxdev/").
+// name tag starts with valuePrefix (e.g. "prod/").
 func (c *Client) ListNameTags(ctx context.Context, valuePrefix string) (map[string]string, error) {
 	res := map[string]string{}
 	q := url.Values{

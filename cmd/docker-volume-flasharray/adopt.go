@@ -22,12 +22,12 @@ Tag existing FlashArray volumes so this driver serves them under their old
 Docker names, without renaming or copying anything. Typical migration from
 the Pure plugin, whose volumes are named <PURE_DOCKER_NAMESPACE>-<docker name>:
 
-  docker-volume-flasharray adopt --prefix sblinuxdev- --dry-run
-  docker-volume-flasharray adopt --prefix sblinuxdev-
+  docker-volume-flasharray adopt --prefix prod- --dry-run
+  docker-volume-flasharray adopt --prefix prod-
 
 Or a single explicit mapping:
 
-  docker-volume-flasharray adopt --volume sblinuxdev-mongodb-1=mongodb-1
+  docker-volume-flasharray adopt --volume prod-db-1=db-1
 
 Reads the same FA_* environment and credentials file as the plugin
 (FA_CONFIG, FA_NAMESPACE, ...). Volumes already tagged are skipped; a Docker
