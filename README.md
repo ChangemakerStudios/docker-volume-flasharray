@@ -12,7 +12,9 @@ global`, so a volume created on one node can be mounted on another).
 Zero Go dependencies outside the standard library. Like the Pure plugin, it
 runs the **host's own** `iscsiadm`, `multipathd`, `multipath`, `dmsetup`,
 `nvme`, `mkfs.*`, `blkid`, `xfs_admin` and `tune2fs` (via `nsenter` into the
-host mount and IPC namespaces, which is why it uses the host PID namespace).
+host mount and IPC namespaces, which is why it uses the host PID namespace;
+`CAP_SYS_PTRACE` and `CAP_SYS_CHROOT` are what `nsenter` needs to enter
+PID 1's namespaces and read host files through `/proc/1/root`).
 The client then always matches the host's `iscsid`/`multipathd`, reads the
 host's `/etc/iscsi`, `/etc/nvme` and `multipath.conf` directly, and formats
 with the host's own xfsprogs, so a new filesystem never has features the
@@ -93,17 +95,41 @@ processes in uninterruptible sleep, recoverable only by a reboot.
    volume it is detaching.
 2. **Restart multipathd after editing its config** (`systemctl restart
    multipathd`); `reload` only re-reads the file.
-3. **Don't queue I/O forever.** `no_path_retry queue` on a device whose
+3. **Don't queue I/O for long.** `no_path_retry queue` on a device whose
    paths are gone makes `multipath -f`, `sync`, `blockdev --flushbufs` and
-   anything that opens the device hang. Bound it. Settings for Pure, in
-   `/etc/multipath/conf.d/pure.conf` or `/etc/multipath.conf`:
+   anything that opens the device hang. Bound it, and keep the bound short:
+   the queue time is `no_path_retry × polling_interval`, and while a stale
+   node queues, a volume taken over by another node (`FA_PREEMPT_RWO`) has a
+   writer that hasn't failed yet. `3` × `10`s rides out a brief path blip
+   and errors within 30 seconds. Larger values (the Proxmox plugin uses 30,
+   i.e. five minutes, for VM boot resilience) trade that for tolerance of
+   longer outages; `0` fails at once, as soon as every path is down.
+4. **Let multipathd claim a Pure LUN on first sight.** With the default
+   `find_multipaths on` (multipath-tools 0.8.x, e.g. Ubuntu 22.04), a freshly
+   attached LUN may get no map even with all paths up; the plugin's targeted
+   `multipathd add path` can paper over it, but set `find_multipaths
+   greedy` (or `yes`) and blacklist the local disks so greedy doesn't claim
+   them. A device that never appears reports "multipath map: none (paths not
+   claimed…)" in its error when this is the cause.
+
+   `polling_interval` and `find_multipaths` belong in `defaults`; in a
+   `device` block they are silently ignored. In `/etc/multipath/conf.d/pure.conf`
+   or `/etc/multipath.conf`:
 
    ```
    defaults {
        polling_interval   10
-       no_path_retry      30
+       find_multipaths    greedy
+       no_path_retry      3
        fast_io_fail_tmo   5
        dev_loss_tmo       60
+   }
+   blacklist {
+       # local system disks; match yours (`lsblk -o NAME,VENDOR,MODEL,WWN`)
+       device {
+           vendor  "VMware"
+           product "Virtual disk"
+       }
    }
    devices {
        device {
@@ -114,7 +140,7 @@ processes in uninterruptible sleep, recoverable only by a reboot.
            prio                 alua
            hardware_handler     "1 alua"
            failback             immediate
-           no_path_retry        30
+           no_path_retry        3
            fast_io_fail_tmo     5
            dev_loss_tmo         60
        }
@@ -269,6 +295,20 @@ docker volume create -d flasharray -o import=prod-app_data app_data
 ```
 
 Array volumes keep their original names; only the `dvfa:name` tag is written.
+
+## Known issues
+
+**Slow first minute after boot on systemd 249 (Ubuntu 22.04).** With
+`FA_CONNECT_ON_START=true` (the default) the plugin logs in to every portal
+when it starts, so the cold iSCSI login, and the flood of LUNs for every
+volume still connected to this node's host object, lands at boot instead of
+inside the first container's mount. On systemd 249 that burst of new block
+devices has been seen to keep PID 1 and logind busy for a minute or more. It
+passes, but it looks like a hang. To shorten it: keep the host object lean
+(disconnect volumes this node no longer uses from its host object on the
+array). `FA_ALLOWED_CIDRS` restricted to one iSCSI subnet halves the
+sessions and paths too, but gives up the other subnet's redundancy: a
+switch or fabric outage on the remaining one then takes every path down.
 
 ## Development
 
