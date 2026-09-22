@@ -463,7 +463,7 @@ func Adopt(ctx context.Context, array flasharray.Array, namespace, dockerName, a
 func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	ctx, cancel := d.ctx()
 	defer cancel()
-	an, _, unlock, err := d.resolveLocked(ctx, req.Name)
+	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
 	if err != nil {
 		if flasharray.IsNotFound(err) {
@@ -472,6 +472,20 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 			return nil
 		}
 		return err
+	}
+	// Another node's `docker volume rm` got there first; the array keeps the
+	// destroyed volume (and its tag) for 24h and rejects connection queries on
+	// it, so this node's own record must still be removable.
+	if v.Destroyed {
+		if d.cfg.EradicateOnRemove {
+			if err := d.array.DestroyVolume(ctx, an, true); err != nil && !flasharray.IsNotFound(err) {
+				return err
+			}
+		}
+		d.forget(req.Name)
+		d.setKnown(req.Name, "")
+		d.log.Info("volume already destroyed on the array; dropped this node's record", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
+		return nil
 	}
 
 	d.mu.Lock()
@@ -494,10 +508,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 			return err
 		}
 	}
-	if err := d.array.DestroyVolume(ctx, an, d.cfg.EradicateOnRemove); err != nil {
-		if flasharray.IsNotFound(err) {
-			return nil
-		}
+	if err := d.array.DestroyVolume(ctx, an, d.cfg.EradicateOnRemove); err != nil && !flasharray.IsNotFound(err) {
 		return err
 	}
 	d.forget(req.Name)

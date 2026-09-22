@@ -207,6 +207,10 @@ func (f *fakeArray) Disconnect(_ context.Context, host, volume string) error {
 func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flasharray.Connection, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if v, ok := f.vols[volume]; ok && v.Destroyed {
+		// What the array answers for a volume in the destroyed state.
+		return nil, errors.New("GET /connections: HTTP 400: " + volume + ": Volume has been destroyed.")
+	}
 	var out []flasharray.Connection
 	for h, lun := range f.conns[volume] {
 		out = append(out, flasharray.Connection{Host: h, Volume: volume, LUN: lun})
@@ -767,5 +771,31 @@ func TestListReconcilesKnownVolumesAndFallsBack(t *testing.T) {
 	}
 	if _, err := d.Get(&plugin.GetRequest{Name: "a"}); err == nil {
 		t.Fatal("volume dropped by List still answered from known volumes")
+	}
+}
+
+// A second node's `docker volume rm` finds the volume already destroyed by
+// the first; it must succeed so that node's Docker record goes away.
+func TestRemoveVolumeAlreadyDestroyedByAnotherNode(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fa.vols["node1-v"].Destroyed {
+		t.Fatal("first remove did not destroy")
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatalf("second remove of a destroyed volume: %v", err)
+	}
+	d.cfg.EradicateOnRemove = true
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatalf("remove with eradicate of a destroyed volume: %v", err)
+	}
+	if _, ok := fa.vols["node1-v"]; ok {
+		t.Fatal("FA_ERADICATE_ON_REMOVE did not eradicate the already-destroyed volume")
 	}
 }
