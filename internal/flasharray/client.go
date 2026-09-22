@@ -26,6 +26,9 @@ import (
 const (
 	TagNamespace = "dvfa"
 	TagKeyName   = "name"
+	// TagKeyClonePending marks a clone whose filesystem still carries its
+	// source's UUID; the value is the source array volume.
+	TagKeyClonePending = "clone-pending"
 )
 
 // ErrNotFound is returned when a volume/host/connection does not exist.
@@ -60,8 +63,14 @@ type Port struct {
 type Array interface {
 	GetVolume(ctx context.Context, name string) (*Volume, error)
 	CreateVolume(ctx context.Context, name string, size int64) (*Volume, error)
+	// CopyVolume creates name as a copy of source (same size and contents).
+	CopyVolume(ctx context.Context, source, name string) (*Volume, error)
 	DestroyVolume(ctx context.Context, name string, eradicate bool) error
 	SetNameTag(ctx context.Context, volume, value string) error
+	SetTag(ctx context.Context, volume, key, value string) error
+	// GetTags returns key -> value for the volume's tags in TagNamespace.
+	GetTags(ctx context.Context, volume string) (map[string]string, error)
+	DeleteTag(ctx context.Context, volume, key string) error
 	ListNameTags(ctx context.Context, valuePrefix string) (map[string]string, error)
 	// LookupNameTag returns the array volume carrying exactly this name tag, or ErrNotFound.
 	LookupNameTag(ctx context.Context, value string) (string, error)
@@ -84,6 +93,8 @@ type Client struct {
 
 	mu        sync.Mutex
 	authToken string
+
+	retryBase time.Duration // backoff unit between retries
 }
 
 // Options configure a Client.
@@ -113,6 +124,8 @@ func New(ctx context.Context, o Options) (*Client, error) {
 		version:  o.APIVersion,
 		http:     &http.Client{Transport: tr, Timeout: o.Timeout},
 		log:      o.Logger.With("component", "flasharray", "array", o.Endpoint),
+
+		retryBase: time.Second,
 	}
 	if c.version == "" {
 		v, err := c.negotiateVersion(ctx)
@@ -205,8 +218,13 @@ func readErr(resp *http.Response) string {
 	return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 }
 
-// do performs an authenticated request, logging in on first use and retrying
-// once on 401 (sessions idle out after 30 minutes).
+// maxAttempts bounds retries of one request (re-login, rate limiting, 5xx).
+const maxAttempts = 4
+
+// do performs an authenticated request, logging in on first use and again on
+// a 401 (sessions idle out after 30 minutes). 429 is retried for any method;
+// 5xx and transport errors only for non-POST, since a POST whose response was
+// lost may already have created the object.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, out any) error {
 	var payload []byte
 	if body != nil {
@@ -219,7 +237,8 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	for attempt := 0; attempt < 2; attempt++ {
+	reauthed := false
+	for attempt := 1; ; attempt++ {
 		c.mu.Lock()
 		tok := c.authToken
 		c.mu.Unlock()
@@ -241,24 +260,43 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			if method != http.MethodPost && attempt < maxAttempts && ctx.Err() == nil {
+				c.log.Warn("request failed; retrying", "method", method, "path", path, "attempt", attempt, "err", err)
+				if c.backoff(ctx, attempt, "") == nil {
+					continue
+				}
+			}
 			return fmt.Errorf("%s %s: %w", method, path, err)
 		}
-		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+		code := resp.StatusCode
+		if code == http.StatusUnauthorized && !reauthed {
 			resp.Body.Close()
+			reauthed = true
+			c.log.Info("session expired; logging in again")
 			c.mu.Lock()
 			c.authToken = ""
 			c.mu.Unlock()
 			continue
 		}
+		retryable := code == http.StatusTooManyRequests || code >= 500 && method != http.MethodPost
+		if retryable && attempt < maxAttempts {
+			msg := readErr(resp)
+			resp.Body.Close()
+			c.log.Warn("array returned a retryable error; retrying", "method", method, "path", path, "attempt", attempt, "err", msg)
+			if err := c.backoff(ctx, attempt, resp.Header.Get("Retry-After")); err != nil {
+				return fmt.Errorf("%s %s: %s", method, path, msg)
+			}
+			continue
+		}
 		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+		if code == http.StatusBadRequest || code == http.StatusNotFound {
 			msg := readErr(resp)
 			if isNotFound(msg) {
 				return fmt.Errorf("%s %s: %w (%s)", method, path, ErrNotFound, msg)
 			}
 			return fmt.Errorf("%s %s: %s", method, path, msg)
 		}
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if code < 200 || code > 299 {
 			return fmt.Errorf("%s %s: %s", method, path, readErr(resp))
 		}
 		if out != nil {
@@ -268,7 +306,21 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 		}
 		return nil
 	}
-	return errors.New("unreachable")
+}
+
+// backoff sleeps attempt*retryBase, or Retry-After when the array sends one
+// (capped at 10s), unless ctx ends first.
+func (c *Client) backoff(ctx context.Context, attempt int, retryAfter string) error {
+	d := time.Duration(attempt) * c.retryBase
+	if n, err := strconv.Atoi(retryAfter); err == nil && n > 0 {
+		d = min(time.Duration(n)*time.Second, 10*time.Second)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 func isNotFound(msg string) bool {
@@ -330,6 +382,19 @@ func (c *Client) CreateVolume(ctx context.Context, name string, size int64) (*Vo
 	return out.Items[0].toVolume(), nil
 }
 
+// CopyVolume creates name as a copy of source.
+func (c *Client) CopyVolume(ctx context.Context, source, name string) (*Volume, error) {
+	var out page[volumeItem]
+	body := map[string]any{"source": map[string]string{"name": source}}
+	if err := c.do(ctx, http.MethodPost, "/volumes", url.Values{"names": {name}}, body, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Items) == 0 {
+		return nil, errors.New("copy volume: empty response")
+	}
+	return out.Items[0].toVolume(), nil
+}
+
 // DestroyVolume destroys a volume (24h eradication pending) and optionally
 // eradicates it immediately.
 func (c *Client) DestroyVolume(ctx context.Context, name string, eradicate bool) error {
@@ -362,8 +427,37 @@ type tagItem struct {
 
 // SetNameTag records the "<namespace>/<docker name>" tag on a volume.
 func (c *Client) SetNameTag(ctx context.Context, volume, value string) error {
-	body := []map[string]string{{"namespace": TagNamespace, "key": TagKeyName, "value": value}}
+	return c.SetTag(ctx, volume, TagKeyName, value)
+}
+
+// SetTag creates or replaces one tag in TagNamespace.
+func (c *Client) SetTag(ctx context.Context, volume, key, value string) error {
+	body := []map[string]string{{"namespace": TagNamespace, "key": key, "value": value}}
 	return c.do(ctx, http.MethodPut, "/volumes/tags/batch", url.Values{"resource_names": {volume}}, body, nil)
+}
+
+// GetTags returns the volume's tags in TagNamespace.
+func (c *Client) GetTags(ctx context.Context, volume string) (map[string]string, error) {
+	var out page[tagItem]
+	q := url.Values{"resource_names": {volume}, "namespaces": {TagNamespace}}
+	if err := c.do(ctx, http.MethodGet, "/volumes/tags", q, nil, &out); err != nil {
+		return nil, err
+	}
+	res := make(map[string]string, len(out.Items))
+	for _, t := range out.Items {
+		res[t.Key] = t.Value
+	}
+	return res, nil
+}
+
+// DeleteTag removes one tag; missing is not an error.
+func (c *Client) DeleteTag(ctx context.Context, volume, key string) error {
+	q := url.Values{"resource_names": {volume}, "namespaces": {TagNamespace}, "keys": {key}}
+	err := c.do(ctx, http.MethodDelete, "/volumes/tags", q, nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // ListNameTags returns arrayVolumeName -> tag value for every volume whose

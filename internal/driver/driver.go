@@ -86,7 +86,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
 		return nil, err
 	}
-	drv.recoverMounts()
+	drv.recoverMounts(ctx)
 
 	if cfg.ConnectOnStart {
 		if err := drv.ensureConnected(ctx); err != nil {
@@ -109,7 +109,7 @@ func (d *Driver) ensureConnected(ctx context.Context) error {
 
 // recoverMounts rebuilds in-memory state for volumes still mounted from a
 // previous plugin process (plugin upgrade/restart with running containers).
-func (d *Driver) recoverMounts() {
+func (d *Driver) recoverMounts(ctx context.Context) {
 	entries, err := os.ReadDir(d.cfg.MountRoot)
 	if err != nil {
 		d.log.Error("cannot scan mount root; existing mounts will not be recovered", "mount_root", d.cfg.MountRoot, "err", err)
@@ -128,18 +128,24 @@ func (d *Driver) recoverMounts() {
 		if !ok {
 			continue
 		}
-		an := d.arrayName(e.Name())
+		// Through the tag, so an adopted volume is keyed by its real array name.
+		an, _, err := d.resolve(ctx, e.Name())
+		if err != nil {
+			an = d.arrayName(e.Name())
+			d.log.Warn("tag lookup failed; recovering mount under its computed array name", "volume", e.Name(), "array_name", an, "err", err)
+		}
 		d.mounts[an] = &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]struct{}{}}
 		d.log.Info("recovered existing mount", "volume", e.Name(), "mountpoint", mp)
 	}
 }
 
-var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9-]+`)
+// FlashArray object names are 1-63 of [A-Za-z0-9_-]; Docker also allows '.'.
+var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 
 // arrayName maps a Docker volume name onto the FlashArray object-name charset
 // under this node's namespace. Names that survive sanitisation unchanged map
-// 1:1; anything else gets a short hash suffix so distinct Docker names can't
-// collide (e.g. "a_b" vs "a-b").
+// 1:1, as the Pure plugin's did; anything else gets a short hash suffix so
+// distinct Docker names can't collide (e.g. "a.b" vs "a-b").
 func (d *Driver) arrayName(dockerName string) string {
 	san := strings.Trim(unsafeChars.ReplaceAllString(dockerName, "-"), "-")
 	name := d.cfg.Namespace + "-" + san
@@ -160,23 +166,75 @@ func (d *Driver) tagValue(dockerName string) string { return d.cfg.Namespace + "
 // resolve maps a Docker volume name to its array volume name. The dvfa:name
 // tag is authoritative — that is what lets an imported volume keep whatever
 // name it already has on the array — and the computed name is the fallback
-// for volumes that don't exist yet.
-func (d *Driver) resolve(ctx context.Context, dockerName string) string {
+// for volumes nothing is tagged for yet. cached reports a hit in d.names. A
+// failed lookup is an error rather than a guess: the computed name may be a
+// different volume from the one the tag points at.
+func (d *Driver) resolve(ctx context.Context, dockerName string) (an string, cached bool, err error) {
 	d.mu.Lock()
 	an, ok := d.names[dockerName]
 	d.mu.Unlock()
 	if ok {
-		return an
+		return an, true, nil
 	}
-	an, err := d.array.LookupNameTag(ctx, d.tagValue(dockerName))
+	an, err = d.array.LookupNameTag(ctx, d.tagValue(dockerName))
+	if flasharray.IsNotFound(err) {
+		return d.arrayName(dockerName), false, nil
+	}
 	if err != nil {
-		if !flasharray.IsNotFound(err) {
-			d.log.Warn("tag lookup failed; using computed array name", "volume", dockerName, "err", err)
-		}
-		return d.arrayName(dockerName)
+		return "", false, fmt.Errorf("look up array volume for %s: %w", dockerName, err)
 	}
 	d.remember(dockerName, an)
-	return an
+	return an, false, nil
+}
+
+// resolveLocked resolves dockerName, takes its per-volume lock and fetches the
+// volume. Scope is global, so another node may have removed and recreated the
+// volume since we cached its name; a cached name whose volume is gone or
+// destroyed is dropped and resolved again. unlock is always non-nil.
+func (d *Driver) resolveLocked(ctx context.Context, dockerName string) (an string, v *flasharray.Volume, unlock func(), err error) {
+	an, cached, err := d.resolve(ctx, dockerName)
+	if err != nil {
+		return "", nil, func() {}, err
+	}
+	unlock = d.lock(an)
+	v, err = d.array.GetVolume(ctx, an)
+	if cached && stale(v, err) {
+		unlock()
+		if an, err = d.reresolve(ctx, dockerName, an); err != nil {
+			return "", nil, func() {}, err
+		}
+		unlock = d.lock(an)
+		v, err = d.array.GetVolume(ctx, an)
+	}
+	return an, v, unlock, err
+}
+
+// lookup is resolveLocked without the lock, for Get: Mount can hold the lock
+// for the whole attach timeout.
+func (d *Driver) lookup(ctx context.Context, dockerName string) (string, *flasharray.Volume, error) {
+	an, cached, err := d.resolve(ctx, dockerName)
+	if err != nil {
+		return "", nil, err
+	}
+	v, err := d.array.GetVolume(ctx, an)
+	if cached && stale(v, err) {
+		if an, err = d.reresolve(ctx, dockerName, an); err != nil {
+			return "", nil, err
+		}
+		v, err = d.array.GetVolume(ctx, an)
+	}
+	return an, v, err
+}
+
+func stale(v *flasharray.Volume, err error) bool {
+	return flasharray.IsNotFound(err) || err == nil && v.Destroyed
+}
+
+func (d *Driver) reresolve(ctx context.Context, dockerName, old string) (string, error) {
+	d.forget(dockerName)
+	d.log.Info("cached array name is stale; resolving again", "volume", dockerName, "array_name", old)
+	an, _, err := d.resolve(ctx, dockerName)
+	return an, err
 }
 
 func (d *Driver) remember(dockerName, arrayName string) {
@@ -223,7 +281,8 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	defer cancel()
 
 	size := d.cfg.DefaultSize
-	importName := ""
+	sizeSet := false
+	importName, source := "", ""
 	for k, v := range req.Options {
 		switch strings.ToLower(k) {
 		case "size":
@@ -231,22 +290,28 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 			if err != nil {
 				return fmt.Errorf("option size: %w", err)
 			}
-			size = s
-		case "import":
+			size, sizeSet = s, true
+		case "import", "import_from_src": // import_from_src is the Pure plugin's spelling
 			importName = v
+		case "source":
+			source = v
 		default:
-			return fmt.Errorf("unknown option %q (supported: size, import)", k)
+			return fmt.Errorf("unknown option %q (supported: size, import, import_from_src, source)", k)
 		}
 	}
-	if importName != "" {
+	switch {
+	case importName != "" && (source != "" || sizeSet):
+		return errors.New("option import cannot be combined with source or size")
+	case source != "" && sizeSet:
+		return errors.New("option size cannot be combined with source; a clone is the size of its source")
+	case importName != "":
 		return d.importVolume(ctx, req.Name, importName)
 	}
 
-	an := d.resolve(ctx, req.Name)
-	unlock := d.lock(an)
+	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
 
-	if v, err := d.array.GetVolume(ctx, an); err == nil {
+	if err == nil {
 		if v.Destroyed {
 			return fmt.Errorf("volume %s exists on the array in destroyed (pending eradication) state; recover or eradicate it first", an)
 		}
@@ -256,16 +321,78 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		return err
 	}
 
-	v, err := d.array.CreateVolume(ctx, an, size)
+	if source != "" {
+		v, err = d.cloneVolume(ctx, source, an)
+	} else if v, err = d.array.CreateVolume(ctx, an, size); err != nil {
+		err = fmt.Errorf("create volume %s: %w", an, err)
+	}
 	if err != nil {
-		return fmt.Errorf("create volume %s: %w", an, err)
+		return err
 	}
 	if err := d.array.SetNameTag(ctx, an, d.tagValue(req.Name)); err != nil {
 		d.log.Error("tagging failed; volume will not appear in list until tagged", "array_name", an, "err", err)
 	}
 	d.remember(req.Name, an)
-	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", size)
+	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", v.Provisioned, "source", source)
 	return nil
+}
+
+// cloneVolume copies source to an. source is a Docker volume in this
+// namespace or, failing that, an array volume name (the Pure plugin's
+// `source=` took array names).
+func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharray.Volume, error) {
+	src, sv, err := d.lookup(ctx, source)
+	if flasharray.IsNotFound(err) && src != source {
+		src = source
+		sv, err = d.array.GetVolume(ctx, source)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("clone source %s: %w", source, err)
+	}
+	if sv.Destroyed {
+		return nil, fmt.Errorf("clone source %s (%s) is destroyed on the array", source, src)
+	}
+	v, err := d.array.CopyVolume(ctx, src, an)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s to %s: %w", src, an, err)
+	}
+	if err := d.array.SetTag(ctx, an, flasharray.TagKeyClonePending, src); err != nil {
+		d.log.Error("marking clone failed; mounting it next to its source may fail on a duplicate filesystem UUID", "array_name", an, "source", src, "err", err)
+	}
+	return v, nil
+}
+
+// mountOptions returns the mount options for an, first giving a pending clone
+// its own filesystem UUID: the copy carries its source's, and XFS refuses to
+// mount a UUID that is already mounted on the host. If that fails (a dirty log
+// from cloning a volume in use) XFS mounts with nouuid, which replays the log,
+// and the next mount tries again.
+func (d *Driver) mountOptions(ctx context.Context, an, dockerName, dev string) string {
+	opts := d.cfg.MountOptions
+	tags, err := d.array.GetTags(ctx, an)
+	if err != nil {
+		d.log.Warn("cannot read volume tags; assuming it is not a pending clone", "volume", dockerName, "array_name", an, "err", err)
+		return opts
+	}
+	if _, ok := tags[flasharray.TagKeyClonePending]; !ok {
+		return opts
+	}
+	if err := d.mnt.RegenerateUUID(ctx, dev, d.cfg.FSType); err != nil {
+		if d.cfg.FSType != "xfs" {
+			d.log.Warn("could not give clone a new filesystem UUID", "volume", dockerName, "dev", dev, "err", err)
+			return opts
+		}
+		d.log.Warn("could not give clone a new filesystem UUID; mounting with nouuid this time", "volume", dockerName, "dev", dev, "err", err)
+		if opts == "" {
+			return "nouuid"
+		}
+		return opts + ",nouuid"
+	}
+	if err := d.array.DeleteTag(ctx, an, flasharray.TagKeyClonePending); err != nil {
+		d.log.Warn("clear clone marker failed; the UUID will be regenerated again on next mount", "array_name", an, "err", err)
+	}
+	d.log.Info("gave cloned volume a new filesystem UUID", "volume", dockerName, "dev", dev)
+	return opts
 }
 
 // importVolume adopts an existing array volume under a Docker name without
@@ -322,9 +449,15 @@ func Adopt(ctx context.Context, array flasharray.Array, namespace, dockerName, a
 func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	ctx, cancel := d.ctx()
 	defer cancel()
-	an := d.resolve(ctx, req.Name)
-	unlock := d.lock(an)
+	an, _, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
+	if err != nil {
+		if flasharray.IsNotFound(err) {
+			d.forget(req.Name)
+			return nil
+		}
+		return err
+	}
 
 	d.mu.Lock()
 	_, mounted := d.mounts[an]
@@ -361,10 +494,10 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) {
 	ctx, cancel := d.ctx()
 	defer cancel()
-	an := d.resolve(ctx, req.Name)
-	unlock := d.lock(an)
+	an, vol, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
 
+	// Already mounted here: serve it even if the array lookup failed.
 	d.mu.Lock()
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
@@ -373,7 +506,6 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return &plugin.MountResponse{Mountpoint: st.mountpoint}, nil
 	}
 
-	vol, err := d.array.GetVolume(ctx, an)
 	if err != nil {
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}
@@ -423,7 +555,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 	mp := filepath.Join(d.cfg.MountRoot, req.Name)
-	if err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, d.cfg.MountOptions); err != nil {
+	if err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, d.mountOptions(ctx, an, req.Name, dev)); err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, err
 	}
@@ -454,7 +586,10 @@ func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
 func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	ctx, cancel := d.ctx()
 	defer cancel()
-	an := d.resolve(ctx, req.Name)
+	an, _, err := d.resolve(ctx, req.Name)
+	if err != nil {
+		return err
+	}
 	unlock := d.lock(an)
 	defer unlock()
 
@@ -488,10 +623,15 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		}
 		serial = v.Serial
 	}
-	var errs []error
 	if err := d.tr.Detach(ctx, serial, st.dev); err != nil {
-		errs = append(errs, err)
+		// Disconnecting on the array under a device the host still holds turns
+		// a cleanup failure into I/O errors for whatever holds it.
+		d.mu.Lock()
+		delete(d.mounts, an)
+		d.mu.Unlock()
+		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", req.Name, err)
 	}
+	var errs []error
 	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
 		errs = append(errs, err)
 	}
@@ -520,8 +660,7 @@ func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
 func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
 	ctx, cancel := d.ctx()
 	defer cancel()
-	an := d.resolve(ctx, req.Name)
-	v, err := d.array.GetVolume(ctx, an)
+	an, v, err := d.lookup(ctx, req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}

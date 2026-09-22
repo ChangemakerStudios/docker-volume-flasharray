@@ -69,6 +69,10 @@ func (t *nvmeTCP) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if err != nil {
 			host, port = p.Portal, "4420"
 		}
+		if err := probePortal(ctx, net.JoinHostPort(host, port)); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		out, err := run(ctx, t.log, "nvme", "connect", "-t", "tcp", "-a", host, "-s", port, "-n", p.NQN,
 			"--ctrl-loss-tmo", "-1", "--reconnect-delay", "5")
 		if err != nil && !strings.Contains(strings.ToLower(out), "already connected") {
@@ -129,7 +133,7 @@ func (t *nvmeTCP) WaitForDevice(ctx context.Context, serial string) (string, err
 	t.rescan(ctx)
 	start := time.Now()
 	lastRescan := start
-	return waitFor(ctx, t.opts.Timeout, func() (string, bool) {
+	return waitFor(ctx, t.opts.Timeout, 250*time.Millisecond, func() (string, bool) {
 		if devs := sysBlockMatching("nvme*n*", serial); len(devs) > 0 {
 			// With native multipath the head node (nvmeXnY under the subsystem)
 			// is what /sys/class/block lists; per-path nodes are nvmeXcYnZ and
