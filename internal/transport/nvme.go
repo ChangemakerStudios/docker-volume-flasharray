@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
 
 // nvmeTCP drives nvme-cli against FlashArray NVMe/TCP ports. With the kernel's
@@ -36,7 +37,7 @@ const hostNQNFile = "/etc/nvme/hostnqn"
 func (t *nvmeTCP) Name() string { return "nvme-tcp" }
 
 func (t *nvmeTCP) InitiatorIDs() ([]string, []string, error) {
-	b, err := os.ReadFile(hostPath(hostNQNFile))
+	b, err := os.ReadFile(hostexec.Path(hostNQNFile))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read host %s (generate with `nvme gen-hostnqn`): %w", hostNQNFile, err)
 	}

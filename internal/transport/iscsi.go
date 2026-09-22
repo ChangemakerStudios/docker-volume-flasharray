@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
 
 // iscsi drives open-iscsi (iscsiadm) and relies on the host's multipathd to
@@ -49,7 +50,7 @@ func multipathdRunning() bool {
 func (t *iscsi) Name() string { return "iscsi" }
 
 func (t *iscsi) InitiatorIDs() ([]string, []string, error) {
-	b, err := os.ReadFile(hostPath(initiatorNameFile))
+	b, err := os.ReadFile(hostexec.Path(initiatorNameFile))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read host %s (is open-iscsi installed?): %w", initiatorNameFile, err)
 	}

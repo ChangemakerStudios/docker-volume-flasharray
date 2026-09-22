@@ -10,12 +10,14 @@ global`, so a volume created on one node can be mounted on another).
 > replacement for the end-of-life `purestorage/docker-plugin`.
 
 Zero Go dependencies outside the standard library. Like the Pure plugin, it
-runs the **host's own** `iscsiadm`, `multipathd`, `multipath`, `dmsetup` and
-`nvme` (via `nsenter` into the host mount and IPC namespaces, which is why it
-uses the host PID namespace), so the client always matches the host's
-`iscsid`/`multipathd` and reads the host's `/etc/iscsi`, `/etc/nvme` and
-`multipath.conf` directly. Only `mkfs`, `blkid`, `mount` and `blockdev` run
-from the plugin image. It does not mount the host's `/run`: on a systemd host
+runs the **host's own** `iscsiadm`, `multipathd`, `multipath`, `dmsetup`,
+`nvme`, `mkfs.*`, `blkid`, `xfs_admin` and `tune2fs` (via `nsenter` into the
+host mount and IPC namespaces, which is why it uses the host PID namespace).
+The client then always matches the host's `iscsid`/`multipathd`, reads the
+host's `/etc/iscsi`, `/etc/nvme` and `multipath.conf` directly, and formats
+with the host's own xfsprogs, so a new filesystem never has features the
+host kernel cannot mount. Only `mount`, `umount` and `blockdev` run from the
+plugin image; the mount has to land in the plugin's propagated mount. It does not mount the host's `/run`: on a systemd host
 that is a shared mount, and Docker's own per-plugin mount under it would
 propagate back onto the host and break plugin startup.
 
@@ -59,7 +61,8 @@ docker plugin install --alias flasharray --grant-all-permissions \
 ```
 
 Host prerequisites (the plugin uses these host binaries rather than shipping
-its own): `open-iscsi` (running `iscsid`) and `multipath-tools` for iSCSI,
+its own): `xfsprogs` (or `e2fsprogs` for ext4); `open-iscsi` (running
+`iscsid`) and `multipath-tools` for iSCSI,
 configured as in [Multipath safety](#multipath-safety); `nvme-cli` and an
 `/etc/nvme/hostnqn` for NVMe/TCP. The host's
 `/etc/iscsi/initiatorname.iscsi` or `/etc/nvme/hostnqn` is what identifies

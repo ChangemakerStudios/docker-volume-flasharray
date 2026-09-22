@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
 
 // Mounter wraps blkid/mkfs/mount/umount.
@@ -31,7 +33,7 @@ func New(log *slog.Logger) Mounter { return &execMounter{log: log} }
 type execMounter struct{ log *slog.Logger }
 
 func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string) (bool, error) {
-	out, err := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
+	out, err := hostexec.Command(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
 	// blkid exits 2 when it finds no filesystem; any other failure (device not
 	// ready, I/O error) also prints nothing, and formatting then would wipe data.
 	var ee *exec.ExitError
@@ -47,7 +49,7 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 	}
 	args := append([]string{}, mkfsOpts...)
 	args = append(args, dev)
-	if b, err := exec.CommandContext(ctx, "mkfs."+fstype, args...).CombinedOutput(); err != nil {
+	if b, err := hostexec.Command(ctx, "mkfs."+fstype, args...).CombinedOutput(); err != nil {
 		return false, fmt.Errorf("mkfs.%s %s: %w: %s", fstype, dev, err, strings.TrimSpace(string(b)))
 	}
 	return true, nil
@@ -64,7 +66,7 @@ func (m *execMounter) RegenerateUUID(ctx context.Context, dev, fstype string) er
 	default:
 		return fmt.Errorf("regenerate UUID: unsupported filesystem %q", fstype)
 	}
-	if b, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err != nil {
+	if b, err := hostexec.Command(ctx, name, args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(b)))
 	}
 	return nil
@@ -79,14 +81,14 @@ func (m *execMounter) Mount(ctx context.Context, dev, target, fstype, opts strin
 		args = append(args, "-o", opts)
 	}
 	args = append(args, dev, target)
-	if b, err := exec.CommandContext(ctx, "mount", args...).CombinedOutput(); err != nil {
+	if b, err := hostexec.Command(ctx, "mount", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("mount %s %s: %w: %s", dev, target, err, strings.TrimSpace(string(b)))
 	}
 	return nil
 }
 
 func (m *execMounter) Unmount(ctx context.Context, target string) error {
-	if b, err := exec.CommandContext(ctx, "umount", target).CombinedOutput(); err != nil {
+	if b, err := hostexec.Command(ctx, "umount", target).CombinedOutput(); err != nil {
 		if strings.Contains(string(b), "not mounted") {
 			return nil
 		}
