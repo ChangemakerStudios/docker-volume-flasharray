@@ -119,6 +119,14 @@ func run(ctx context.Context, log *slog.Logger, name string, args ...string) (st
 	return s, nil
 }
 
+// runTimeout is run with its own deadline, for cleanup steps that must not
+// eat the whole request budget when a device is wedged.
+func runTimeout(ctx context.Context, log *slog.Logger, d time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	return run(ctx, log, name, args...)
+}
+
 func exitCode(err error) int {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
@@ -137,10 +145,10 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// waitFor polls fn every 250ms until it returns a path or the context/timeout expires.
-func waitFor(ctx context.Context, timeout time.Duration, fn func() (string, bool)) (string, error) {
+// waitFor polls fn every interval until it returns a path or the context/timeout expires.
+func waitFor(ctx context.Context, timeout, interval time.Duration, fn func() (string, bool)) (string, error) {
 	deadline := time.Now().Add(timeout)
-	t := time.NewTicker(250 * time.Millisecond)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		if p, ok := fn(); ok {
@@ -165,7 +173,7 @@ func sysBlockMatching(pattern, needle string) []string {
 	var out []string
 	for _, m := range matches {
 		for _, f := range []string{"wwid", "device/wwid"} {
-			b, err := os.ReadFile(filepath.Join(m, f))
+			b, err := readFileTimeout(filepath.Join(m, f), 3*time.Second)
 			if err != nil {
 				continue
 			}
@@ -178,7 +186,50 @@ func sysBlockMatching(pattern, needle string) []string {
 	return out
 }
 
+// probePortal checks the portal accepts TCP before iscsiadm/nvme spend their
+// much longer login timeouts on it.
+func probePortal(ctx context.Context, addr string) error {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("portal %s unreachable: %w", addr, err)
+	}
+	return conn.Close()
+}
+
 func exists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// readFileTimeout and writeFileTimeout bound sysfs access, which can block in
+// uninterruptible sleep on a dead device. On timeout the goroutine is
+// abandoned (it cannot be interrupted); the caller moves on.
+func readFileTimeout(path string, d time.Duration) ([]byte, error) {
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := os.ReadFile(path)
+		ch <- result{b, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.b, r.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("read %s: timed out after %s", path, d)
+	}
+}
+
+func writeFileTimeout(path, data string, d time.Duration) error {
+	ch := make(chan error, 1)
+	go func() { ch <- os.WriteFile(path, []byte(data), 0o200) }()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(d):
+		return fmt.Errorf("write %s: timed out after %s", path, d)
+	}
 }

@@ -18,6 +18,8 @@ type Mounter interface {
 	// Returns true if it formatted.
 	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string) (bool, error)
 	Mount(ctx context.Context, dev, target, fstype, opts string) error
+	// RegenerateUUID gives the (unmounted) filesystem on dev a new UUID.
+	RegenerateUUID(ctx context.Context, dev, fstype string) error
 	Unmount(ctx context.Context, target string) error
 	// IsMounted reports whether target is a mountpoint per /proc/self/mountinfo.
 	IsMounted(target string) (bool, error)
@@ -49,6 +51,23 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 		return false, fmt.Errorf("mkfs.%s %s: %w: %s", fstype, dev, err, strings.TrimSpace(string(b)))
 	}
 	return true, nil
+}
+
+func (m *execMounter) RegenerateUUID(ctx context.Context, dev, fstype string) error {
+	var name string
+	var args []string
+	switch fstype {
+	case "xfs":
+		name, args = "xfs_admin", []string{"-U", "generate", dev}
+	case "ext2", "ext3", "ext4":
+		name, args = "tune2fs", []string{"-U", "random", dev}
+	default:
+		return fmt.Errorf("regenerate UUID: unsupported filesystem %q", fstype)
+	}
+	if b, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 func (m *execMounter) Mount(ctx context.Context, dev, target, fstype, opts string) error {

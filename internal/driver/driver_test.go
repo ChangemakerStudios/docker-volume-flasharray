@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,17 +19,19 @@ import (
 // --- fakes -----------------------------------------------------------------
 
 type fakeArray struct {
-	mu      sync.Mutex
-	vols    map[string]*flasharray.Volume
-	tags    map[string]string
-	hosts   map[string][]string
-	conns   map[string]map[string]int // volume -> host -> lun
-	nextLUN int
-	calls   []string
+	mu        sync.Mutex
+	vols      map[string]*flasharray.Volume
+	tags      map[string]string            // dvfa:name only
+	extra     map[string]map[string]string // other dvfa tags: volume -> key -> value
+	lookupErr error                        // returned by LookupNameTag
+	hosts     map[string][]string
+	conns     map[string]map[string]int // volume -> host -> lun
+	nextLUN   int
+	calls     []string
 }
 
 func newFakeArray() *fakeArray {
-	return &fakeArray{vols: map[string]*flasharray.Volume{}, tags: map[string]string{}, hosts: map[string][]string{}, conns: map[string]map[string]int{}, nextLUN: 1}
+	return &fakeArray{vols: map[string]*flasharray.Volume{}, tags: map[string]string{}, extra: map[string]map[string]string{}, hosts: map[string][]string{}, conns: map[string]map[string]int{}, nextLUN: 1}
 }
 
 func (f *fakeArray) rec(s string) { f.calls = append(f.calls, s) }
@@ -51,6 +54,49 @@ func (f *fakeArray) CreateVolume(_ context.Context, name string, size int64) (*f
 	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: size, Created: time.Now()}
 	f.vols[name] = v
 	return v, nil
+}
+
+func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flasharray.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rec("copy:" + source + ":" + name)
+	src, ok := f.vols[source]
+	if !ok {
+		return nil, flasharray.ErrNotFound
+	}
+	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now()}
+	f.vols[name] = v
+	return v, nil
+}
+
+func (f *fakeArray) SetTag(_ context.Context, volume, key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.extra[volume] == nil {
+		f.extra[volume] = map[string]string{}
+	}
+	f.extra[volume][key] = value
+	return nil
+}
+
+func (f *fakeArray) GetTags(_ context.Context, volume string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range f.extra[volume] {
+		out[k] = v
+	}
+	if v, ok := f.tags[volume]; ok {
+		out[flasharray.TagKeyName] = v
+	}
+	return out, nil
+}
+
+func (f *fakeArray) DeleteTag(_ context.Context, volume, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.extra[volume], key)
+	return nil
 }
 
 func (f *fakeArray) DestroyVolume(_ context.Context, name string, eradicate bool) error {
@@ -91,6 +137,9 @@ func (f *fakeArray) ListNameTags(_ context.Context, prefix string) (map[string]s
 func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.lookupErr != nil {
+		return "", f.lookupErr
+	}
 	for an, v := range f.tags {
 		if v == value {
 			return an, nil
@@ -198,10 +247,13 @@ type fakeMounter struct {
 	mu        sync.Mutex
 	formatted map[string]bool
 	mounted   map[string]string // target -> dev
+	opts      map[string]string // target -> mount options
+	uuidErr   error             // returned by RegenerateUUID
+	uuidRegen []string          // devs given a new UUID
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}}
+	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}}
 }
 func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string) (bool, error) {
 	m.mu.Lock()
@@ -212,10 +264,20 @@ func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []str
 	m.formatted[dev] = true
 	return true, nil
 }
-func (m *fakeMounter) Mount(_ context.Context, dev, target, _, _ string) error {
+func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mounted[target] = dev
+	m.opts[target] = opts
+	return nil
+}
+func (m *fakeMounter) RegenerateUUID(_ context.Context, dev, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.uuidErr != nil {
+		return m.uuidErr
+	}
+	m.uuidRegen = append(m.uuidRegen, dev)
 	return nil
 }
 func (m *fakeMounter) Unmount(_ context.Context, target string) error {
@@ -261,9 +323,10 @@ func TestArrayName(t *testing.T) {
 		hashSuffix bool
 	}{
 		"mongodb-1":             {want: "node1-mongodb-1"},
-		"cas_store":             {hashSuffix: true},
+		"cas_store":             {want: "node1-cas_store"},
 		"seq.store":             {hashSuffix: true},
-		"a_b":                   {hashSuffix: true},
+		"seq-store":             {want: "node1-seq-store"},
+		"a_b":                   {want: "node1-a_b"},
 		"a-b":                   {want: "node1-a-b"},
 		"CamelCase123":          {want: "node1-CamelCase123"},
 		strings.Repeat("x", 80): {hashSuffix: true},
@@ -474,5 +537,159 @@ func TestImportAdoptsExistingArrayVolume(t *testing.T) {
 	}
 	if !fa.vols[old.Name].Destroyed {
 		t.Fatal("remove did not destroy the adopted volume")
+	}
+}
+
+func TestStaleCachedNameIsResolvedAgain(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	// Another node removes and eradicates it, then imports a different volume under the same name.
+	fa.mu.Lock()
+	delete(fa.vols, "node1-v")
+	delete(fa.tags, "node1-v")
+	fa.mu.Unlock()
+	repl, _ := fa.CreateVolume(context.Background(), "legacy-v", 1<<30)
+	_ = fa.SetNameTag(context.Background(), repl.Name, "node1/v")
+
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Volume.Status["array_name"] != repl.Name {
+		t.Fatalf("array_name = %v, want %s", g.Volume.Status["array_name"], repl.Name)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fa.conns[repl.Name]["node1"]; !ok {
+		t.Fatalf("mount attached the wrong volume: %v", fa.conns)
+	}
+}
+
+func TestRecoveredMountOfAdoptedVolumeUnmounts(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old, _ := fa.CreateVolume(context.Background(), "sblinuxdev-chromadb_data", 1<<30)
+	if err := d.Create(&plugin.CreateRequest{Name: "chromadb_data", Options: map[string]string{"import": old.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.Mount(&plugin.MountRequest{Name: "chromadb_data", ID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(r.Mountpoint, 0o755); err != nil { // the fake mounter doesn't create it
+		t.Fatal(err)
+	}
+
+	// Plugin restart: a fresh driver must key the recovered mount by the tagged array name.
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.Unmount(&plugin.UnmountRequest{Name: "chromadb_data", ID: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := fm.IsMounted(r.Mountpoint); ok {
+		t.Fatal("recovered mount was not unmounted")
+	}
+	if n := len(tr.detaches); n == 0 || tr.detaches[n-1] != old.Serial {
+		t.Fatalf("detaches = %v, want last %s", tr.detaches, old.Serial)
+	}
+}
+
+func TestCloneFromSource(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "pg", Options: map[string]string{"size": "10GiB"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}); err != nil {
+		t.Fatal(err)
+	}
+	an := d.arrayName("pg_copy")
+	c := fa.vols[an]
+	if c == nil || c.Provisioned != 10<<30 {
+		t.Fatalf("clone = %+v", c)
+	}
+	if fa.tags[an] != "node1/pg_copy" || fa.extra[an][flasharray.TagKeyClonePending] != "node1-pg" {
+		t.Fatalf("tags: name=%q extra=%v", fa.tags[an], fa.extra[an])
+	}
+	// First mount gives the clone its own filesystem UUID and clears the marker.
+	r, err := d.Mount(&plugin.MountRequest{Name: "pg_copy", ID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fm.uuidRegen) != 1 || fm.opts[r.Mountpoint] != "" {
+		t.Fatalf("regen=%v opts=%q", fm.uuidRegen, fm.opts[r.Mountpoint])
+	}
+	if _, ok := fa.extra[an][flasharray.TagKeyClonePending]; ok {
+		t.Fatal("clone marker not cleared")
+	}
+	// A plain volume never gets its UUID touched.
+	if _, err := d.Mount(&plugin.MountRequest{Name: "pg", ID: "c2"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fm.uuidRegen) != 1 {
+		t.Fatalf("regenerated UUID on a non-clone: %v", fm.uuidRegen)
+	}
+}
+
+func TestCloneFallsBackToNouuid(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	fm.uuidErr = errors.New("xfs_admin: log is dirty")
+	d := newTestDriver(t, fa, tr, fm)
+	src, _ := fa.CreateVolume(context.Background(), "legacy-data", 1<<30)
+	// source may be a raw array volume name, as with the Pure plugin.
+	if err := d.Create(&plugin.CreateRequest{Name: "copy", Options: map[string]string{"source": src.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.Mount(&plugin.MountRequest{Name: "copy", ID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm.opts[r.Mountpoint] != "nouuid" {
+		t.Fatalf("opts = %q, want nouuid", fm.opts[r.Mountpoint])
+	}
+	if _, ok := fa.extra["node1-copy"][flasharray.TagKeyClonePending]; !ok {
+		t.Fatal("marker must stay so the next mount retries")
+	}
+}
+
+func TestCreateOptionCombinations(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old, _ := fa.CreateVolume(context.Background(), "legacy-x", 1<<30)
+	for _, opts := range []map[string]string{
+		{"source": "a", "size": "1G"},
+		{"import": "a", "source": "b"},
+		{"import_from_src": "a", "size": "1G"},
+	} {
+		if err := d.Create(&plugin.CreateRequest{Name: "v", Options: opts}); err == nil {
+			t.Errorf("%v: expected error", opts)
+		}
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "x", Options: map[string]string{"import_from_src": old.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.tags[old.Name] != "node1/x" {
+		t.Fatalf("import_from_src did not adopt: %v", fa.tags)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "y", Options: map[string]string{"source": "missing"}}); err == nil {
+		t.Fatal("expected error cloning a missing source")
+	}
+}
+
+func TestTagLookupFailureDoesNotGuess(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	fa.lookupErr = errors.New("HTTP 503")
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err == nil {
+		t.Fatal("expected create to fail when the tag lookup fails")
+	}
+	if len(fa.vols) != 0 {
+		t.Fatalf("created a volume under a guessed name: %v", fa.calls)
 	}
 }

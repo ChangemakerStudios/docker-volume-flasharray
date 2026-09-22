@@ -22,8 +22,11 @@ stall the host for minutes. This driver:
 
 - logs in to array portals **once at plugin start**, not lazily during the
   first container mount after boot;
-- waits for the device via `/dev/disk/by-id` and only ever nudges multipathd
-  with targeted `add path` calls, never a global reconfigure;
+- waits for the device by asking multipathd for the map with the volume's
+  WWID, and only ever nudges it with targeted `add path` calls, never a
+  global reconfigure;
+- tears a device down in the order that can't hang the host (see
+  [Multipath safety](#multipath-safety));
 - supports **NVMe/TCP**, where the kernel's native multipath means one block
   device per volume instead of one per path and no `multipath.conf` at all;
 - lets you restrict which array portals are used (`FA_ALLOWED_CIDRS`).
@@ -50,10 +53,71 @@ docker plugin install --alias flasharray --grant-all-permissions \
 ```
 
 Host prerequisites: `open-iscsi` (running `iscsid`) and `multipath-tools`
-for iSCSI; `nvme-cli` and an `/etc/nvme/hostnqn` for NVMe/TCP. The host's
+for iSCSI, configured as in [Multipath safety](#multipath-safety);
+`nvme-cli` and an `/etc/nvme/hostnqn` for NVMe/TCP. The host's
 `/etc/iscsi/initiatorname.iscsi` or `/etc/nvme/hostnqn` is what identifies
 the node to the array; the plugin creates (or reuses) a FlashArray host
 object named after `FA_HOST_NAME` (default: hostname).
+
+`endpoint` must be the array's **virtual** management IP (`vir0`, see
+`purenetwork list`) or a name resolving to it, not a controller's own
+address: a controller's address leaves with it on failover, and every
+create, mount and remove fails until it returns. Running containers are
+unaffected either way; the data path fails over through multipath.
+
+The API token needs create/modify/delete/list on volumes and hosts, plus
+list on ports. On Purity 6.6+ prefer a token from a user inside a realm: the
+array then scopes what the plugin can see and touch, and caps its capacity,
+instead of the token being array-wide.
+
+## Multipath safety
+
+Adapted from [jt-pve-storage-purestorage](https://github.com/jasoncheng7115/jt-pve-storage-purestorage),
+whose author found these the hard way: getting them wrong has left host
+processes in uninterruptible sleep, recoverable only by a reboot.
+
+1. **Never run `multipath -F`** (capital F). It flushes every unused map on
+   the host, including other storage that happens to be idle. Flush one map
+   with `multipath -f <name>`. The plugin only ever removes the map for the
+   volume it is detaching.
+2. **Restart multipathd after editing its config** (`systemctl restart
+   multipathd`); `reload` only re-reads the file.
+3. **Don't queue I/O forever.** `no_path_retry queue` on a device whose
+   paths are gone makes `multipath -f`, `sync`, `blockdev --flushbufs` and
+   anything that opens the device hang. Bound it. Settings for Pure, in
+   `/etc/multipath/conf.d/pure.conf` or `/etc/multipath.conf`:
+
+   ```
+   defaults {
+       polling_interval   10
+       no_path_retry      30
+       fast_io_fail_tmo   5
+       dev_loss_tmo       60
+   }
+   devices {
+       device {
+           vendor               "PURE"
+           product              "FlashArray"
+           path_selector        "queue-length 0"
+           path_grouping_policy group_by_prio
+           prio                 alua
+           hardware_handler     "1 alua"
+           failback             immediate
+           no_path_retry        30
+           fast_io_fail_tmo     5
+           dev_loss_tmo         60
+       }
+   }
+   ```
+
+On unmount the plugin refuses to touch a map that still has holders, turns
+queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
+fail_if_no_path`) before flushing it, removes it with `multipathd remove
+map`, falling back to `multipath -f` then `dmsetup remove --force`, and
+deletes each SCSI path only after checking it still carries the volume's
+WWID, because the kernel reuses `sdX` names as soon as they are freed. If
+any step fails it leaves the array connection in place rather than pull the
+LUN out from under the host.
 
 ## Use
 
@@ -72,10 +136,41 @@ volumes:
       size: 50GiB
 ```
 
-Volumes are named `<namespace>-<name>` on the array (with a short hash suffix
-when the Docker name contains characters the array rejects, e.g. `_`), and
-tagged `dvfa:name=<namespace>/<docker name>` so `docker volume ls` shows the
-original names from any node.
+| Option | Meaning |
+| --- | --- |
+| `size` | provisioned size, e.g. `50GiB`, `500M`, `1T` (default `FA_DEFAULT_SIZE`) |
+| `source` | create the volume as an array-side copy of another: a Docker volume in this namespace, or else an array volume name. Not combinable with `size`; a clone is the size of its source |
+| `import` | adopt an existing array volume under this Docker name instead of creating one (see [Migrating from the Pure plugin](#migrating-from-the-pure-plugin)). `import_from_src`, the Pure plugin's spelling, is accepted too |
+
+```bash
+docker volume create -d flasharray -o source=pgdata pgdata-test
+```
+
+A clone is instant and crash-consistent: cloning a volume that is mounted and
+being written gives you what a power cut would have left. Stop the writer, or
+snapshot at the application level, when that matters. The copy also carries
+its source's filesystem UUID, and XFS refuses to mount a UUID that is already
+mounted on the host, so the first mount of a clone gives it a new one
+(`xfs_admin -U generate`, or `tune2fs -U random` for ext4). If that fails
+because the clone's log is dirty, XFS mounts it with `nouuid` once, which
+replays the log, and the next mount tries again. Clones are marked on the
+array with a `dvfa:clone-pending=<source>` tag until that is done.
+
+New volumes are named `<namespace>-<name>` on the array, as the Pure plugin
+named them (with a short hash suffix when the Docker name contains
+characters the array rejects, i.e. `.`, or would exceed 63 characters),
+and tagged `dvfa:name=<namespace>/<docker name>` so `docker volume ls` shows
+the original names from any node.
+
+The tag, not the array name, is what the driver goes by: every operation
+looks the Docker name up through `dvfa:name` and only falls back to the
+computed `<namespace>-<name>` when nothing is tagged. If the lookup itself
+fails (array unreachable) the operation fails rather than guess, since the
+computed name may be a different volume. That is why an imported volume
+keeps whatever name it already had on the array. Each node caches the
+mapping; if a cached array volume turns out to be gone or destroyed (another
+node removed and recreated it), the node drops the entry and looks it up
+again.
 
 ## Settings
 
@@ -136,6 +231,13 @@ tag on the array, Docker's local record of which driver owns the name, and
    The binary is on each GitHub release (and as a build artifact of every
    `develop` run). `--volume <array>=<docker>` handles one-offs whose Docker
    name isn't simply the array name minus the prefix.
+
+   Each line of the plan is `would` (will be tagged), `skip` (already tagged
+   correctly) or `CONFLICT`: the array volume is already tagged with another
+   name, or the Docker name already maps to a different array volume
+   (including an earlier line of the same plan). `--dry-run` reports every
+   conflict the real run would hit and exits non-zero if there are any, so
+   fix those before running it for real. Destroyed volumes are left out.
 5. Change `driver: pure` to `driver: flasharray` in the stack files and
    `docker stack deploy`. `Create` is idempotent and resolves names through
    the tag, so the services come up on their existing data.
@@ -172,9 +274,18 @@ rootfs directly; no `docker create`/`export` step.
 
 ## Status
 
-Early. The array client, name mapping, mount reference counting and failure
-rollback are unit-tested against fakes; the transports are exercised only on
-real hardware. Expect the iSCSI path to be the first one hardened.
+Early. The array client (including retries), name mapping, adoption,
+cloning, mount reference counting and failure rollback are unit-tested
+against fakes; the transports are exercised only on real hardware. The iSCSI
+attach/detach sequence follows jt-pve-storage-purestorage, which has been
+through many field releases; NVMe/TCP device matching has not yet been
+verified on an array.
+
+The array client retries 429 for any request and 5xx or transport errors
+for everything but POST (a create whose response was lost may already have
+happened), and logs in again on 401. When a device does not appear in time,
+the error carries what the host knows about the WWID: SCSI paths found,
+whether multipathd built a map, and the `/dev/disk/by-id` links.
 
 ## License
 

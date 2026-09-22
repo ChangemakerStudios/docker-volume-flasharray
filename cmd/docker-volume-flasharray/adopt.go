@@ -104,6 +104,12 @@ func adopt(ctx context.Context, array flasharray.Array, namespace, prefix string
 	if err != nil {
 		return err
 	}
+	// claimed is tag value -> array volume, so dry-run catches a Docker name
+	// already mapped elsewhere, including by an earlier entry in this plan.
+	claimed := make(map[string]string, len(already))
+	for an, val := range already {
+		claimed[val] = an
+	}
 
 	var failed int
 	for _, p := range plan {
@@ -116,7 +122,12 @@ func adopt(ctx context.Context, array flasharray.Array, namespace, prefix string
 			fmt.Fprintf(out, "CONFLICT %-40s tagged %s, wanted %s\n", p.arrayName, already[p.arrayName], want)
 			failed++
 			continue
+		case claimed[want] != "" && claimed[want] != p.arrayName:
+			fmt.Fprintf(out, "CONFLICT %-40s %s already maps to %s\n", p.arrayName, want, claimed[want])
+			failed++
+			continue
 		}
+		claimed[want] = p.arrayName
 		if dryRun {
 			fmt.Fprintf(out, "would   %-40s -> %s\n", p.arrayName, want)
 			continue

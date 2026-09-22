@@ -26,6 +26,14 @@ func (m *memArray) CreateVolume(context.Context, string, int64) (*flasharray.Vol
 	panic("not used")
 }
 func (m *memArray) DestroyVolume(context.Context, string, bool) error { panic("not used") }
+func (m *memArray) CopyVolume(context.Context, string, string) (*flasharray.Volume, error) {
+	panic("not used")
+}
+func (m *memArray) SetTag(context.Context, string, string, string) error { panic("not used") }
+func (m *memArray) GetTags(context.Context, string) (map[string]string, error) {
+	panic("not used")
+}
+func (m *memArray) DeleteTag(context.Context, string, string) error { panic("not used") }
 func (m *memArray) SetNameTag(_ context.Context, v, val string) error {
 	m.tags[v] = val
 	return nil
@@ -101,5 +109,28 @@ func TestAdoptPrefix(t *testing.T) {
 	err := adopt(context.Background(), a, "docker", "", []string{"unrelated=chromadb_data"}, false, &out, nil)
 	if err == nil || !strings.Contains(out.String(), "CONFLICT") && !strings.Contains(out.String(), "FAILED") {
 		t.Fatalf("expected conflict, got %v\n%s", err, out.String())
+	}
+}
+
+func TestAdoptDryRunReportsNameConflict(t *testing.T) {
+	a := &memArray{
+		vols: map[string]*flasharray.Volume{
+			"pre-a":   {Name: "pre-a", Serial: "a"},
+			"pre-b":   {Name: "pre-b", Serial: "b"},
+			"current": {Name: "current", Serial: "c"},
+		},
+		tags: map[string]string{"current": "docker/a"},
+	}
+	var out bytes.Buffer
+	// pre-a collides with an existing mapping; pre-b and the explicit entry collide with each other.
+	err := adopt(context.Background(), a, "docker", "pre-", []string{"pre-a=b"}, true, &out, nil)
+	if err == nil {
+		t.Fatalf("expected dry-run to fail\n%s", out.String())
+	}
+	if got := strings.Count(out.String(), "CONFLICT"); got != 2 {
+		t.Fatalf("want 2 conflicts, got %d\n%s", got, out.String())
+	}
+	if len(a.tags) != 1 {
+		t.Fatal("dry-run must not write tags")
 	}
 }
