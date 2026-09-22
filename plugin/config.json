@@ -8,18 +8,17 @@
     "socket": "flasharray.sock"
   },
   "network": { "type": "host" },
+  "pidhost": true,
   "propagatedmount": "/mnt/flasharray",
   "linux": {
     "allowAllDevices": true,
-    "capabilities": ["CAP_SYS_ADMIN", "CAP_SYS_RESOURCE", "CAP_NET_ADMIN", "CAP_MKNOD", "CAP_SYS_MODULE"],
+    "capabilities": ["CAP_SYS_ADMIN", "CAP_SYS_RESOURCE", "CAP_NET_ADMIN", "CAP_MKNOD", "CAP_SYS_MODULE", "CAP_SYS_PTRACE", "CAP_SYS_CHROOT"],
     "devices": null
   },
   "mounts": [
     { "name": "config", "description": "array credentials file directory", "source": "/etc/docker-volume-flasharray", "destination": "/etc/docker-volume-flasharray", "type": "bind", "options": ["rbind", "ro"], "settable": ["source"] },
     { "name": "dev", "source": "/dev", "destination": "/dev", "type": "bind", "options": ["rbind"] },
     { "name": "sys", "source": "/sys", "destination": "/sys", "type": "bind", "options": ["rbind"] },
-    { "name": "iscsi", "description": "host initiator name and node database", "source": "/etc/iscsi", "destination": "/etc/iscsi", "type": "bind", "options": ["rbind"] },
-    { "name": "nvme", "description": "host NQN", "source": "/etc/nvme", "destination": "/etc/nvme", "type": "bind", "options": ["rbind"] },
     { "name": "modules", "source": "/lib/modules", "destination": "/lib/modules", "type": "bind", "options": ["rbind", "ro"] }
   ],
   "env": [

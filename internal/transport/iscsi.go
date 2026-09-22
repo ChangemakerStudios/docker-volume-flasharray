@@ -49,9 +49,9 @@ func multipathdRunning() bool {
 func (t *iscsi) Name() string { return "iscsi" }
 
 func (t *iscsi) InitiatorIDs() ([]string, []string, error) {
-	b, err := os.ReadFile(initiatorNameFile)
+	b, err := os.ReadFile(hostPath(initiatorNameFile))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s (is /etc/iscsi bind-mounted from the host?): %w", initiatorNameFile, err)
+		return nil, nil, fmt.Errorf("read host %s (is open-iscsi installed?): %w", initiatorNameFile, err)
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
