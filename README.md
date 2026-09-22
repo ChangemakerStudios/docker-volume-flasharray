@@ -17,9 +17,10 @@ The client then always matches the host's `iscsid`/`multipathd`, reads the
 host's `/etc/iscsi`, `/etc/nvme` and `multipath.conf` directly, and formats
 with the host's own xfsprogs, so a new filesystem never has features the
 host kernel cannot mount. Only `mount`, `umount` and `blockdev` run from the
-plugin image; the mount has to land in the plugin's propagated mount. It does not mount the host's `/run`: on a systemd host
-that is a shared mount, and Docker's own per-plugin mount under it would
-propagate back onto the host and break plugin startup.
+plugin image; the mount has to land in the plugin's propagated mount. It
+does not mount the host's `/run`: on a systemd host that is a shared mount,
+and Docker's own per-plugin mount under it would propagate back onto the
+host and break plugin startup.
 
 ## Why another one
 
@@ -225,17 +226,26 @@ the same volumes once they carry its name tag. What changes is metadata: the
 tag on the array, Docker's local record of which driver owns the name, and
 `driver:` in your stack files.
 
-1. Snapshot the volumes on the array (instant, free insurance).
-2. Stop the stacks that use them.
-3. On **every** node: `docker plugin disable -f pure`, then for each volume
+1. Install this plugin on **every** node that runs any of those services, with
+   the credentials file in place and the same `FA_NAMESPACE` everywhere,
+   before touching the Pure plugin; a service rescheduled onto a node without
+   it cannot start. Use the Pure plugin's `PURE_DOCKER_NAMESPACE`
+   (`docker plugin inspect pure --format '{{json .Settings.Env}}'`) as
+   `FA_NAMESPACE`: the computed array names then equal Pure's, so Docker names
+   and tags line up. Both plugins can be installed side by side; don't use
+   one volume through both at once.
+2. Snapshot the volumes on the array (instant, free insurance).
+3. Stop the stacks that use them.
+4. On **every** node: `docker plugin disable -f pure`, then for each volume
    `docker volume rm -f <name>`. With the driver disabled, `rm -f` only drops
    Docker's local reference — it cannot reach the array. Do **not** do this
    with the Pure plugin enabled: its `Remove` destroys the array volume.
-4. Adopt the volumes (once, from any node with the credentials file):
+5. Adopt the volumes (once, from any node with the credentials file), with
+   `PURE_DOCKER_NAMESPACE=prod` for example:
 
    ```bash
-   sudo FA_NAMESPACE=docker ./docker-volume-flasharray adopt --prefix prod- --dry-run
-   sudo FA_NAMESPACE=docker ./docker-volume-flasharray adopt --prefix prod-
+   sudo FA_NAMESPACE=prod ./docker-volume-flasharray adopt --prefix prod- --dry-run
+   sudo FA_NAMESPACE=prod ./docker-volume-flasharray adopt --prefix prod-
    ```
 
    The binary is on each GitHub release (and as a build artifact of every
@@ -248,7 +258,7 @@ tag on the array, Docker's local record of which driver owns the name, and
    (including an earlier line of the same plan). `--dry-run` reports every
    conflict the real run would hit and exits non-zero if there are any, so
    fix those before running it for real. Destroyed volumes are left out.
-5. Change `driver: pure` to `driver: flasharray` in the stack files and
+6. Change `driver: pure` to `driver: flasharray` in the stack files and
    `docker stack deploy`. `Create` is idempotent and resolves names through
    the tag, so the services come up on their existing data.
 
