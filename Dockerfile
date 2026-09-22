@@ -17,11 +17,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/docker-volume-flasharray ./cmd/docker-volume-flasharray
 
-# iscsiadm, multipathd/multipath, dmsetup and nvme are not shipped: the plugin
-# runs the host's own copies in the host mount and IPC namespaces (nsenter), so
-# client and daemon versions always match. The image carries only what runs
-# locally: mkfs, blkid and mount (the mount must land in the plugin's
-# propagated mount), blockdev, and nsenter itself.
+# The plugin runs the host's own iscsiadm, multipath tools, dmsetup, nvme, mkfs,
+# blkid, xfs_admin and tune2fs in the host mount and IPC namespaces (nsenter),
+# so they match the host's daemons and kernel. The image carries mount/umount
+# (the mount must land in the plugin's propagated mount), blockdev and nsenter;
+# xfsprogs/e2fsprogs stay only as a fallback when not run with pidhost.
 FROM debian:bookworm-slim AS rootfs
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

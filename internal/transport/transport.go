@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
 
 // Transport is the host-side half of an attach.
@@ -106,35 +107,10 @@ func portalAllowed(portal string, allowed []*net.IPNet) bool {
 	return false
 }
 
-// hostTools are clients of host daemons (iscsid, multipathd, udev) or read
-// host config (/etc/iscsi, /etc/multipath.conf, /etc/nvme). They run as the
-// host's own binaries in the host mount and IPC namespaces, as the Pure plugin
-// did: iscsiadm and iscsid speak a binary IPC that breaks across open-iscsi
-// versions ("initiator reported error (12 - iSCSI driver not found)"), and
-// dmsetup/multipath wait on udev through SysV semaphores that only exist in
-// the host IPC namespace.
-var hostTools = map[string]bool{"iscsiadm": true, "multipathd": true, "multipath": true, "dmsetup": true, "nvme": true}
-
-// onHost reports whether the plugin shares the host PID namespace (plugin
-// config pidhost), which is what makes PID 1 the host's init.
-var onHost = os.Getpid() != 1
-
-// hostPath maps a host file path to one readable from the plugin.
-func hostPath(p string) string {
-	if onHost {
-		return "/proc/1/root" + p
-	}
-	return p
-}
-
 // run executes a command, returning combined output; the error message
 // includes the output so callers can log one line.
 func run(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
-	bin, argv := name, args
-	if onHost && hostTools[name] {
-		bin, argv = "nsenter", append([]string{"--target", "1", "--mount", "--ipc", "--", name}, args...)
-	}
-	cmd := exec.CommandContext(ctx, bin, argv...)
+	cmd := hostexec.Command(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	log.Debug("exec", "cmd", name+" "+strings.Join(args, " "), "rc", exitCode(err), "out", truncate(s, 300))
