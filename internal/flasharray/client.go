@@ -328,6 +328,13 @@ func isNotFound(msg string) bool {
 	return strings.Contains(m, "does not exist") || strings.Contains(m, "not found") || strings.Contains(m, "no such")
 }
 
+// isAlreadyDestroyed matches the array's refusal to act on a volume that is
+// in the destroyed (pending eradication) state.
+func isAlreadyDestroyed(err error) bool {
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "has been destroyed") || strings.Contains(m, "already destroyed")
+}
+
 // IsNotFound reports whether err wraps ErrNotFound.
 func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 
@@ -400,7 +407,7 @@ func (c *Client) CopyVolume(ctx context.Context, source, name string) (*Volume, 
 func (c *Client) DestroyVolume(ctx context.Context, name string, eradicate bool) error {
 	q := url.Values{"names": {name}}
 	if err := c.do(ctx, http.MethodPatch, "/volumes", q, map[string]any{"destroyed": true}, nil); err != nil {
-		if !IsNotFound(err) {
+		if !IsNotFound(err) && !isAlreadyDestroyed(err) {
 			return err
 		}
 	}
