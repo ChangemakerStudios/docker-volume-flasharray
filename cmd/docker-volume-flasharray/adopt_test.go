@@ -79,8 +79,8 @@ func TestAdoptPrefix(t *testing.T) {
 		vols: map[string]*flasharray.Volume{
 			"prod-db-1":     {Name: "prod-db-1", Serial: "a", Created: time.Now()},
 			"prod-app_data": {Name: "prod-app_data", Serial: "b", Created: time.Now()},
-			"prod-old":           {Name: "prod-old", Serial: "c", Destroyed: true},
-			"unrelated":                {Name: "unrelated", Serial: "d"},
+			"prod-old":      {Name: "prod-old", Serial: "c", Destroyed: true},
+			"unrelated":     {Name: "unrelated", Serial: "d"},
 		},
 		tags: map[string]string{"prod-db-1": "docker/db-1"}, // already adopted
 	}
