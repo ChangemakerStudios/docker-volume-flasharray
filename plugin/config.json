@@ -20,7 +20,6 @@
     { "name": "sys", "source": "/sys", "destination": "/sys", "type": "bind", "options": ["rbind"] },
     { "name": "iscsi", "description": "host initiator name and node database", "source": "/etc/iscsi", "destination": "/etc/iscsi", "type": "bind", "options": ["rbind"] },
     { "name": "nvme", "description": "host NQN", "source": "/etc/nvme", "destination": "/etc/nvme", "type": "bind", "options": ["rbind"] },
-    { "name": "run", "description": "iscsid lock dir and multipathd socket", "source": "/run", "destination": "/run", "type": "bind", "options": ["rbind"] },
     { "name": "modules", "source": "/lib/modules", "destination": "/lib/modules", "type": "bind", "options": ["rbind", "ro"] }
   ],
   "env": [

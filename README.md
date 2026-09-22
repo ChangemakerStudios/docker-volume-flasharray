@@ -11,7 +11,10 @@ global`, so a volume created on one node can be mounted on another).
 
 Zero Go dependencies outside the standard library. The runtime image carries
 `iscsiadm`, `nvme`, `multipath` and `mkfs.*`; the plugin talks to the host's
-own `iscsid`/`multipathd` through `/run` and the host network namespace.
+own `iscsid`/`multipathd` over their abstract sockets, which it reaches by
+sharing the host network namespace. It does not mount the host's `/run`:
+on a systemd host that is a shared mount, and Docker's own per-plugin mount
+under it would propagate back onto the host and break plugin startup.
 
 ## Why another one
 
@@ -36,7 +39,8 @@ stall the host for minutes. This driver:
 On every node:
 
 ```bash
-sudo mkdir -p /etc/docker-volume-flasharray
+# the plugin bind-mounts all three; Docker refuses to start it if any is missing
+sudo mkdir -p /etc/docker-volume-flasharray /etc/iscsi /etc/nvme
 sudo tee /etc/docker-volume-flasharray/flasharray.json >/dev/null <<'EOF'
 {
   "arrays": [

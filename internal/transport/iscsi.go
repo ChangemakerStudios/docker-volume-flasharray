@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,8 +35,16 @@ const (
 	iscsiadmExitSessionExists = 15
 	iscsiadmExitNoObjects     = 21
 	initiatorNameFile         = "/etc/iscsi/initiatorname.iscsi"
-	multipathdSocket          = "/run/multipathd.sock"
+	// multipathdAbstractSocket is where multipathd listens. It is an abstract
+	// socket, so it never appears under /run; the plugin sees it because it
+	// shares the host network namespace.
+	multipathdAbstractSocket = "@/org/kernel/linux/storage/multipathd"
 )
+
+func multipathdRunning() bool {
+	b, err := readFileTimeout("/proc/net/unix", 3*time.Second)
+	return err == nil && bytes.Contains(b, []byte(multipathdAbstractSocket))
+}
 
 func (t *iscsi) Name() string { return "iscsi" }
 
@@ -168,7 +177,7 @@ func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath bool) 
 // map being waited for.
 func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error) {
 	wwid := WWID(serial)
-	useMultipath := exists(multipathdSocket)
+	useMultipath := multipathdRunning()
 	if dev := t.findDevice(ctx, wwid, useMultipath); dev != "" {
 		return dev, nil
 	}
@@ -226,7 +235,7 @@ func (t *iscsi) describe(wwid string, useMultipath bool) string {
 	}
 	switch {
 	case !useMultipath:
-		b.WriteString("  multipathd: not running (no /run/multipathd.sock); expecting a single-path device\n")
+		b.WriteString("  multipathd: not running (no " + multipathdAbstractSocket + " in /proc/net/unix); expecting a single-path device\n")
 	default:
 		if name := t.mpathMap(ctx, wwid); name != "" {
 			fmt.Fprintf(&b, "  multipath map: %s (/dev/mapper/%s present: %v)\n", name, name, exists("/dev/mapper/"+name))
@@ -253,7 +262,7 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
 	wwid := WWID(serial)
 	needle := strings.TrimPrefix(wwid, "3")
 	paths := sysBlockMatching("sd*", needle)
-	if exists(multipathdSocket) {
+	if multipathdRunning() {
 		if name := t.mpathMap(ctx, wwid); name != "" {
 			if err := t.removeMap(ctx, name); err != nil {
 				return err

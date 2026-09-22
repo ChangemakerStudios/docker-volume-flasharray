@@ -31,6 +31,6 @@ RUN apt-get update \
       util-linux \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/* /etc/iscsi /etc/nvme /etc/multipath* \
- && mkdir -p /mnt/flasharray /etc/docker-volume-flasharray /run/docker/plugins
+ && mkdir -p /mnt/flasharray /etc/docker-volume-flasharray /run/docker/plugins /run/lock
 COPY --from=build /out/docker-volume-flasharray /usr/local/bin/docker-volume-flasharray
 ENTRYPOINT ["/usr/local/bin/docker-volume-flasharray"]
