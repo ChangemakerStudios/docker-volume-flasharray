@@ -209,6 +209,36 @@ mapping; if a cached array volume turns out to be gone or destroyed (another
 node removed and recreated it), the node drops the entry and looks it up
 again.
 
+### When the array's management API is unreachable
+
+Docker treats any error from a volume driver's `Get` as "no such volume".
+For a volume declared **without** a driver (`external: true`), a container
+start during an array outage (controller failover, Purity upgrade) then
+makes Docker silently create a `local` volume of the same name, which
+shadows the real one on that node until it is removed and pruned. Two
+things prevent it:
+
+- **Name the driver in the stack file** instead of `external: true`. Docker
+  then asks this driver specifically and never substitutes `local`; during
+  an outage the task fails and swarm retries it.
+
+  ```yaml
+  volumes:
+    pgdata:
+      name: pgdata          # no stack-name prefix
+      driver: flasharray
+  ```
+
+- **The driver answers from what it already knows.** Each node keeps the
+  Docker names it has seen, and their array volumes, in
+  `.dvfa-known.json` in the plugin's mount directory (survives plugin
+  restarts; every successful `docker volume ls` replaces it with the array's
+  view). When a `Get` or `List` can't reach the array, a volume in that file
+  is still reported as existing, with `array_unreachable` in its status and
+  a warning in the log. Only lookups fall back; creating, mounting and
+  removing still need the array. A volume this node has never seen is still
+  an error.
+
 ## Settings
 
 Set at install time or with `docker plugin set flasharray KEY=value` (plugin

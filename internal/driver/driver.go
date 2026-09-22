@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,12 +35,16 @@ type Driver struct {
 	host  string // FlashArray host object name for this node
 	ports []flasharray.Port
 
-	mu    sync.Mutex // guards locks, mounts and names maps
+	mu    sync.Mutex // guards locks, mounts, names and known maps
 	locks map[string]*sync.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
 	// names caches dockerName -> array volume name once resolved.
 	names map[string]string
+	// known is the persisted dockerName -> array volume map behind the
+	// outage fallback in Get and List; see known.go.
+	known  map[string]string
+	saveMu sync.Mutex
 }
 
 type mountState struct {
@@ -72,6 +77,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		locks:  map[string]*sync.Mutex{},
 		mounts: map[string]*mountState{},
 		names:  map[string]string{},
+		known:  map[string]string{},
 	}
 	iqns, nqns, err := drv.tr.InitiatorIDs()
 	if err != nil {
@@ -86,6 +92,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
 		return nil, err
 	}
+	drv.loadKnown()
 	drv.recoverMounts(ctx)
 
 	if cfg.ConnectOnStart {
@@ -241,8 +248,11 @@ func (d *Driver) remember(dockerName, arrayName string) {
 	d.mu.Lock()
 	d.names[dockerName] = arrayName
 	d.mu.Unlock()
+	d.setKnown(dockerName, arrayName)
 }
 
+// forget drops the resolved name. The known entry is only dropped when the
+// volume is really gone (Remove), not on a stale re-resolve.
 func (d *Driver) forget(dockerName string) {
 	d.mu.Lock()
 	delete(d.names, dockerName)
@@ -400,7 +410,11 @@ func (d *Driver) mountOptions(ctx context.Context, an, dockerName, dev string) s
 func (d *Driver) importVolume(ctx context.Context, dockerName, arrayName string) error {
 	unlock := d.lock(arrayName)
 	defer unlock()
-	return Adopt(ctx, d.array, d.cfg.Namespace, dockerName, arrayName, d.log)
+	if err := Adopt(ctx, d.array, d.cfg.Namespace, dockerName, arrayName, d.log); err != nil {
+		return err
+	}
+	d.remember(dockerName, arrayName)
+	return nil
 }
 
 // Adopt tags array volume arrayName as <namespace>/<dockerName>. It refuses
@@ -454,6 +468,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	if err != nil {
 		if flasharray.IsNotFound(err) {
 			d.forget(req.Name)
+			d.setKnown(req.Name, "")
 			return nil
 		}
 		return err
@@ -486,6 +501,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		return err
 	}
 	d.forget(req.Name)
+	d.setKnown(req.Name, "")
 	d.log.Info("removed volume", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
 	return nil
 }
@@ -662,8 +678,15 @@ func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
 	defer cancel()
 	an, v, err := d.lookup(ctx, req.Name)
 	if err != nil {
+		if !flasharray.IsNotFound(err) {
+			if kv, ok := d.knownVolume(req.Name, err); ok {
+				d.log.Warn("array unreachable; answering from known volumes so Docker does not substitute a local volume", "volume", req.Name, "array_name", kv.Status["array_name"], "err", err)
+				return &plugin.GetResponse{Volume: kv}, nil
+			}
+		}
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}
+	d.setKnown(req.Name, an)
 	return &plugin.GetResponse{Volume: d.toVolume(req.Name, an, v)}, nil
 }
 
@@ -696,20 +719,39 @@ func (d *Driver) List() (*plugin.ListResponse, error) {
 	prefix := d.cfg.Namespace + "/"
 	tags, err := d.array.ListNameTags(ctx, prefix)
 	if err != nil {
-		return nil, err
+		d.mu.Lock()
+		byName := maps.Clone(d.known)
+		d.mu.Unlock()
+		if len(byName) == 0 {
+			return nil, err
+		}
+		d.log.Warn("array unreachable; listing known volumes", "volumes", len(byName), "err", err)
+		return d.listResponse(byName), nil
 	}
+	byName := make(map[string]string, len(tags))
+	d.mu.Lock()
+	for an, val := range tags {
+		name := strings.TrimPrefix(val, prefix)
+		d.names[name] = an
+		byName[name] = an
+	}
+	d.mu.Unlock()
+	d.replaceKnown(byName)
+	return d.listResponse(byName), nil
+}
+
+func (d *Driver) listResponse(byName map[string]string) *plugin.ListResponse {
 	resp := &plugin.ListResponse{}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for an, val := range tags {
-		d.names[strings.TrimPrefix(val, prefix)] = an
-		v := &plugin.Volume{Name: strings.TrimPrefix(val, prefix)}
+	for name, an := range byName {
+		v := &plugin.Volume{Name: name}
 		if st, ok := d.mounts[an]; ok {
 			v.Mountpoint = st.mountpoint
 		}
 		resp.Volumes = append(resp.Volumes, v)
 	}
-	return resp, nil
+	return resp
 }
 
 // Capabilities implements plugin.Driver.
