@@ -17,15 +17,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/docker-volume-flasharray ./cmd/docker-volume-flasharray
 
-# Runtime needs the host-side storage tooling the driver shells out to. The
-# daemons these packages ship (iscsid, multipathd) are never started here; the
-# plugin talks to the host's copies via /run and the host network namespace.
+# iscsiadm, multipathd/multipath, dmsetup and nvme are not shipped: the plugin
+# runs the host's own copies in the host mount and IPC namespaces (nsenter), so
+# client and daemon versions always match. The image carries only what runs
+# locally: mkfs, blkid and mount (the mount must land in the plugin's
+# propagated mount), blockdev, and nsenter itself.
 FROM debian:bookworm-slim AS rootfs
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      open-iscsi \
-      multipath-tools \
-      nvme-cli \
       xfsprogs \
       e2fsprogs \
       util-linux \

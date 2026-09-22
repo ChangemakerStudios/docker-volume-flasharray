@@ -9,12 +9,15 @@ global`, so a volume created on one node can be mounted on another).
 > FlashArray is a trademark of Pure Storage. This is a from-scratch
 > replacement for the end-of-life `purestorage/docker-plugin`.
 
-Zero Go dependencies outside the standard library. The runtime image carries
-`iscsiadm`, `nvme`, `multipath` and `mkfs.*`; the plugin talks to the host's
-own `iscsid`/`multipathd` over their abstract sockets, which it reaches by
-sharing the host network namespace. It does not mount the host's `/run`:
-on a systemd host that is a shared mount, and Docker's own per-plugin mount
-under it would propagate back onto the host and break plugin startup.
+Zero Go dependencies outside the standard library. Like the Pure plugin, it
+runs the **host's own** `iscsiadm`, `multipathd`, `multipath`, `dmsetup` and
+`nvme` (via `nsenter` into the host mount and IPC namespaces, which is why it
+uses the host PID namespace), so the client always matches the host's
+`iscsid`/`multipathd` and reads the host's `/etc/iscsi`, `/etc/nvme` and
+`multipath.conf` directly. Only `mkfs`, `blkid`, `mount` and `blockdev` run
+from the plugin image. It does not mount the host's `/run`: on a systemd host
+that is a shared mount, and Docker's own per-plugin mount under it would
+propagate back onto the host and break plugin startup.
 
 ## Why another one
 
@@ -39,8 +42,7 @@ stall the host for minutes. This driver:
 On every node:
 
 ```bash
-# the plugin bind-mounts all three; Docker refuses to start it if any is missing
-sudo mkdir -p /etc/docker-volume-flasharray /etc/iscsi /etc/nvme
+sudo mkdir -p /etc/docker-volume-flasharray
 sudo tee /etc/docker-volume-flasharray/flasharray.json >/dev/null <<'EOF'
 {
   "arrays": [
@@ -56,9 +58,10 @@ docker plugin install --alias flasharray --grant-all-permissions \
   FA_ALLOWED_CIDRS=10.10.100.0/24
 ```
 
-Host prerequisites: `open-iscsi` (running `iscsid`) and `multipath-tools`
-for iSCSI, configured as in [Multipath safety](#multipath-safety);
-`nvme-cli` and an `/etc/nvme/hostnqn` for NVMe/TCP. The host's
+Host prerequisites (the plugin uses these host binaries rather than shipping
+its own): `open-iscsi` (running `iscsid`) and `multipath-tools` for iSCSI,
+configured as in [Multipath safety](#multipath-safety); `nvme-cli` and an
+`/etc/nvme/hostnqn` for NVMe/TCP. The host's
 `/etc/iscsi/initiatorname.iscsi` or `/etc/nvme/hostnqn` is what identifies
 the node to the array; the plugin creates (or reuses) a FlashArray host
 object named after `FA_HOST_NAME` (default: hostname).

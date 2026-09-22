@@ -36,9 +36,9 @@ const hostNQNFile = "/etc/nvme/hostnqn"
 func (t *nvmeTCP) Name() string { return "nvme-tcp" }
 
 func (t *nvmeTCP) InitiatorIDs() ([]string, []string, error) {
-	b, err := os.ReadFile(hostNQNFile)
+	b, err := os.ReadFile(hostPath(hostNQNFile))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s (is /etc/nvme bind-mounted from the host? generate with `nvme gen-hostnqn`): %w", hostNQNFile, err)
+		return nil, nil, fmt.Errorf("read host %s (generate with `nvme gen-hostnqn`): %w", hostNQNFile, err)
 	}
 	nqn := strings.TrimSpace(string(b))
 	if nqn == "" {
