@@ -24,6 +24,7 @@ type fakeArray struct {
 	tags      map[string]string            // dvfa:name only
 	extra     map[string]map[string]string // other dvfa tags: volume -> key -> value
 	lookupErr error                        // returned by LookupNameTag
+	down      error                        // array unreachable: returned by every read
 	hosts     map[string][]string
 	conns     map[string]map[string]int // volume -> host -> lun
 	nextLUN   int
@@ -39,6 +40,9 @@ func (f *fakeArray) rec(s string) { f.calls = append(f.calls, s) }
 func (f *fakeArray) GetVolume(_ context.Context, name string) (*flasharray.Volume, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.down != nil {
+		return nil, f.down
+	}
 	v, ok := f.vols[name]
 	if !ok {
 		return nil, flasharray.ErrNotFound
@@ -125,6 +129,9 @@ func (f *fakeArray) SetNameTag(_ context.Context, volume, value string) error {
 func (f *fakeArray) ListNameTags(_ context.Context, prefix string) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.down != nil {
+		return nil, f.down
+	}
 	out := map[string]string{}
 	for k, v := range f.tags {
 		if strings.HasPrefix(v, prefix) {
@@ -139,6 +146,9 @@ func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, erro
 	defer f.mu.Unlock()
 	if f.lookupErr != nil {
 		return "", f.lookupErr
+	}
+	if f.down != nil {
+		return "", f.down
 	}
 	for an, v := range f.tags {
 		if v == value {
@@ -322,7 +332,7 @@ func TestArrayName(t *testing.T) {
 		want       string
 		hashSuffix bool
 	}{
-		"db-1":             {want: "node1-db-1"},
+		"db-1":                  {want: "node1-db-1"},
 		"app_store":             {want: "node1-app_store"},
 		"seq.store":             {hashSuffix: true},
 		"seq-store":             {want: "node1-seq-store"},
@@ -691,5 +701,71 @@ func TestTagLookupFailureDoesNotGuess(t *testing.T) {
 	}
 	if len(fa.vols) != 0 {
 		t.Fatalf("created a volume under a guessed name: %v", fa.calls)
+	}
+}
+
+func TestGetAnswersFromKnownVolumesWhileArrayDown(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fa.down = errors.New("HTTP 503")
+
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil {
+		t.Fatalf("Get during outage must not error (Docker would substitute a local volume): %v", err)
+	}
+	if g.Volume.Status["array_unreachable"] == nil || g.Volume.Status["array_name"] != "node1-v" {
+		t.Fatalf("status = %v", g.Volume.Status)
+	}
+	if _, err := d.Get(&plugin.GetRequest{Name: "never-seen"}); err == nil {
+		t.Fatal("an unknown volume must still be an error")
+	}
+
+	// Survives a plugin restart.
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d2.Get(&plugin.GetRequest{Name: "v"}); err != nil {
+		t.Fatalf("restarted plugin lost the known volume: %v", err)
+	}
+
+	// Removed volumes are forgotten.
+	fa.down = nil
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fa.down = errors.New("HTTP 503")
+	if _, err := d.Get(&plugin.GetRequest{Name: "v"}); err == nil {
+		t.Fatal("removed volume still answered from known volumes")
+	}
+}
+
+func TestListReconcilesKnownVolumesAndFallsBack(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	for _, n := range []string{"a", "b"} {
+		if err := d.Create(&plugin.CreateRequest{Name: n}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Another node removed and eradicated "a"; List reflects the array.
+	fa.mu.Lock()
+	delete(fa.vols, "node1-a")
+	delete(fa.tags, "node1-a")
+	fa.mu.Unlock()
+	if l, err := d.List(); err != nil || len(l.Volumes) != 1 {
+		t.Fatalf("list = %+v, %v", l, err)
+	}
+
+	fa.down = errors.New("dial tcp: i/o timeout")
+	l, err := d.List()
+	if err != nil || len(l.Volumes) != 1 || l.Volumes[0].Name != "b" {
+		t.Fatalf("outage list = %+v, %v", l, err)
+	}
+	if _, err := d.Get(&plugin.GetRequest{Name: "a"}); err == nil {
+		t.Fatal("volume dropped by List still answered from known volumes")
 	}
 }
