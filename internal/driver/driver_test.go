@@ -134,11 +134,16 @@ func (f *fakeArray) ListNameTags(_ context.Context, prefix string) (map[string]s
 	}
 	out := map[string]string{}
 	for k, v := range f.tags {
-		if strings.HasPrefix(v, prefix) {
+		if strings.HasPrefix(v, prefix) && !f.destroyed(k) {
 			out[k] = v
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeArray) destroyed(name string) bool {
+	v, ok := f.vols[name]
+	return ok && v.Destroyed
 }
 
 func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, error) {
@@ -151,7 +156,7 @@ func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, erro
 		return "", f.down
 	}
 	for an, v := range f.tags {
-		if v == value {
+		if v == value && !f.destroyed(an) {
 			return an, nil
 		}
 	}
@@ -797,5 +802,35 @@ func TestRemoveVolumeAlreadyDestroyedByAnotherNode(t *testing.T) {
 	}
 	if _, ok := fa.vols["node1-v"]; ok {
 		t.Fatal("FA_ERADICATE_ON_REMOVE did not eradicate the already-destroyed volume")
+	}
+}
+
+// The array keeps a destroyed volume's tag until eradication; the Docker name
+// must still drop out of List and Get at once and be importable again.
+func TestDestroyedImportedVolumeIsNotListedOrResolved(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old, _ := fa.CreateVolume(context.Background(), "dvfa-migtest", 1<<30)
+	if err := d.Create(&plugin.CreateRequest{Name: "migtest", Options: map[string]string{"import": old.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "migtest"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fa.vols[old.Name].Destroyed || fa.tags[old.Name] == "" {
+		t.Fatalf("want destroyed with its tag kept: %+v tag=%q", fa.vols[old.Name], fa.tags[old.Name])
+	}
+	if l, err := d.List(); err != nil || len(l.Volumes) != 0 {
+		t.Fatalf("list = %+v, %v", l, err)
+	}
+	if g, err := d.Get(&plugin.GetRequest{Name: "migtest"}); err == nil {
+		t.Fatalf("get resolved the destroyed volume: %+v", g.Volume)
+	}
+	repl, _ := fa.CreateVolume(context.Background(), "dvfa-migtest2", 1<<30)
+	if err := d.Create(&plugin.CreateRequest{Name: "migtest", Options: map[string]string{"import": repl.Name}}); err != nil {
+		t.Fatalf("re-import while the old volume awaits eradication: %v", err)
+	}
+	if g, err := d.Get(&plugin.GetRequest{Name: "migtest"}); err != nil || g.Volume.Status["array_name"] != repl.Name {
+		t.Fatalf("get = %+v, %v", g, err)
 	}
 }

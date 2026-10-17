@@ -41,15 +41,19 @@ func (m *memArray) SetNameTag(_ context.Context, v, val string) error {
 func (m *memArray) ListNameTags(_ context.Context, p string) (map[string]string, error) {
 	out := map[string]string{}
 	for k, v := range m.tags {
-		if strings.HasPrefix(v, p) {
+		if strings.HasPrefix(v, p) && !m.destroyed(k) {
 			out[k] = v
 		}
 	}
 	return out, nil
 }
+func (m *memArray) destroyed(name string) bool {
+	v, ok := m.vols[name]
+	return ok && v.Destroyed
+}
 func (m *memArray) LookupNameTag(_ context.Context, val string) (string, error) {
 	for k, v := range m.tags {
-		if v == val {
+		if v == val && !m.destroyed(k) {
 			return k, nil
 		}
 	}

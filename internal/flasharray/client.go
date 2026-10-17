@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +72,7 @@ type Array interface {
 	// GetTags returns key -> value for the volume's tags in TagNamespace.
 	GetTags(ctx context.Context, volume string) (map[string]string, error)
 	DeleteTag(ctx context.Context, volume, key string) error
+	// ListNameTags and LookupNameTag ignore destroyed volumes, which keep their tags until eradicated.
 	ListNameTags(ctx context.Context, valuePrefix string) (map[string]string, error)
 	// LookupNameTag returns the array volume carrying exactly this name tag, or ErrNotFound.
 	LookupNameTag(ctx context.Context, value string) (string, error)
@@ -467,13 +469,46 @@ func (c *Client) DeleteTag(ctx context.Context, volume, key string) error {
 	return err
 }
 
-// ListNameTags returns arrayVolumeName -> tag value for every volume whose
+// ListNameTags returns arrayVolumeName -> tag value for every live volume whose
 // name tag starts with valuePrefix (e.g. "prod/").
 func (c *Client) ListNameTags(ctx context.Context, valuePrefix string) (map[string]string, error) {
+	tags, err := c.nameTags(ctx, fmt.Sprintf("key='%s'", TagKeyName))
+	if err != nil {
+		return nil, err
+	}
 	res := map[string]string{}
+	for _, t := range tags {
+		if strings.HasPrefix(t.Value, valuePrefix) {
+			res[t.Resource.Name] = t.Value
+		}
+	}
+	return res, nil
+}
+
+// LookupNameTag finds the live volume tagged dvfa:name=<value>.
+func (c *Client) LookupNameTag(ctx context.Context, value string) (string, error) {
+	tags, err := c.nameTags(ctx, fmt.Sprintf("key='%s' and value='%s'", TagKeyName, strings.ReplaceAll(value, "'", "\\'")))
+	if err != nil {
+		return "", err
+	}
+	switch len(tags) {
+	case 0:
+		return "", ErrNotFound
+	case 1:
+		return tags[0].Resource.Name, nil
+	default:
+		return "", fmt.Errorf("tag %s=%q is on more than one volume (%s, %s)", TagKeyName, value, tags[0].Resource.Name, tags[1].Resource.Name)
+	}
+}
+
+// nameTags returns the dvfa tags matching filter, minus those on destroyed
+// volumes: a tag outlives its volume's destruction for the 24h before
+// eradication, and Docker would keep listing and resolving the name.
+func (c *Client) nameTags(ctx context.Context, filter string) ([]tagItem, error) {
+	var res []tagItem
 	q := url.Values{
 		"namespaces": {TagNamespace},
-		"filter":     {fmt.Sprintf("key='%s'", TagKeyName)},
+		"filter":     {filter},
 		"limit":      {"1000"},
 	}
 	for {
@@ -481,44 +516,35 @@ func (c *Client) ListNameTags(ctx context.Context, valuePrefix string) (map[stri
 		if err := c.do(ctx, http.MethodGet, "/volumes/tags", q, nil, &out); err != nil {
 			return nil, err
 		}
-		for _, t := range out.Items {
-			if strings.HasPrefix(t.Value, valuePrefix) {
-				res[t.Resource.Name] = t.Value
-			}
-		}
+		res = append(res, out.Items...)
 		if !out.MoreItemsRemain || out.ContinuationToken == "" {
-			return res, nil
+			break
 		}
 		q.Set("continuation_token", out.ContinuationToken)
 	}
-}
-
-// LookupNameTag finds the volume tagged dvfa:name=<value>.
-func (c *Client) LookupNameTag(ctx context.Context, value string) (string, error) {
-	q := url.Values{
-		"namespaces": {TagNamespace},
-		"filter":     {fmt.Sprintf("key='%s' and value='%s'", TagKeyName, strings.ReplaceAll(value, "'", "\\'"))},
-		"limit":      {"2"},
+	if len(res) == 0 {
+		return nil, nil
 	}
-	var out page[tagItem]
-	if err := c.do(ctx, http.MethodGet, "/volumes/tags", q, nil, &out); err != nil {
-		return "", err
+	destroyed, err := c.listVolumes(ctx, "destroyed='true'")
+	if err != nil {
+		return nil, err
 	}
-	switch len(out.Items) {
-	case 0:
-		return "", ErrNotFound
-	case 1:
-		return out.Items[0].Resource.Name, nil
-	default:
-		return "", fmt.Errorf("tag %s=%q is on more than one volume (%s, %s)", TagKeyName, value, out.Items[0].Resource.Name, out.Items[1].Resource.Name)
+	gone := make(map[string]bool, len(destroyed))
+	for _, v := range destroyed {
+		gone[v.Name] = true
 	}
+	return slices.DeleteFunc(res, func(t tagItem) bool { return gone[t.Resource.Name] }), nil
 }
 
 // ListVolumes lists live volumes by array-name prefix.
 func (c *Client) ListVolumes(ctx context.Context, namePrefix string) ([]*Volume, error) {
+	return c.listVolumes(ctx, fmt.Sprintf("name='%s*' and destroyed='false'", namePrefix))
+}
+
+func (c *Client) listVolumes(ctx context.Context, filter string) ([]*Volume, error) {
 	var res []*Volume
 	q := url.Values{
-		"filter": {fmt.Sprintf("name='%s*' and destroyed='false'", namePrefix)},
+		"filter": {filter},
 		"limit":  {"1000"},
 	}
 	for {

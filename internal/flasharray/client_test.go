@@ -81,6 +81,32 @@ func TestRetrySucceedsAfterTransientError(t *testing.T) {
 	}
 }
 
+func TestNameTagsSkipDestroyedVolumes(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/2.26/volumes/tags":
+			_, _ = w.Write([]byte(`{"items":[
+				{"key":"name","value":"ns/a","resource":{"name":"old-a"}},
+				{"key":"name","value":"ns/a","resource":{"name":"new-a"}}]}`))
+		case "/api/2.26/volumes":
+			if f := r.URL.Query().Get("filter"); f != "destroyed='true'" {
+				t.Errorf("volumes filter = %q", f)
+			}
+			_, _ = w.Write([]byte(`{"items":[{"name":"old-a","destroyed":true}]}`))
+		default:
+			t.Errorf("unexpected %s", r.URL.Path)
+		}
+	})
+	ctx := context.Background()
+	tags, err := c.ListNameTags(ctx, "ns/")
+	if err != nil || len(tags) != 1 || tags["new-a"] != "ns/a" {
+		t.Fatalf("tags = %v, %v", tags, err)
+	}
+	if an, err := c.LookupNameTag(ctx, "ns/a"); err != nil || an != "new-a" {
+		t.Fatalf("lookup = %q, %v", an, err)
+	}
+}
+
 func TestReloginOn401(t *testing.T) {
 	var n atomic.Int32
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
