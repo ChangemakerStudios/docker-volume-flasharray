@@ -58,6 +58,9 @@ type Config struct {
 	PreemptRWO        bool
 	EradicateOnRemove bool
 	AttachTimeout     time.Duration
+	// PreemptGrace is how long a node may keep a volume that another node
+	// wants before it is presumed dead and preempted; 0 preempts at once.
+	PreemptGrace time.Duration
 	LogLevel          string
 	// ConnectOnStart logs into every array portal when the plugin starts so the
 	// first volume mount after boot doesn't pay for a cold login while a
@@ -136,6 +139,10 @@ func FromEnv() (*Config, error) {
 	c.AttachTimeout, err = time.ParseDuration(getenv("FA_ATTACH_TIMEOUT", "60s"))
 	if err != nil {
 		return nil, fmt.Errorf("FA_ATTACH_TIMEOUT: %w", err)
+	}
+	c.PreemptGrace, err = time.ParseDuration(getenv("FA_PREEMPT_GRACE", "90s"))
+	if err != nil {
+		return nil, fmt.Errorf("FA_PREEMPT_GRACE: %w", err)
 	}
 
 	f, err := LoadFile(c.ConfigPath)

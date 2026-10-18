@@ -274,6 +274,7 @@ must be disabled).
 | `FA_MOUNT_OPTS` | | `mount -o` options |
 | `FA_ALLOWED_CIDRS` | all | only log in to array portals inside these CIDRs |
 | `FA_PREEMPT_RWO` | `true` | take over a volume still connected to another host (needed for swarm rescheduling off a dead node; unsafe if the other node is actually alive and writing) |
+| `FA_PREEMPT_GRACE` | `90s` | how long another host may keep a volume after a mount here asks for it before it is presumed dead and preempted; `0` preempts at once |
 | `FA_ERADICATE_ON_REMOVE` | `false` | `docker volume rm` eradicates immediately instead of leaving 24h to recover |
 | `FA_CONNECT_ON_START` | `true` | log in to portals at plugin start |
 | `FA_ATTACH_TIMEOUT` | `60s` | how long to wait for the device |
@@ -287,10 +288,15 @@ everywhere. Point staging and production at different namespaces (or
 different arrays). The FlashArray host object is per node: it is found by
 the node's IQN/NQN and created as `FA_HOST_NAME` (hostname) if missing.
 
-A block volume is single-writer. When swarm reschedules a task off a node
-that died without unmounting, the new node takes the connection over
-(`FA_PREEMPT_RWO=true`). Do not rely on this to move a volume between two
-*live* nodes — that is a filesystem corruption waiting to happen.
+A block volume is single-writer. On a drain swarm starts the new task while
+the old one is still stopping, so a mount first waits (up to 30s per attempt)
+for the other host to release the volume itself, which its unmount does once
+the old container is gone. Only a host that keeps it past `FA_PREEMPT_GRACE`,
+counted across Docker's retries, is presumed dead and has its connection
+taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
+"waiting for … to release" error and swarm retries. A grace of `0` restores
+immediate takeover, which cut writes a live node was still flushing and
+corrupted XFS.
 
 ## Migrating from the Pure plugin
 

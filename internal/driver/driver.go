@@ -45,6 +45,9 @@ type Driver struct {
 	// outage fallback in Get and List; see known.go.
 	known  map[string]string
 	saveMu sync.Mutex
+	// heldSince records when this node first found an array volume attached
+	// to another host, so the preempt grace spans Docker's mount retries.
+	heldSince map[string]time.Time
 }
 
 type mountState struct {
@@ -78,6 +81,8 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		mounts: map[string]*mountState{},
 		names:  map[string]string{},
 		known:  map[string]string{},
+
+		heldSince: map[string]time.Time{},
 	}
 	iqns, nqns, err := drv.tr.InitiatorIDs()
 	if err != nil {
@@ -282,7 +287,7 @@ func (d *Driver) lock(name string) func() {
 }
 
 func (d *Driver) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d.cfg.AttachTimeout+30*time.Second)
+	return context.WithTimeout(context.Background(), d.cfg.AttachTimeout+maxReleaseWait+30*time.Second)
 }
 
 // Create implements plugin.Driver.
@@ -543,25 +548,8 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 
-	// RWO: a block volume can be mounted by one host at a time. Swarm will
-	// reschedule a task while a dead node still holds the connection, so by
-	// default we take it over (PreemptRWO). A live node writing concurrently
-	// would corrupt the filesystem — this is only safe for single-writer use.
-	conns, err := d.array.ListConnections(ctx, an)
-	if err != nil {
+	if err := d.takeOver(ctx, an, req.Name); err != nil {
 		return nil, err
-	}
-	for _, c := range conns {
-		if c.Host == d.host {
-			continue
-		}
-		if !d.cfg.PreemptRWO {
-			return nil, fmt.Errorf("volume %s is attached to host %s (FA_PREEMPT_RWO=false)", req.Name, c.Host)
-		}
-		d.log.Warn("preempting existing attachment", "volume", req.Name, "from_host", c.Host)
-		if err := d.array.Disconnect(ctx, c.Host, an); err != nil {
-			return nil, fmt.Errorf("preempt %s from %s: %w", req.Name, c.Host, err)
-		}
 	}
 
 	lun, err := d.array.Connect(ctx, d.host, an)
@@ -607,6 +595,88 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	d.mu.Unlock()
 	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "formatted", formatted)
 	return &plugin.MountResponse{Mountpoint: mp}, nil
+}
+
+// releasePoll and maxReleaseWait are variables so tests needn't wait.
+var (
+	releasePoll    = 2 * time.Second
+	maxReleaseWait = 30 * time.Second
+)
+
+// takeOver makes sure no other host holds an. A block volume is single-writer.
+// On a drain swarm starts the new task while the old one is still stopping,
+// and disconnecting the old host then cuts writes it is still flushing, which
+// corrupted XFS on staging. So first wait for the other host to release it;
+// only one that keeps it past PreemptGrace is presumed dead and preempted.
+func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
+	others, err := d.otherHosts(ctx, an)
+	if err != nil || len(others) == 0 {
+		d.clearHeld(an)
+		return err
+	}
+	if !d.cfg.PreemptRWO {
+		return fmt.Errorf("volume %s is attached to host %s (FA_PREEMPT_RWO=false)", dockerName, others[0])
+	}
+	held := d.markHeld(an)
+	wait := min(d.cfg.PreemptGrace-time.Since(held), maxReleaseWait)
+	deadline := time.Now().Add(wait)
+	for len(others) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(releasePoll):
+		}
+		if others, err = d.otherHosts(ctx, an); err != nil {
+			return err
+		}
+	}
+	if len(others) == 0 {
+		d.clearHeld(an)
+		d.log.Info("other host released the volume", "volume", dockerName, "waited", time.Since(held).Round(time.Second))
+		return nil
+	}
+	if since := time.Since(held); since < d.cfg.PreemptGrace {
+		return fmt.Errorf("volume %s is still attached to host %s; waiting up to %s for it to release before preempting (%s left)",
+			dockerName, strings.Join(others, ","), d.cfg.PreemptGrace, (d.cfg.PreemptGrace - since).Round(time.Second))
+	}
+	for _, h := range others {
+		d.log.Warn("preempting attachment: the other host kept it past the grace period", "volume", dockerName, "from_host", h, "grace", d.cfg.PreemptGrace)
+		if err := d.array.Disconnect(ctx, h, an); err != nil {
+			return fmt.Errorf("preempt %s from %s: %w", dockerName, h, err)
+		}
+	}
+	d.clearHeld(an)
+	return nil
+}
+
+func (d *Driver) otherHosts(ctx context.Context, an string) ([]string, error) {
+	conns, err := d.array.ListConnections(ctx, an)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, c := range conns {
+		if c.Host != d.host {
+			out = append(out, c.Host)
+		}
+	}
+	return out, nil
+}
+
+func (d *Driver) markHeld(an string) time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.heldSince[an]
+	if !ok {
+		t = time.Now()
+		d.heldSince[an] = t
+	}
+	return t
+}
+
+func (d *Driver) clearHeld(an string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.heldSince, an)
 }
 
 // rollbackAttach is best effort; failures are logged because a leftover array

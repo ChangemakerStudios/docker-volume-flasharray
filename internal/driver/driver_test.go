@@ -508,6 +508,60 @@ func TestMountPreemptsOtherHost(t *testing.T) {
 	}
 }
 
+func TestMountWaitsForOtherHostToRelease(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 2*time.Second
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"draining-node": 7}
+	go func() {
+		time.Sleep(20 * time.Millisecond) // its container stops and Unmount disconnects
+		fa.mu.Lock()
+		delete(fa.conns[an], "draining-node")
+		fa.mu.Unlock()
+	}()
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range fa.calls {
+		if c == "disconnect:draining-node:"+an {
+			t.Fatal("preempted a host that released the volume on its own")
+		}
+	}
+}
+
+func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 5*time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"dead-node": 7}
+
+	_, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait for dead-node, got %v", err)
+	}
+	if _, still := fa.conns[an]["dead-node"]; !still {
+		t.Fatal("preempted before the grace period")
+	}
+
+	d.heldSince[an] = time.Now().Add(-2 * time.Hour) // Docker kept retrying past the grace
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := fa.conns[an]["dead-node"]; still {
+		t.Fatal("dead-node not preempted after the grace period")
+	}
+	if _, held := d.heldSince[an]; held {
+		t.Fatal("grace timer not cleared after takeover")
+	}
+}
+
 func TestMountRollbackWhenDeviceNeverAppears(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{failWait: true}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
