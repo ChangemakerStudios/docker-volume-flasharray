@@ -31,6 +31,9 @@ type Transport interface {
 	// serial appears, returning its path. Called after the array connection is
 	// made.
 	WaitForDevice(ctx context.Context, serial string) (string, error)
+	// FindDevice returns the volume's block device if it is present now,
+	// without rescanning, or "".
+	FindDevice(ctx context.Context, serial string) string
 	// Detach removes host-side state for a device before the array connection
 	// is deleted (flush multipath map, delete SCSI paths). Best effort.
 	Detach(ctx context.Context, serial, devPath string) error

@@ -259,6 +259,14 @@ func (t *fakeTransport) WaitForDevice(_ context.Context, serial string) (string,
 	}
 	return "/dev/mapper/3624a9370" + serial, nil
 }
+func (t *fakeTransport) FindDevice(_ context.Context, serial string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if dev, ok := t.devs[serial]; ok {
+		return dev
+	}
+	return "/dev/mapper/3624a9370" + serial
+}
 func (t *fakeTransport) Detach(_ context.Context, serial, _ string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -274,10 +282,20 @@ type fakeMounter struct {
 	opts      map[string]string // target -> mount options
 	uuidErr   error             // returned by RegenerateUUID
 	uuidRegen []string          // devs given a new UUID
+	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}}
+	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}}
+}
+func (m *fakeMounter) Busy(dev string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := m.busy[dev]
+	if n > 0 {
+		m.busy[dev] = n - 1
+	}
+	return n != 0, nil
 }
 func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string, allowFormat bool) (bool, error) {
 	m.mu.Lock()
@@ -557,6 +575,87 @@ func TestMountRefusesDeviceAlreadyMountedOnNode(t *testing.T) {
 	}
 	if len(tr.detaches) != 0 {
 		t.Fatalf("detached a device that is still mounted: %v", tr.detaches)
+	}
+}
+
+func TestUnmountWaitsForKernelToReleaseDevice(t *testing.T) {
+	idlePoll = time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := fm.mounted[r.Mountpoint]
+	fm.busy[dev] = 3 // a container namespace still flushing the filesystem
+
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if fm.busy[dev] != 0 {
+		t.Fatalf("detached before the device was released (%d busy polls left)", fm.busy[dev])
+	}
+	if len(tr.detaches) != 1 || len(fa.conns[an]) != 0 {
+		t.Fatalf("detach=%v conns=%v", tr.detaches, fa.conns[an])
+	}
+}
+
+func TestUnmountKeepsConnectionWhileDeviceStaysBusy(t *testing.T) {
+	idlePoll = time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.AttachTimeout = 20 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm.busy[fm.mounted[r.Mountpoint]] = -1
+
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "still in use") {
+		t.Fatalf("expected still-in-use error, got %v", err)
+	}
+	if len(tr.detaches) != 0 {
+		t.Fatalf("detached a busy device: %v", tr.detaches)
+	}
+	if _, ok := fa.conns[an]["node1"]; !ok {
+		t.Fatal("array connection removed under a busy device")
+	}
+}
+
+// After a plugin restart the driver no longer tracks mounts that running
+// containers still hold; Unmount must not disconnect under them.
+func TestUntrackedUnmountWaitsThenDetaches(t *testing.T) {
+	idlePoll = time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	d.mounts = map[string]*mountState{} // plugin restarted
+	dev := tr.FindDevice(context.Background(), fa.vols[an].Serial)
+
+	fm.busy[dev] = -1
+	d.cfg.AttachTimeout = 20 * time.Millisecond
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("untracked unmount disconnected under a busy device")
+	}
+	if _, ok := fa.conns[an]["node1"]; !ok || len(tr.detaches) != 0 {
+		t.Fatalf("busy device was torn down: conns=%v detach=%v", fa.conns[an], tr.detaches)
+	}
+
+	fm.busy[dev] = 2
+	d.cfg.AttachTimeout = 5 * time.Second
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.detaches) != 1 || len(fa.conns[an]) != 0 {
+		t.Fatalf("released device not detached: conns=%v detach=%v", fa.conns[an], tr.detaches)
 	}
 }
 

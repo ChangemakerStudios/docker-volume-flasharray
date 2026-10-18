@@ -148,10 +148,18 @@ processes in uninterruptible sleep, recoverable only by a reboot.
    }
    ```
 
+Before any teardown the plugin waits, up to `FA_ATTACH_TIMEOUT`, until an
+exclusive open of the device succeeds. A stopped container's filesystem can
+still be flushing, and after a plugin disable or upgrade the mounts of running
+containers live only in their namespaces, so the plugin no longer tracks them.
+Disconnecting then loses writes and corrupts XFS. If the device stays busy,
+unmount fails and leaves the device and the array connection in place.
+
 On unmount the plugin refuses to touch a map that still has holders, turns
 queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
 fail_if_no_path`) before flushing it, removes it with `multipathd remove
-map`, falling back to `multipath -f` then `dmsetup remove --force`, and
+map`, falling back to `multipath -f` then, only if the map is not open,
+`dmsetup remove --force`, and
 deletes each SCSI path only after checking it still carries the volume's
 WWID, because the kernel reuses `sdX` names as soon as they are freed. If
 any step fails it leaves the array connection in place rather than pull the

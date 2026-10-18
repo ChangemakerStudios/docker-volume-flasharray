@@ -638,8 +638,7 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
 	if !ok {
-		// Nothing tracked; make sure the array side is clean anyway.
-		return d.array.Disconnect(ctx, d.host, an)
+		return d.detachUntracked(ctx, an, req.Name)
 	}
 	delete(st.refs, req.ID)
 	if len(st.refs) > 0 {
@@ -664,6 +663,16 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		}
 		serial = v.Serial
 	}
+	dev := st.dev
+	if dev == "" {
+		dev = d.tr.FindDevice(ctx, serial)
+	}
+	if err := d.waitIdle(ctx, dev); err != nil {
+		d.mu.Lock()
+		delete(d.mounts, an)
+		d.mu.Unlock()
+		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place", req.Name, err)
+	}
 	if err := d.tr.Detach(ctx, serial, st.dev); err != nil {
 		// Disconnecting on the array under a device the host still holds turns
 		// a cleanup failure into I/O errors for whatever holds it.
@@ -684,6 +693,72 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	d.mu.Unlock()
 	d.log.Info("unmounted", "volume", req.Name)
 	return errors.Join(errs...)
+}
+
+// detachUntracked handles Unmount for a volume this process never mounted: the
+// plugin was disabled or upgraded under running containers, which keep the
+// filesystem mounted in their own namespaces. Disconnecting on the array as
+// soon as Docker asked lost writes still being flushed and corrupted XFS.
+func (d *Driver) detachUntracked(ctx context.Context, an, dockerName string) error {
+	v, err := d.array.GetVolume(ctx, an)
+	if flasharray.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("volume %s: look up serial before detach: %w", dockerName, err)
+	}
+	dev := d.tr.FindDevice(ctx, v.Serial)
+	if dev != "" {
+		if err := d.waitIdle(ctx, dev); err != nil {
+			return fmt.Errorf("volume %s: %w; host device and array connection left in place", dockerName, err)
+		}
+		if err := d.tr.Detach(ctx, v.Serial, dev); err != nil {
+			return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", dockerName, err)
+		}
+	}
+	var errs []error
+	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
+		errs = append(errs, err)
+	}
+	if dev != "" {
+		if err := d.tr.PostDisconnect(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		d.log.Info("detached volume mounted before this plugin start", "volume", dockerName, "dev", dev)
+	}
+	return errors.Join(errs...)
+}
+
+// idlePoll is a variable so tests needn't wait.
+var idlePoll = 500 * time.Millisecond
+
+// waitIdle waits up to the attach timeout for the kernel to release dev. A
+// stopped container's mount namespace is torn down asynchronously, so its
+// filesystem can still be flushing when Docker calls Unmount.
+func (d *Driver) waitIdle(ctx context.Context, dev string) error {
+	if dev == "" {
+		return nil
+	}
+	deadline := time.Now().Add(d.cfg.AttachTimeout)
+	for {
+		busy, err := d.mnt.Busy(dev)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("check whether %s is in use: %w", dev, err)
+		}
+		if !busy {
+			return nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("%s is still in use after %s (a filesystem mounted elsewhere?)", dev, d.cfg.AttachTimeout)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(idlePoll):
+		}
+	}
 }
 
 // Path implements plugin.Driver.

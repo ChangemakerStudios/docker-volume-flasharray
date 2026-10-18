@@ -126,6 +126,13 @@ func (t *nvmeTCP) rescan(ctx context.Context) {
 	}
 }
 
+func (t *nvmeTCP) FindDevice(_ context.Context, serial string) string {
+	if devs := sysBlockMatching("nvme*n*", serial); len(devs) > 0 {
+		return "/dev/" + devs[0]
+	}
+	return ""
+}
+
 // WaitForDevice matches the namespace by the volume serial embedded in its
 // NGUID/EUI-64 (FlashArray derives both from the volume serial). The match is
 // a case-insensitive substring test against the kernel wwid, which is robust

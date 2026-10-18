@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,10 @@ func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath bool) 
 	return ""
 }
 
+func (t *iscsi) FindDevice(ctx context.Context, serial string) string {
+	return t.findDevice(ctx, WWID(serial), multipathdRunning())
+}
+
 // WaitForDevice probes first, then escalates in rounds (session rescan, SCSI
 // host scan, targeted `multipathd add path`) with a probe after every step so
 // a LUN that surfaces mid-round is seen at once. It never runs `multipathd
@@ -320,6 +325,13 @@ func (t *iscsi) removeMap(ctx context.Context, name string) error {
 	}
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipath", "-f", name); err == nil {
 		return nil
+	}
+	// A forced remove swaps an open map's table for an error target, which is
+	// the same as pulling the disk from under a filesystem still flushing.
+	if out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && n > 0 {
+			return fmt.Errorf("detach: multipath map %s is still open (%d); not forcing its removal", name, n)
+		}
 	}
 	t.log.Warn("multipath -f failed; forcing removal with dmsetup", "map", name)
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "dmsetup", "remove", "--force", "--retry", name); err != nil {

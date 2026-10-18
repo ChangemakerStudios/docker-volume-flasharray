@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
@@ -34,6 +35,9 @@ type Mounter interface {
 	// MountedAt returns a mountpoint where dev (after resolving symlinks) is
 	// mounted per /proc/self/mountinfo, or "".
 	MountedAt(dev string) (string, error)
+	// Busy reports whether the kernel still holds dev, e.g. a filesystem
+	// mounted in a container's mount namespace this process can't see.
+	Busy(dev string) (bool, error)
 }
 
 // mountinfoPath is a variable so tests can substitute a fixture.
@@ -161,6 +165,19 @@ func (m *execMounter) MountedAt(dev string) (string, error) {
 		}
 	}
 	return "", sc.Err()
+}
+
+// Busy uses an exclusive open: Linux refuses O_EXCL on a block device with
+// EBUSY while a mounted filesystem or a dm table claims it, in any namespace.
+func (m *execMounter) Busy(dev string) (bool, error) {
+	f, err := os.OpenFile(dev, os.O_RDONLY|os.O_EXCL, 0)
+	if err == nil {
+		return false, f.Close()
+	}
+	if errors.Is(err, syscall.EBUSY) {
+		return true, nil
+	}
+	return false, err
 }
 
 // unescape handles the \040 style escapes mountinfo uses for spaces etc.
