@@ -153,7 +153,7 @@ func (m *execMounter) MountedAt(dev string) (string, error) {
 				return unescape(fields[4]), nil
 			}
 			if filepath.IsAbs(src) {
-				if real, err := filepath.EvalSymlinks(src); err == nil && real == want {
+				if resolved, err := filepath.EvalSymlinks(src); err == nil && resolved == want {
 					return unescape(fields[4]), nil
 				}
 			}

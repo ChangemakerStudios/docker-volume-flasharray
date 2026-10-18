@@ -194,21 +194,21 @@ var sysClassBlock = "/sys/class/block"
 // /dev/disk/by-id and /dev/mapper links can outlive their map and point at a
 // dm number the kernel has since given to another LUN.
 func dmCarries(dev, wwid string) bool {
-	real, err := filepath.EvalSymlinks(dev)
+	resolved, err := filepath.EvalSymlinks(dev)
 	if err != nil {
 		return false
 	}
-	b, err := readFileTimeout(filepath.Join(sysClassBlock, filepath.Base(real), "dm", "uuid"), 3*time.Second)
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, filepath.Base(resolved), "dm", "uuid"), 3*time.Second)
 	return err == nil && strings.EqualFold(strings.TrimSpace(string(b)), "mpath-"+wwid)
 }
 
 // sdCarries is dmCarries for a single-path SCSI disk.
 func sdCarries(dev, wwid string) bool {
-	real, err := filepath.EvalSymlinks(dev)
+	resolved, err := filepath.EvalSymlinks(dev)
 	if err != nil {
 		return false
 	}
-	b, err := readFileTimeout(filepath.Join(sysClassBlock, filepath.Base(real), "device", "wwid"), 3*time.Second)
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, filepath.Base(resolved), "device", "wwid"), 3*time.Second)
 	return err == nil && strings.Contains(strings.ToLower(string(b)), strings.TrimPrefix(strings.ToLower(wwid), "3"))
 }
 
