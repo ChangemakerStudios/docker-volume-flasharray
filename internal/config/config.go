@@ -61,7 +61,7 @@ type Config struct {
 	// PreemptGrace is how long a node may keep a volume that another node
 	// wants before it is presumed dead and preempted; 0 preempts at once.
 	PreemptGrace time.Duration
-	LogLevel          string
+	LogLevel     string
 	// ConnectOnStart logs into every array portal when the plugin starts so the
 	// first volume mount after boot doesn't pay for a cold login while a
 	// container is waiting on it.
