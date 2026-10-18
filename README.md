@@ -1,7 +1,8 @@
 # docker-volume-flasharray
 
 A Docker managed volume plugin for Pure Storage FlashArray over **iSCSI** or
-**NVMe/TCP**. Volumes are FlashArray block volumes, formatted on first use and
+**NVMe/TCP**. Volumes are FlashArray block volumes, formatted on first use
+(only while the array reports nothing has ever been written to them) and
 mounted into containers. Works with plain Docker and Docker Swarm (`Scope:
 global`, so a volume created on one node can be mounted on another).
 
@@ -155,6 +156,15 @@ deletes each SCSI path only after checking it still carries the volume's
 WWID, because the kernel reuses `sdX` names as soon as they are freed. If
 any step fails it leaves the array connection in place rather than pull the
 LUN out from under the host.
+
+On mount the same rule applies to dm names: a `/dev/disk/by-id` or
+`/dev/mapper` link can outlive its map and point at a dm number the kernel has
+given to another LUN, so the device is used only after its sysfs `dm/uuid`
+(or the SCSI `wwid`) matches the volume. A device already mounted elsewhere on
+the node is refused, and a volume whose filesystem blkid can't find is
+formatted only if the array's `space.virtual` is 0; otherwise the mount fails
+with the bytes written, since a damaged superblock also reads as "no
+filesystem".
 
 ## Use
 

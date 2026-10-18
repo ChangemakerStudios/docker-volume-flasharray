@@ -81,6 +81,21 @@ func TestRetrySucceedsAfterTransientError(t *testing.T) {
 	}
 }
 
+func TestVolumeWrittenFromSpaceVirtual(t *testing.T) {
+	cases := map[string]int64{
+		`{"items":[{"name":"v","serial":"ABC","space":{"virtual":0}}]}`:    0,
+		`{"items":[{"name":"v","serial":"ABC","space":{"virtual":8192}}]}`: 8192,
+		`{"items":[{"name":"v","serial":"ABC"}]}`:                          -1,
+	}
+	for body, want := range cases {
+		c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) })
+		v, err := c.GetVolume(context.Background(), "v")
+		if err != nil || v.Written != want {
+			t.Errorf("%s: written=%d err=%v, want %d", body, v.Written, err, want)
+		}
+	}
+}
+
 func TestNameTagsSkipDestroyedVolumes(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

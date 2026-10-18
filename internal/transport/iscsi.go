@@ -155,18 +155,30 @@ func (t *iscsi) mpathMap(ctx context.Context, wwid string) string {
 	return ""
 }
 
+// findDevice only returns a path whose sysfs identity is wwid: a stale udev
+// link once mounted one volume's filesystem from another volume's LUN.
 func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath bool) string {
 	if !useMultipath {
-		if p := "/dev/disk/by-id/scsi-" + wwid; exists(p) {
-			return p
+		p := "/dev/disk/by-id/scsi-" + wwid
+		if exists(p) {
+			if sdCarries(p, wwid) {
+				return p
+			}
+			t.log.Warn("ignoring stale by-id link: it points at another LUN", "link", p, "wwid", wwid)
 		}
 		return ""
 	}
-	if p := "/dev/disk/by-id/dm-uuid-mpath-" + wwid; exists(p) {
-		return p
+	if name := t.mpathMap(ctx, wwid); name != "" {
+		if p := "/dev/mapper/" + name; dmCarries(p, wwid) {
+			return p
+		}
 	}
-	if name := t.mpathMap(ctx, wwid); name != "" && exists("/dev/mapper/"+name) {
-		return "/dev/mapper/" + name
+	p := "/dev/disk/by-id/dm-uuid-mpath-" + wwid
+	if exists(p) {
+		if dmCarries(p, wwid) {
+			return p
+		}
+		t.log.Warn("ignoring stale by-id link: it points at another LUN", "link", p, "wwid", wwid)
 	}
 	return ""
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
 )
 
@@ -233,6 +234,7 @@ type fakeTransport struct {
 	waits    []string
 	detaches []string
 	failWait bool
+	devs     map[string]string // serial -> device, overriding the default path
 }
 
 func (t *fakeTransport) Name() string { return "fake" }
@@ -251,6 +253,9 @@ func (t *fakeTransport) WaitForDevice(_ context.Context, serial string) (string,
 	t.waits = append(t.waits, serial)
 	if t.failWait {
 		return "", errors.New("no device")
+	}
+	if dev, ok := t.devs[serial]; ok {
+		return dev, nil
 	}
 	return "/dev/mapper/3624a9370" + serial, nil
 }
@@ -274,14 +279,27 @@ type fakeMounter struct {
 func newFakeMounter() *fakeMounter {
 	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}}
 }
-func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string) (bool, error) {
+func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string, allowFormat bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.formatted[dev] {
 		return false, nil
 	}
+	if !allowFormat {
+		return false, fmt.Errorf("%s: %w", dev, mounter.ErrNoFilesystem)
+	}
 	m.formatted[dev] = true
 	return true, nil
+}
+func (m *fakeMounter) MountedAt(dev string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for target, d := range m.mounted {
+		if d == dev {
+			return target, nil
+		}
+	}
+	return "", nil
 }
 func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
 	m.mu.Lock()
@@ -485,6 +503,60 @@ func TestMountRollbackWhenDeviceNeverAppears(t *testing.T) {
 	}
 	if len(d.mounts) != 0 {
 		t.Fatal("mount state leaked")
+	}
+}
+
+func TestMountRefusesToFormatWrittenVolume(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.vols[an].Written = 4096 // blkid sees nothing, but data has been written
+
+	_, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err == nil || !errors.Is(err, mounter.ErrNoFilesystem) || !strings.Contains(err.Error(), "refusing to format") {
+		t.Fatalf("expected refusal to format, got %v", err)
+	}
+	if len(fm.formatted) != 0 {
+		t.Fatalf("formatted a written volume: %v", fm.formatted)
+	}
+	if len(fa.conns[an]) != 0 || len(d.mounts) != 0 {
+		t.Fatalf("attach not rolled back: conns=%v mounts=%v", fa.conns[an], d.mounts)
+	}
+
+	fa.vols[an].Written = 0
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatalf("never-written volume should be formatted and mounted: %v", err)
+	}
+	if len(fm.formatted) != 1 {
+		t.Fatalf("expected one format, got %v", fm.formatted)
+	}
+}
+
+func TestMountRefusesDeviceAlreadyMountedOnNode(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{devs: map[string]string{}}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "a"})
+	_ = d.Create(&plugin.CreateRequest{Name: "b"})
+	ra, err := d.Mount(&plugin.MountRequest{Name: "a", ID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devA := fm.mounted[ra.Mountpoint]
+	tr.devs[fa.vols[d.arrayName("b")].Serial] = devA
+
+	_, err = d.Mount(&plugin.MountRequest{Name: "b", ID: "c2"})
+	if err == nil || !strings.Contains(err.Error(), "already mounted at "+ra.Mountpoint) {
+		t.Fatalf("expected refusal naming %s, got %v", ra.Mountpoint, err)
+	}
+	if fm.mounted[ra.Mountpoint] != devA {
+		t.Fatal("existing mount was disturbed")
+	}
+	if _, ok := fa.conns[d.arrayName("a")]["node1"]; !ok {
+		t.Fatal("volume a lost its array connection")
+	}
+	if len(tr.detaches) != 0 {
+		t.Fatalf("detached a device that is still mounted: %v", tr.detaches)
 	}
 }
 

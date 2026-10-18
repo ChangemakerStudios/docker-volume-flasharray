@@ -9,30 +9,42 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
 
+// ErrNoFilesystem is returned by EnsureFilesystem when dev has no filesystem
+// and formatting was not allowed.
+var ErrNoFilesystem = errors.New("no filesystem found")
+
 // Mounter wraps blkid/mkfs/mount/umount.
 type Mounter interface {
-	// EnsureFilesystem creates fstype on dev if blkid finds no filesystem.
-	// Returns true if it formatted.
-	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string) (bool, error)
+	// EnsureFilesystem creates fstype on dev if blkid finds no filesystem and
+	// allowFormat is set; otherwise it returns ErrNoFilesystem. Returns true
+	// if it formatted.
+	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error)
 	Mount(ctx context.Context, dev, target, fstype, opts string) error
 	// RegenerateUUID gives the (unmounted) filesystem on dev a new UUID.
 	RegenerateUUID(ctx context.Context, dev, fstype string) error
 	Unmount(ctx context.Context, target string) error
 	// IsMounted reports whether target is a mountpoint per /proc/self/mountinfo.
 	IsMounted(target string) (bool, error)
+	// MountedAt returns a mountpoint where dev (after resolving symlinks) is
+	// mounted per /proc/self/mountinfo, or "".
+	MountedAt(dev string) (string, error)
 }
+
+// mountinfoPath is a variable so tests can substitute a fixture.
+var mountinfoPath = "/proc/self/mountinfo"
 
 // New returns the exec-based implementation.
 func New(log *slog.Logger) Mounter { return &execMounter{log: log} }
 
 type execMounter struct{ log *slog.Logger }
 
-func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string) (bool, error) {
+func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error) {
 	out, err := hostexec.Command(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
 	// blkid exits 2 when it finds no filesystem; any other failure (device not
 	// ready, I/O error) also prints nothing, and formatting then would wipe data.
@@ -46,6 +58,11 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 			m.log.Warn("device already has a different filesystem; mounting as-is", "dev", dev, "have", existing, "want", fstype)
 		}
 		return false, nil
+	}
+	// A damaged superblock also makes blkid exit 2, so "no filesystem" alone
+	// is not proof the device is blank.
+	if !allowFormat {
+		return false, fmt.Errorf("%s: %w", dev, ErrNoFilesystem)
 	}
 	args := append([]string{}, mkfsOpts...)
 	args = append(args, dev)
@@ -98,7 +115,7 @@ func (m *execMounter) Unmount(ctx context.Context, target string) error {
 }
 
 func (m *execMounter) IsMounted(target string) (bool, error) {
-	f, err := os.Open("/proc/self/mountinfo")
+	f, err := os.Open(mountinfoPath)
 	if err != nil {
 		return false, err
 	}
@@ -111,6 +128,39 @@ func (m *execMounter) IsMounted(target string) (bool, error) {
 		}
 	}
 	return false, sc.Err()
+}
+
+func (m *execMounter) MountedAt(dev string) (string, error) {
+	want, err := filepath.EvalSymlinks(dev)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(mountinfoPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// Optional fields end at "-", followed by fstype and mount source.
+		fields := strings.Fields(sc.Text())
+		for i := 6; i+2 < len(fields); i++ {
+			if fields[i] != "-" {
+				continue
+			}
+			src := unescape(fields[i+2])
+			if src == want {
+				return unescape(fields[4]), nil
+			}
+			if filepath.IsAbs(src) {
+				if real, err := filepath.EvalSymlinks(src); err == nil && real == want {
+					return unescape(fields[4]), nil
+				}
+			}
+			break
+		}
+	}
+	return "", sc.Err()
 }
 
 // unescape handles the \040 style escapes mountinfo uses for spaces etc.

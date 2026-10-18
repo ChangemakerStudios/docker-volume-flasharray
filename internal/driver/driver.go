@@ -576,9 +576,23 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host: %w", req.Name, vol.Serial, err)
 	}
 
-	formatted, err := d.mnt.EnsureFilesystem(ctx, dev, d.cfg.FSType, d.cfg.MkfsOptions)
+	// The device is ours, so a mount of it elsewhere on this node is a leftover
+	// of this same volume; detaching would pull it from under that mount.
+	if other, err := d.mnt.MountedAt(dev); err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		return nil, fmt.Errorf("volume %s: check whether %s is already mounted: %w", req.Name, dev, err)
+	} else if other != "" {
+		return nil, fmt.Errorf("volume %s: %s is already mounted at %s on this node; unmount it there first", req.Name, dev, other)
+	}
+
+	// Only a volume nothing has ever written to may be formatted: blkid also
+	// finds "no filesystem" on a damaged one.
+	formatted, err := d.mnt.EnsureFilesystem(ctx, dev, d.cfg.FSType, d.cfg.MkfsOptions, vol.Written == 0)
 	if err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		if errors.Is(err, mounter.ErrNoFilesystem) {
+			return nil, fmt.Errorf("volume %s: no %s filesystem found on %s, but the array reports %d bytes written to it; refusing to format (damaged filesystem?): %w", req.Name, d.cfg.FSType, dev, vol.Written, err)
+		}
 		return nil, err
 	}
 	mp := filepath.Join(d.cfg.MountRoot, req.Name)

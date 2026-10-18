@@ -40,8 +40,11 @@ type Volume struct {
 	Name        string
 	Serial      string
 	Provisioned int64
-	Destroyed   bool
-	Created     time.Time
+	// Written is the array's space.virtual: bytes hosts have written, before
+	// data reduction and excluding zeroes. -1 when the array didn't report it.
+	Written   int64
+	Destroyed bool
+	Created   time.Time
 }
 
 // Connection is a host<->volume connection.
@@ -348,6 +351,9 @@ type volumeItem struct {
 	Provisioned int64  `json:"provisioned"`
 	Destroyed   bool   `json:"destroyed"`
 	Created     int64  `json:"created"` // epoch millis
+	Space       struct {
+		Virtual *int64 `json:"virtual"`
+	} `json:"space"`
 }
 
 type page[T any] struct {
@@ -357,10 +363,15 @@ type page[T any] struct {
 }
 
 func (v volumeItem) toVolume() *Volume {
+	written := int64(-1)
+	if v.Space.Virtual != nil {
+		written = *v.Space.Virtual
+	}
 	return &Volume{
 		Name:        v.Name,
 		Serial:      strings.ToLower(v.Serial),
 		Provisioned: v.Provisioned,
+		Written:     written,
 		Destroyed:   v.Destroyed,
 		Created:     time.UnixMilli(v.Created).UTC(),
 	}
