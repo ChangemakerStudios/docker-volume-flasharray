@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -38,7 +39,17 @@ type Mounter interface {
 	// Busy reports whether the kernel still holds dev, e.g. a filesystem
 	// mounted in a container's mount namespace this process can't see.
 	Busy(dev string) (bool, error)
+	// DuplicateFSUUID reports whether another block device the kernel holds
+	// carries the same filesystem UUID as dev.
+	DuplicateFSUUID(ctx context.Context, dev string) (bool, error)
 }
+
+// blockGlobs and nvmePathNode are variables so tests can use fixtures; the
+// per-path nodes nvmeXcYnZ of native NVMe multipath are skipped.
+var (
+	blockGlobs   = []string{"/sys/class/block/dm-*", "/sys/class/block/nvme*n*"}
+	nvmePathNode = regexp.MustCompile(`^nvme\d+c\d+n\d+$`)
+)
 
 // mountinfoPath is a variable so tests can substitute a fixture.
 var mountinfoPath = "/proc/self/mountinfo"
@@ -178,6 +189,46 @@ func (m *execMounter) Busy(dev string) (bool, error) {
 		return true, nil
 	}
 	return false, err
+}
+
+func (m *execMounter) DuplicateFSUUID(ctx context.Context, dev string) (bool, error) {
+	want, err := m.fsUUID(ctx, dev)
+	if err != nil || want == "" {
+		return false, err
+	}
+	self, err := filepath.EvalSymlinks(dev)
+	if err != nil {
+		return false, err
+	}
+	for _, g := range blockGlobs {
+		matches, _ := filepath.Glob(g)
+		for _, sys := range matches {
+			name := filepath.Base(sys)
+			other := filepath.Join(filepath.Dir(self), name)
+			if other == self || nvmePathNode.MatchString(name) {
+				continue
+			}
+			if busy, _ := m.Busy(other); !busy {
+				continue
+			}
+			if u, _ := m.fsUUID(ctx, other); u == want {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (m *execMounter) fsUUID(ctx context.Context, dev string) (string, error) {
+	out, err := hostexec.Command(ctx, "blkid", "-p", "-o", "value", "-s", "UUID", dev).Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 2 {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("blkid %s: %w", dev, err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // unescape handles the \040 style escapes mountinfo uses for spaces etc.

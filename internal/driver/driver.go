@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -324,16 +325,22 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	}
 
 	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
-	defer unlock()
+	defer func() { unlock() }() // unlock is swapped when a destroyed volume forces a new array name
 
-	if err == nil {
-		if v.Destroyed {
-			return fmt.Errorf("volume %s exists on the array in destroyed (pending eradication) state; recover or eradicate it first", an)
-		}
+	if err == nil && !v.Destroyed {
 		d.log.Info("volume already exists", "volume", req.Name, "array_name", an)
 		return nil
-	} else if !flasharray.IsNotFound(err) {
+	} else if err != nil && !flasharray.IsNotFound(err) {
 		return err
+	}
+	if err == nil { // destroyed, awaiting eradication: leave it recoverable and make a new one
+		old := an
+		if an, err = d.freshArrayName(ctx, old); err != nil {
+			return err
+		}
+		unlock()
+		unlock = d.lock(an)
+		d.log.Info("array volume under this name is destroyed; creating a new one beside it", "volume", req.Name, "destroyed", old, "array_name", an)
 	}
 
 	if source != "" {
@@ -350,6 +357,26 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	d.remember(req.Name, an)
 	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", v.Provisioned, "source", source)
 	return nil
+}
+
+// freshArrayName derives an unused array name from base for a volume whose
+// usual name is taken by a destroyed one. The dvfa:name tag, not the array
+// name, maps it back to the Docker name.
+func (d *Driver) freshArrayName(ctx context.Context, base string) (string, error) {
+	for i := 0; i < 5; i++ {
+		suffix := "-" + strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond)+int64(i), 36)
+		name := base
+		if len(name)+len(suffix) > 63 {
+			name = strings.TrimRight(name[:63-len(suffix)], "-")
+		}
+		name += suffix
+		if _, err := d.array.GetVolume(ctx, name); flasharray.IsNotFound(err) {
+			return name, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no free array name derived from %s", base)
 }
 
 // cloneVolume copies source to an. source is a Docker volume in this
@@ -513,6 +540,20 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 			return err
 		}
 	}
+	// A destroyed volume keeps its name for 24h, and Get still answers for it
+	// so Docker never swaps in an empty local volume for one destroyed by
+	// accident. That also blocked recreating a name just removed on purpose,
+	// so move the volume out of its computed name first. Its dvfa:name tag
+	// still maps it back if it is recovered.
+	if !d.cfg.EradicateOnRemove && an == d.arrayName(req.Name) {
+		if parked, err := d.freshArrayName(ctx, an); err != nil {
+			d.log.Warn("no free name to move the removed volume to; the name stays taken until eradication", "array_name", an, "err", err)
+		} else if err := d.array.RenameVolume(ctx, an, parked); err != nil {
+			d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+		} else {
+			an = parked
+		}
+	}
 	if err := d.array.DestroyVolume(ctx, an, d.cfg.EradicateOnRemove); err != nil && !flasharray.IsNotFound(err) {
 		return err
 	}
@@ -551,6 +592,9 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	if err := d.takeOver(ctx, an, req.Name); err != nil {
 		return nil, err
 	}
+	if err := d.clearLeftover(ctx, an, req.Name, vol.Serial); err != nil {
+		return nil, err
+	}
 
 	lun, err := d.array.Connect(ctx, d.host, an)
 	if err != nil {
@@ -584,7 +628,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 	mp := filepath.Join(d.cfg.MountRoot, req.Name)
-	if err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, d.mountOptions(ctx, an, req.Name, dev)); err != nil {
+	if err := d.mountFS(ctx, dev, mp, d.mountOptions(ctx, an, req.Name, dev), req.Name); err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, err
 	}
@@ -677,6 +721,67 @@ func (d *Driver) clearHeld(an string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.heldSince, an)
+}
+
+// clearLeftover runs before this host connects an. A device for the volume
+// that this host has no array connection for was left behind when the volume
+// was taken away. If something still holds it, it is a stale mount: on
+// reconnect multipathd would revive its paths and the stale filesystem would
+// write old metadata over the volume, as happened on staging. An idle one is
+// removed so the attach builds a fresh device.
+func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial string) error {
+	conns, err := d.array.ListConnections(ctx, an)
+	if err != nil {
+		return err
+	}
+	for _, c := range conns {
+		if c.Host == d.host {
+			return nil // still connected here: a running container may be using it
+		}
+	}
+	dev := d.tr.FindDevice(ctx, serial)
+	if dev == "" {
+		return nil
+	}
+	busy, err := d.mnt.Busy(dev)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("volume %s: check leftover device %s: %w", dockerName, dev, err)
+	}
+	if busy {
+		return fmt.Errorf("volume %s: %s is still held on this node by a mount from before the volume was disconnected from it; reconnecting would let that stale mount write over the volume (stop what holds it, or reboot the node)", dockerName, dev)
+	}
+	d.log.Warn("removing a leftover device from an earlier attachment before reconnecting", "volume", dockerName, "dev", dev)
+	if err := d.tr.Detach(ctx, serial, dev); err != nil {
+		return fmt.Errorf("volume %s: remove leftover device %s: %w", dockerName, dev, err)
+	}
+	return nil
+}
+
+// mountFS mounts dev and, when XFS refuses because another filesystem on this
+// node has the same UUID (volumes copied outside the driver carry their
+// source's), gives this one a new UUID and retries. A dirty log stops the UUID
+// change, so the last resort is nouuid, which replays the log.
+func (d *Driver) mountFS(ctx context.Context, dev, mp, opts, dockerName string) error {
+	err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
+	if err == nil || d.cfg.FSType != "xfs" {
+		return err
+	}
+	dup, derr := d.mnt.DuplicateFSUUID(ctx, dev)
+	if derr != nil || !dup {
+		return err
+	}
+	rerr := d.mnt.RegenerateUUID(ctx, dev, d.cfg.FSType)
+	if rerr == nil {
+		d.log.Warn("filesystem UUID was already mounted on this node by another volume; gave this one a new UUID", "volume", dockerName, "dev", dev)
+		return d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
+	}
+	d.log.Warn("duplicate filesystem UUID and regenerating it failed; mounting with nouuid", "volume", dockerName, "dev", dev, "err", rerr)
+	if opts == "" {
+		opts = "nouuid"
+	} else {
+		opts += ",nouuid"
+	}
+	return d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
 }
 
 // rollbackAttach is best effort; failures are logged because a leftover array

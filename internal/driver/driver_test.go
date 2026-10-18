@@ -104,6 +104,31 @@ func (f *fakeArray) DeleteTag(_ context.Context, volume, key string) error {
 	return nil
 }
 
+func (f *fakeArray) RenameVolume(_ context.Context, name, newName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rec("rename:" + name + ":" + newName)
+	v, ok := f.vols[name]
+	if !ok {
+		return flasharray.ErrNotFound
+	}
+	if _, taken := f.vols[newName]; taken {
+		return errors.New("PATCH /volumes: HTTP 400: volume already exists")
+	}
+	v.Name = newName
+	f.vols[newName] = v
+	delete(f.vols, name)
+	if t, ok := f.tags[name]; ok {
+		f.tags[newName] = t
+		delete(f.tags, name)
+	}
+	if c, ok := f.conns[name]; ok {
+		f.conns[newName] = c
+		delete(f.conns, name)
+	}
+	return nil
+}
+
 func (f *fakeArray) DestroyVolume(_ context.Context, name string, eradicate bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -235,6 +260,25 @@ type fakeTransport struct {
 	detaches []string
 	failWait bool
 	devs     map[string]string // serial -> device, overriding the default path
+	present  map[string]bool   // serial -> device exists on this node (attached, or a planted leftover)
+}
+
+func (t *fakeTransport) dev(serial string) string {
+	if dev, ok := t.devs[serial]; ok {
+		return dev
+	}
+	return "/dev/mapper/3624a9370" + serial
+}
+
+func (t *fakeTransport) setPresent(serial string, on bool) {
+	if t.present == nil {
+		t.present = map[string]bool{}
+	}
+	if on {
+		t.present[serial] = true
+	} else {
+		delete(t.present, serial)
+	}
 }
 
 func (t *fakeTransport) Name() string { return "fake" }
@@ -254,23 +298,22 @@ func (t *fakeTransport) WaitForDevice(_ context.Context, serial string) (string,
 	if t.failWait {
 		return "", errors.New("no device")
 	}
-	if dev, ok := t.devs[serial]; ok {
-		return dev, nil
-	}
-	return "/dev/mapper/3624a9370" + serial, nil
+	t.setPresent(serial, true)
+	return t.dev(serial), nil
 }
 func (t *fakeTransport) FindDevice(_ context.Context, serial string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if dev, ok := t.devs[serial]; ok {
-		return dev
+	if !t.present[serial] {
+		return ""
 	}
-	return "/dev/mapper/3624a9370" + serial
+	return t.dev(serial)
 }
 func (t *fakeTransport) Detach(_ context.Context, serial, _ string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.detaches = append(t.detaches, serial)
+	t.setPresent(serial, false)
 	return nil
 }
 func (t *fakeTransport) PostDisconnect(context.Context) error { return nil }
@@ -283,10 +326,11 @@ type fakeMounter struct {
 	uuidErr   error             // returned by RegenerateUUID
 	uuidRegen []string          // devs given a new UUID
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
+	dupUUID   map[string]bool   // dev -> its filesystem UUID is already mounted on the node
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}}
+	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, dupUUID: map[string]bool{}}
 }
 func (m *fakeMounter) Busy(dev string) (bool, error) {
 	m.mu.Lock()
@@ -319,9 +363,17 @@ func (m *fakeMounter) MountedAt(dev string) (string, error) {
 	}
 	return "", nil
 }
+func (m *fakeMounter) DuplicateFSUUID(_ context.Context, dev string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dupUUID[dev], nil
+}
 func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.dupUUID[dev] && !strings.Contains(opts, "nouuid") {
+		return errors.New("mount: wrong fs type, bad option, bad superblock")
+	}
 	m.mounted[target] = dev
 	m.opts[target] = opts
 	return nil
@@ -333,6 +385,7 @@ func (m *fakeMounter) RegenerateUUID(_ context.Context, dev, _ string) error {
 		return m.uuidErr
 	}
 	m.uuidRegen = append(m.uuidRegen, dev)
+	delete(m.dupUUID, dev)
 	return nil
 }
 func (m *fakeMounter) Unmount(_ context.Context, target string) error {
@@ -474,11 +527,18 @@ func TestCreateMountUnmountRemove(t *testing.T) {
 		t.Fatalf("get = %+v, %v", g, err)
 	}
 
+	serial := fa.vols[an].Serial
 	if err := d.Remove(&plugin.RemoveRequest{Name: "data_vol"}); err != nil {
 		t.Fatal(err)
 	}
-	if v := fa.vols[an]; v == nil || !v.Destroyed {
-		t.Fatalf("expected destroyed (not eradicated): %+v", v)
+	var removed *flasharray.Volume
+	for _, v := range fa.vols {
+		if v.Serial == serial {
+			removed = v
+		}
+	}
+	if removed == nil || !removed.Destroyed {
+		t.Fatalf("expected destroyed (not eradicated): %+v", removed)
 	}
 }
 
@@ -559,6 +619,170 @@ func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
 	}
 	if _, held := d.heldSince[an]; held {
 		t.Fatal("grace timer not cleared after takeover")
+	}
+}
+
+func TestMountRemovesIdleLeftoverBeforeReconnecting(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	serial := fa.vols[d.arrayName("v")].Serial
+	tr.setPresent(serial, true) // a map left behind when the volume was taken away
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.detaches) != 1 || tr.detaches[0] != serial {
+		t.Fatalf("leftover not removed before reconnecting: %v", tr.detaches)
+	}
+}
+
+// A stale mount still holding the leftover would revive on reconnect and
+// write old metadata over the volume.
+func TestMountRefusesWhileStaleMountHoldsLeftover(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	serial := fa.vols[an].Serial
+	tr.setPresent(serial, true)
+	fm.busy[tr.dev(serial)] = -1
+
+	_, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err == nil || !strings.Contains(err.Error(), "stale mount") {
+		t.Fatalf("expected refusal over a held leftover, got %v", err)
+	}
+	if len(fa.conns[an]) != 0 || len(tr.detaches) != 0 {
+		t.Fatalf("connected or detached under a stale mount: conns=%v detach=%v", fa.conns[an], tr.detaches)
+	}
+}
+
+// Still connected here (a container started before a plugin restart): the
+// device is in legitimate use and must be left alone.
+func TestMountKeepsDeviceOfVolumeStillConnectedHere(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Plugin restarted under the running container: its own mount table and
+	// state are gone, the container's namespace still holds the filesystem.
+	d.mounts = map[string]*mountState{}
+	delete(fm.mounted, r.Mountpoint)
+	fm.busy[tr.dev(fa.vols[an].Serial)] = -1
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c2"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.detaches) != 0 {
+		t.Fatalf("detached a device in use on this node: %v", tr.detaches)
+	}
+}
+
+func TestMountGivesDuplicateFilesystemUUIDANewOne(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	dev := tr.dev(fa.vols[d.arrayName("v")].Serial)
+	fm.formatted[dev] = true // an existing filesystem copied from another volume
+	fm.dupUUID[dev] = true
+
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fm.uuidRegen) != 1 || fm.uuidRegen[0] != dev || strings.Contains(fm.opts[r.Mountpoint], "nouuid") {
+		t.Fatalf("expected a new UUID and a normal mount: regen=%v opts=%q", fm.uuidRegen, fm.opts[r.Mountpoint])
+	}
+}
+
+func TestMountFallsBackToNouuidWhenUUIDChangeFails(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	dev := tr.dev(fa.vols[d.arrayName("v")].Serial)
+	fm.formatted[dev] = true
+	fm.dupUUID[dev] = true
+	fm.uuidErr = errors.New("xfs_admin: log is dirty")
+
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fm.opts[r.Mountpoint], "nouuid") {
+		t.Fatalf("expected nouuid fallback, opts=%q", fm.opts[r.Mountpoint])
+	}
+}
+
+// docker volume rm must free the name at once: the destroyed volume moves
+// aside and stays recoverable, and the name can be created again.
+func TestRemoveFreesNameForRecreate(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	name := d.arrayName("v")
+	oldSerial := fa.vols[name].Serial
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	var parked *flasharray.Volume
+	for n, v := range fa.vols {
+		if v.Serial == oldSerial {
+			parked = v
+			if n == name || !strings.HasPrefix(n, name+"-") || !v.Destroyed {
+				t.Fatalf("removed volume should be destroyed under a new name: %s %+v", n, v)
+			}
+		}
+	}
+	if parked == nil {
+		t.Fatal("removed volume disappeared instead of staying recoverable")
+	}
+	if _, err := d.Get(&plugin.GetRequest{Name: "v"}); err == nil {
+		t.Fatal("Get still answered for the removed volume")
+	}
+
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_name"] != name || g.Volume.Status["serial"] == oldSerial {
+		t.Fatalf("expected a new volume under %s, got %+v, %v", name, g, err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatalf("mount of the recreated volume: %v", err)
+	}
+}
+
+// Destroyed by other means (the array UI): Get keeps answering, so a stack's
+// external volume fails loudly instead of Docker creating an empty local one.
+// An explicit create still gets a fresh volume beside it.
+func TestVolumeDestroyedOutsideDriverStaysVisible(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	name := d.arrayName("v")
+	fa.vols[name].Destroyed = true
+
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["destroyed"] != true {
+		t.Fatalf("Get should answer destroyed=true, got %+v, %v", g, err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("mount should fail loudly, got %v", err)
+	}
+
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	g, err = d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["destroyed"] != false || !strings.HasPrefix(g.Volume.Status["array_name"].(string), name+"-") {
+		t.Fatalf("expected a fresh volume beside the destroyed one, got %+v, %v", g, err)
+	}
+	if !fa.vols[name].Destroyed {
+		t.Fatal("destroyed volume should be left alone")
 	}
 }
 
@@ -1012,12 +1236,7 @@ func TestRemoveVolumeAlreadyDestroyedByAnotherNode(t *testing.T) {
 	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
-		t.Fatal(err)
-	}
-	if !fa.vols["node1-v"].Destroyed {
-		t.Fatal("first remove did not destroy")
-	}
+	fa.vols["node1-v"].Destroyed = true // another node's remove (or an older plugin) got there first
 	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
 		t.Fatalf("second remove of a destroyed volume: %v", err)
 	}

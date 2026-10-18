@@ -165,6 +165,13 @@ WWID, because the kernel reuses `sdX` names as soon as they are freed. If
 any step fails it leaves the array connection in place rather than pull the
 LUN out from under the host.
 
+Before connecting a volume, the plugin checks for a device the node still
+has for it without an array connection, left behind when the volume was taken
+away. An idle one is removed so the attach builds a fresh device. A busy one
+is a stale mount: reconnecting would let multipathd revive its paths and the
+stale filesystem write old metadata over the volume, so the mount is refused
+until whatever holds it is stopped or the node rebooted.
+
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has
 given to another LUN, so the device is used only after its sysfs `dm/uuid`
@@ -173,6 +180,11 @@ the node is refused, and a volume whose filesystem blkid can't find is
 formatted only if the array's `space.virtual` is 0; otherwise the mount fails
 with the bytes written, since a damaged superblock also reads as "no
 filesystem".
+
+XFS refuses to mount a filesystem whose UUID is already mounted on the node,
+which happens with volumes copied outside the plugin. When a mount fails that
+way, the plugin gives the volume a new UUID (`xfs_admin -U generate`) and
+retries, falling back to `nouuid` if a dirty log blocks the change.
 
 ## Use
 
@@ -226,6 +238,16 @@ keeps whatever name it already had on the array. Each node caches the
 mapping; if a cached array volume turns out to be gone or destroyed (another
 node removed and recreated it), the node drops the entry and looks it up
 again.
+
+`docker volume rm` renames the array volume out of its computed name (adding
+a short suffix) before destroying it, so the name can be created again at
+once while the destroyed volume stays recoverable for the array's 24 hours;
+its `dvfa:name` tag still maps it back after a recover. A volume destroyed by
+other means (the array UI) keeps its name, and `Get` keeps answering for it
+with `destroyed: true`: a stack volume declared without a driver then fails
+to mount instead of Docker quietly creating an empty `local` volume in its
+place. An explicit `docker volume create` of such a name gets a fresh array
+volume beside the destroyed one.
 
 ### When the array's management API is unreachable
 
@@ -297,6 +319,11 @@ taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
 "waiting for … to release" error and swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and
 corrupted XFS.
+
+**Services on these volumes must update and roll back `stop-first`** (swarm's
+default). With `start-first` the old task keeps the volume until the new one
+is healthy, the new one cannot mount until the old one lets go, and after
+`FA_PREEMPT_GRACE` the old, still-live task is preempted mid-write.
 
 ## Migrating from the Pure plugin
 

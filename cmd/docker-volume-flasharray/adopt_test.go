@@ -25,7 +25,8 @@ func (m *memArray) GetVolume(_ context.Context, n string) (*flasharray.Volume, e
 func (m *memArray) CreateVolume(context.Context, string, int64) (*flasharray.Volume, error) {
 	panic("not used")
 }
-func (m *memArray) DestroyVolume(context.Context, string, bool) error { panic("not used") }
+func (m *memArray) DestroyVolume(context.Context, string, bool) error  { panic("not used") }
+func (m *memArray) RenameVolume(context.Context, string, string) error { panic("not used") }
 func (m *memArray) CopyVolume(context.Context, string, string) (*flasharray.Volume, error) {
 	panic("not used")
 }

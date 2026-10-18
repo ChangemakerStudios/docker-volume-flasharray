@@ -70,6 +70,7 @@ type Array interface {
 	// CopyVolume creates name as a copy of source (same size and contents).
 	CopyVolume(ctx context.Context, source, name string) (*Volume, error)
 	DestroyVolume(ctx context.Context, name string, eradicate bool) error
+	RenameVolume(ctx context.Context, name, newName string) error
 	SetNameTag(ctx context.Context, volume, value string) error
 	SetTag(ctx context.Context, volume, key, value string) error
 	// GetTags returns key -> value for the volume's tags in TagNamespace.
@@ -432,6 +433,11 @@ func (c *Client) DestroyVolume(ctx context.Context, name string, eradicate bool)
 		return nil
 	}
 	return err
+}
+
+// RenameVolume renames an array volume; its serial, data and tags stay.
+func (c *Client) RenameVolume(ctx context.Context, name, newName string) error {
+	return c.do(ctx, http.MethodPatch, "/volumes", url.Values{"names": {name}}, map[string]any{"name": newName}, nil)
 }
 
 // --- tags ------------------------------------------------------------------
