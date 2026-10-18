@@ -42,6 +42,10 @@ type Mounter interface {
 	// DuplicateFSUUID reports whether another block device the kernel holds
 	// carries the same filesystem UUID as dev.
 	DuplicateFSUUID(ctx context.Context, dev string) (bool, error)
+	// InUseByContainer reports whether a mount namespace other than the
+	// host's and this process's has the filesystem at mountpoint mounted.
+	// Needs the host PID namespace (pidhost).
+	InUseByContainer(mountpoint string) (bool, error)
 }
 
 // blockGlobs and nvmePathNode are variables so tests can use fixtures; the
@@ -51,8 +55,15 @@ var (
 	nvmePathNode = regexp.MustCompile(`^nvme\d+c\d+n\d+$`)
 )
 
-// mountinfoPath is a variable so tests can substitute a fixture.
-var mountinfoPath = "/proc/self/mountinfo"
+// mountinfoPath and procRoot are variables so tests can substitute fixtures.
+var (
+	mountinfoPath = "/proc/self/mountinfo"
+	procRoot      = "/proc"
+)
+
+// pluginMountPath matches the plugin's own propagated mounts, which
+// namespaces copied from the host (systemd PrivateTmp etc.) also carry.
+var pluginMountPath = regexp.MustCompile(`/plugins/[0-9a-f]{64}/`)
 
 // New returns the exec-based implementation.
 func New(log *slog.Logger) Mounter { return &execMounter{log: log} }
@@ -217,6 +228,60 @@ func (m *execMounter) DuplicateFSUUID(ctx context.Context, dev string) (bool, er
 		}
 	}
 	return false, nil
+}
+
+// InUseByContainer only sees namespaces that still have a process in them,
+// which is what matters: a stopped container's namespace has none.
+func (m *execMounter) InUseByContainer(mountpoint string) (bool, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(mountpoint, &st); err != nil {
+		return false, err
+	}
+	dev := uint64(st.Dev) // uint32 on some arches
+	want := fmt.Sprintf("%d:%d", (dev>>8)&0xfff|(dev>>32)&^0xfff, dev&0xff|(dev>>12)&^0xff)
+
+	seen := map[string]bool{}
+	for _, p := range []string{"1", "self"} {
+		ns, err := os.Readlink(filepath.Join(procRoot, p, "ns", "mnt"))
+		if err != nil {
+			return false, fmt.Errorf("read mount namespace of %s: %w", p, err)
+		}
+		seen[ns] = true
+	}
+	pids, err := filepath.Glob(filepath.Join(procRoot, "[0-9]*"))
+	if err != nil {
+		return false, err
+	}
+	for _, dir := range pids {
+		ns, err := os.Readlink(filepath.Join(dir, "ns", "mnt"))
+		if err != nil || seen[ns] {
+			continue
+		}
+		seen[ns] = true
+		if mountsDevice(filepath.Join(dir, "mountinfo"), want) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// mountsDevice reports whether the mountinfo file lists want (major:minor)
+// outside the plugin's own propagated mounts. An unreadable file means the
+// process has exited.
+func mountsDevice(path, want string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) > 4 && fields[2] == want && !pluginMountPath.MatchString(unescape(fields[4])) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *execMounter) fsUUID(ctx context.Context, dev string) (string, error) {

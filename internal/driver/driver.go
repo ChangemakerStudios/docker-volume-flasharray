@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,8 +48,14 @@ type Driver struct {
 	known  map[string]string
 	saveMu sync.Mutex
 	// heldSince records when this node first found an array volume attached
-	// to another host, so the preempt grace spans Docker's mount retries.
-	heldSince map[string]time.Time
+	// to its current other holders, so the preempt grace spans Docker's mount
+	// retries but restarts when the holder changes.
+	heldSince map[string]holdState
+}
+
+type holdState struct {
+	hosts string
+	since time.Time
 }
 
 type mountState struct {
@@ -56,7 +63,7 @@ type mountState struct {
 	serial     string
 	dev        string
 	mountpoint string
-	refs       map[string]struct{}
+	refs       map[string]time.Time // Docker mount ID -> when it was added
 }
 
 // Deps lets tests inject fakes.
@@ -83,7 +90,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		names:  map[string]string{},
 		known:  map[string]string{},
 
-		heldSince: map[string]time.Time{},
+		heldSince: map[string]holdState{},
 	}
 	iqns, nqns, err := drv.tr.InitiatorIDs()
 	if err != nil {
@@ -147,7 +154,7 @@ func (d *Driver) recoverMounts(ctx context.Context) {
 			an = d.arrayName(e.Name())
 			d.log.Warn("tag lookup failed; recovering mount under its computed array name", "volume", e.Name(), "array_name", an, "err", err)
 		}
-		d.mounts[an] = &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]struct{}{}}
+		d.mounts[an] = &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]time.Time{}}
 		d.log.Info("recovered existing mount", "volume", e.Name(), "mountpoint", mp)
 	}
 }
@@ -288,7 +295,19 @@ func (d *Driver) lock(name string) func() {
 }
 
 func (d *Driver) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d.cfg.AttachTimeout+maxReleaseWait+30*time.Second)
+	return d.ctxWithin(time.Hour)
+}
+
+// Docker gives up on a Mount after 2 minutes and an Unmount after 1
+// (volume/drivers/proxy.go) and treats it as failed, while the driver would
+// finish it unseen. Mount and Unmount stay inside those limits.
+const (
+	mountBudget   = 110 * time.Second
+	unmountBudget = 55 * time.Second
+)
+
+func (d *Driver) ctxWithin(limit time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), min(d.cfg.AttachTimeout+maxReleaseWait+30*time.Second, limit))
 }
 
 // Create implements plugin.Driver.
@@ -565,7 +584,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 
 // Mount implements plugin.Driver.
 func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) {
-	ctx, cancel := d.ctx()
+	ctx, cancel := d.ctxWithin(mountBudget)
 	defer cancel()
 	an, vol, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
@@ -575,7 +594,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
 	if ok {
-		st.refs[req.ID] = struct{}{}
+		st.refs[req.ID] = time.Now()
 		return &plugin.MountResponse{Mountpoint: st.mountpoint}, nil
 	}
 
@@ -633,7 +652,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 
-	st = &mountState{dockerName: req.Name, serial: vol.Serial, dev: dev, mountpoint: mp, refs: map[string]struct{}{req.ID: {}}}
+	st = &mountState{dockerName: req.Name, serial: vol.Serial, dev: dev, mountpoint: mp, refs: map[string]time.Time{req.ID: time.Now()}}
 	d.mu.Lock()
 	d.mounts[an] = st
 	d.mu.Unlock()
@@ -661,7 +680,7 @@ func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
 	if !d.cfg.PreemptRWO {
 		return fmt.Errorf("volume %s is attached to host %s (FA_PREEMPT_RWO=false)", dockerName, others[0])
 	}
-	held := d.markHeld(an)
+	held := d.markHeld(an, others)
 	wait := min(d.cfg.PreemptGrace-time.Since(held), maxReleaseWait)
 	deadline := time.Now().Add(wait)
 	for len(others) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
@@ -671,6 +690,9 @@ func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
 		}
 		if others, err = d.otherHosts(ctx, an); err != nil {
 			return err
+		}
+		if len(others) > 0 {
+			held = d.markHeld(an, others)
 		}
 	}
 	if len(others) == 0 {
@@ -706,15 +728,18 @@ func (d *Driver) otherHosts(ctx context.Context, an string) ([]string, error) {
 	return out, nil
 }
 
-func (d *Driver) markHeld(an string) time.Time {
+// markHeld returns when an was first seen held by exactly these hosts. A new
+// holder restarts the grace: it is live, not the host that went quiet.
+func (d *Driver) markHeld(an string, others []string) time.Time {
+	hosts := strings.Join(slices.Sorted(slices.Values(others)), ",")
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	t, ok := d.heldSince[an]
-	if !ok {
-		t = time.Now()
-		d.heldSince[an] = t
+	h, ok := d.heldSince[an]
+	if !ok || h.hosts != hosts {
+		h = holdState{hosts: hosts, since: time.Now()}
+		d.heldSince[an] = h
 	}
-	return t
+	return h.since
 }
 
 func (d *Driver) clearHeld(an string) {
@@ -800,7 +825,7 @@ func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
 
 // Unmount implements plugin.Driver.
 func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
-	ctx, cancel := d.ctx()
+	ctx, cancel := d.ctxWithin(unmountBudget)
 	defer cancel()
 	an, _, err := d.resolve(ctx, req.Name)
 	if err != nil {
@@ -816,7 +841,8 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		return d.detachUntracked(ctx, an, req.Name)
 	}
 	delete(st.refs, req.ID)
-	if len(st.refs) > 0 {
+	if len(st.refs) > 0 && !d.dropStaleRefs(st, req.Name) {
+		d.log.Info("volume still in use here; kept mounted", "volume", req.Name, "refs", len(st.refs))
 		return nil
 	}
 
@@ -870,6 +896,33 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	return errors.Join(errs...)
 }
 
+// refPending is a variable so tests needn't wait.
+var refPending = 2 * time.Minute
+
+// dropStaleRefs clears st's remaining refs if no container uses the volume.
+// Docker has sent Mounts it never paired with an Unmount; trusting those refs
+// left filesystems mounted after their last container stopped, and the next
+// node to mount the volume preempted them mid-write. A ref younger than
+// refPending may belong to a container still starting, so it always counts.
+func (d *Driver) dropStaleRefs(st *mountState, dockerName string) bool {
+	for _, added := range st.refs {
+		if time.Since(added) < refPending {
+			return false
+		}
+	}
+	inUse, err := d.mnt.InUseByContainer(st.mountpoint)
+	if err != nil {
+		d.log.Warn("cannot tell whether a container still uses the volume; keeping it mounted", "volume", dockerName, "err", err)
+		return false
+	}
+	if inUse {
+		return false
+	}
+	d.log.Warn("dropping mount refs Docker never released: no container uses the volume", "volume", dockerName, "refs", len(st.refs))
+	clear(st.refs)
+	return true
+}
+
 // detachUntracked handles Unmount for a volume this process never mounted: the
 // plugin was disabled or upgraded under running containers, which keep the
 // filesystem mounted in their own namespaces. Disconnecting on the array as
@@ -907,6 +960,8 @@ func (d *Driver) detachUntracked(ctx context.Context, an, dockerName string) err
 // idlePoll is a variable so tests needn't wait.
 var idlePoll = 500 * time.Millisecond
 
+const detachReserve = 15 * time.Second
+
 // waitIdle waits up to the attach timeout for the kernel to release dev. A
 // stopped container's mount namespace is torn down asynchronously, so its
 // filesystem can still be flushing when Docker calls Unmount.
@@ -914,7 +969,12 @@ func (d *Driver) waitIdle(ctx context.Context, dev string) error {
 	if dev == "" {
 		return nil
 	}
-	deadline := time.Now().Add(d.cfg.AttachTimeout)
+	start := time.Now()
+	deadline := start.Add(d.cfg.AttachTimeout)
+	// Leave the detach and disconnect that follow time to run.
+	if dl, ok := ctx.Deadline(); ok && dl.Add(-detachReserve).Before(deadline) {
+		deadline = dl.Add(-detachReserve)
+	}
 	for {
 		busy, err := d.mnt.Busy(dev)
 		if err != nil {
@@ -927,7 +987,7 @@ func (d *Driver) waitIdle(ctx context.Context, dev string) error {
 			return nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("%s is still in use after %s (a filesystem mounted elsewhere?)", dev, d.cfg.AttachTimeout)
+			return fmt.Errorf("%s is still in use after %s (a filesystem mounted elsewhere?)", dev, time.Since(start).Round(time.Second))
 		}
 		select {
 		case <-ctx.Done():

@@ -155,6 +155,20 @@ containers live only in their namespaces, so the plugin no longer tracks them.
 Disconnecting then loses writes and corrupts XFS. If the device stays busy,
 unmount fails and leaves the device and the array connection in place.
 
+Docker sometimes sends a Mount it never pairs with an Unmount, so the
+plugin does not trust its own count of mount IDs. When the last expected
+Unmount leaves IDs behind, it checks the mount namespaces of every process
+(the plugin runs with the host PID namespace) and unmounts if no container
+still has the filesystem; IDs younger than two minutes may belong to a
+container still starting and always keep it mounted. Mount and Unmount
+finish inside Docker's own limits (2 and 1 minute), past which Docker counts
+the call as failed while the plugin would carry on unseen.
+
+**Upgrade or disable the plugin only on a drained node, and without `-f`.**
+Plain `docker plugin disable` refuses while any volume is still in use;
+`-f` tears the plugin's mounts out from under running containers
+([moby#32515](https://github.com/moby/moby/issues/32515)).
+
 On unmount the plugin refuses to touch a map that still has holders, turns
 queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
 fail_if_no_path`) before flushing it, removes it with `multipathd remove
@@ -314,7 +328,8 @@ A block volume is single-writer. On a drain swarm starts the new task while
 the old one is still stopping, so a mount first waits (up to 30s per attempt)
 for the other host to release the volume itself, which its unmount does once
 the old container is gone. Only a host that keeps it past `FA_PREEMPT_GRACE`,
-counted across Docker's retries, is presumed dead and has its connection
+counted across Docker's retries and restarted whenever the holder changes,
+is presumed dead and has its connection
 taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
 "waiting for … to release" error and swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and

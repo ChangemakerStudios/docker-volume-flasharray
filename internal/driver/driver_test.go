@@ -327,10 +327,13 @@ type fakeMounter struct {
 	uuidRegen []string          // devs given a new UUID
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
 	dupUUID   map[string]bool   // dev -> its filesystem UUID is already mounted on the node
+	inUse     map[string]bool   // mountpoint -> a container namespace still has it
+	// inUseChecks counts InUseByContainer calls.
+	inUseChecks int
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, dupUUID: map[string]bool{}}
+	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, dupUUID: map[string]bool{}, inUse: map[string]bool{}}
 }
 func (m *fakeMounter) Busy(dev string) (bool, error) {
 	m.mu.Lock()
@@ -367,6 +370,12 @@ func (m *fakeMounter) DuplicateFSUUID(_ context.Context, dev string) (bool, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.dupUUID[dev], nil
+}
+func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inUseChecks++
+	return m.inUse[mountpoint], nil
 }
 func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
 	m.mu.Lock()
@@ -610,7 +619,7 @@ func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
 		t.Fatal("preempted before the grace period")
 	}
 
-	d.heldSince[an] = time.Now().Add(-2 * time.Hour) // Docker kept retrying past the grace
+	d.heldSince[an] = holdState{hosts: "dead-node", since: time.Now().Add(-2 * time.Hour)} // Docker kept retrying past the grace
 	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
 		t.Fatal(err)
 	}
@@ -619,6 +628,26 @@ func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
 	}
 	if _, held := d.heldSince[an]; held {
 		t.Fatal("grace timer not cleared after takeover")
+	}
+}
+
+// The grace belongs to the holder: a host that only just took the volume is
+// live and must get the full grace, however long an earlier holder kept it.
+func TestPreemptGraceRestartsWhenHolderChanges(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 5*time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"new-holder": 7}
+	d.heldSince[an] = holdState{hosts: "old-holder", since: time.Now().Add(-2 * time.Hour)}
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait for new-holder, got %v", err)
+	}
+	if _, still := fa.conns[an]["new-holder"]; !still {
+		t.Fatal("preempted a new holder on the old holder's grace")
 	}
 }
 
@@ -901,6 +930,82 @@ func TestUnmountKeepsConnectionWhileDeviceStaysBusy(t *testing.T) {
 	}
 	if _, ok := fa.conns[an]["node1"]; !ok {
 		t.Fatal("array connection removed under a busy device")
+	}
+}
+
+// Docker sent Mounts it never unmounted; trusting their refs left the volume
+// mounted after its last container stopped, and the next node preempted it.
+func TestUnmountDropsRefsNoContainerUses(t *testing.T) {
+	refPending = 0
+	t.Cleanup(func() { refPending = 2 * time.Minute })
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "leaked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := fm.mounted[r.Mountpoint]; still {
+		t.Fatal("kept the volume mounted for a ref no container uses")
+	}
+	if len(tr.detaches) != 1 || len(fa.conns[an]) != 0 {
+		t.Fatalf("not detached: detach=%v conns=%v", tr.detaches, fa.conns[an])
+	}
+}
+
+func TestUnmountKeepsVolumeAContainerStillUses(t *testing.T) {
+	refPending = 0
+	t.Cleanup(func() { refPending = 2 * time.Minute })
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	fm.inUse[r.Mountpoint] = true
+
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := fm.mounted[r.Mountpoint]; !still || len(tr.detaches) != 0 {
+		t.Fatal("unmounted a volume another container still uses")
+	}
+}
+
+// A ref Docker just added may be a container that has not started yet, so
+// its namespace can't show the mount.
+func TestUnmountKeepsYoungRefs(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "starting"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := fm.mounted[r.Mountpoint]; !still || len(tr.detaches) != 0 {
+		t.Fatal("unmounted under a container that is still starting")
+	}
+	if fm.inUseChecks != 0 {
+		t.Fatal("young ref should keep the mount without asking the kernel")
 	}
 }
 
