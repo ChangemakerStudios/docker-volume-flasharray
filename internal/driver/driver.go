@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
@@ -37,8 +38,10 @@ type Driver struct {
 	host  string // FlashArray host object name for this node
 	ports []flasharray.Port
 
-	mu    sync.Mutex // guards locks, mounts, names and known maps
-	locks map[string]*sync.Mutex
+	mu sync.Mutex // guards locks, mounts, names and known maps
+	// prefix is this array's serial prefix (string) once known; see arrayPrefix.
+	prefix atomic.Value
+	locks  map[string]*sync.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
 	// names caches dockerName -> array volume name once resolved.
@@ -660,16 +663,27 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 // a rescan can have created.
 func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string) (int, error) {
 	var lun int
+	prefix := arrayPrefix(serial)
+	d.prefix.Store(prefix)
 	err := d.tr.Exclusive(func() error {
-		var err error
+		// First clear paths on LUN numbers the array does not map here: the
+		// connect may hand one of them out, and until the sweep after it a
+		// leftover path there would reach the newly connected volume.
+		want, err := d.array.HostLUNs(ctx, d.host)
+		if err != nil {
+			return fmt.Errorf("volume %s: read this host's LUN map before attaching: %w", dockerName, err)
+		}
+		if err := d.tr.Sweep(ctx, want, prefix, -1, false); err != nil {
+			d.log.Warn("pre-attach sweep left stale paths", "volume", dockerName, "err", err)
+		}
 		lun, err = d.array.Connect(ctx, d.host, an)
 		if err != nil {
 			return fmt.Errorf("connect %s to %s: %w", dockerName, d.host, err)
 		}
 		d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
-		want, err := d.array.HostLUNs(ctx, d.host)
+		want, err = d.array.HostLUNs(ctx, d.host)
 		if err == nil {
-			err = d.tr.Sweep(ctx, want, arrayPrefix(serial), lun)
+			err = d.tr.Sweep(ctx, want, prefix, lun, false)
 		}
 		if err != nil {
 			d.rollbackLocked(ctx, an, serial, "")
@@ -687,6 +701,54 @@ const cleanupBudget = 60 * time.Second
 
 func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+}
+
+// pathCheckInterval is a variable so tests needn't wait.
+var pathCheckInterval = 30 * time.Second
+
+// RunPathCheck re-checks this host's paths against the array until ctx ends.
+// The sweeps around each attach close every window the driver itself opens,
+// but a path the kernel scans late, or a LUN reassigned by someone else, can
+// still put a path into a live map that reaches another volume.
+func (d *Driver) RunPathCheck(ctx context.Context) {
+	t := time.NewTicker(pathCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.checkPaths(ctx)
+		}
+	}
+}
+
+// checkPaths deletes only paths on a LUN the array gives to a different
+// volume (crossedOnly), so an incomplete answer from the array can never cut
+// a live volume's path.
+func (d *Driver) checkPaths(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, pathCheckInterval)
+	defer cancel()
+	_ = d.tr.Exclusive(func() error {
+		want, err := d.array.HostLUNs(ctx, d.host)
+		if err != nil {
+			d.log.Warn("path check: cannot read this host's LUN map", "err", err)
+			return nil
+		}
+		prefix, _ := d.prefix.Load().(string)
+		for _, serial := range want {
+			prefix = arrayPrefix(serial)
+			d.prefix.Store(prefix)
+			break
+		}
+		if prefix == "" {
+			return nil // nothing connected or mounted yet
+		}
+		if err := d.tr.Sweep(ctx, want, prefix, -1, true); err != nil {
+			d.log.Error("path check left a path that reaches another volume", "err", err)
+		}
+		return nil
+	})
 }
 
 // arrayPrefix is the part of a FlashArray volume serial all volumes of one

@@ -448,7 +448,12 @@ const purePrefix = "naa.624a9370"
 // afterwards (its buffers belong to a volume it no longer reaches). Only a
 // stale path on ownLUN that cannot be deleted is an error; others are logged,
 // so one wedged device does not block every mount on the node.
-func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int) error {
+//
+// crossedOnly limits the sweep to paths on a LUN the array gives to a
+// different volume. A LUN missing from want then proves nothing: I/O to an
+// unmapped LUN fails on its own, and a list missing an entry must never be
+// grounds to cut a live volume's path.
+func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int, crossedOnly bool) error {
 	arrayPrefix = strings.ToLower(arrayPrefix)
 	devs, _ := filepath.Glob(filepath.Join(sysClassBlock, "sd*"))
 	stale := map[string]int{} // sd -> LUN
@@ -463,7 +468,7 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 			continue
 		}
 		lun, ok := pathLUN(p)
-		if !ok || want[lun] == serial {
+		if !ok || want[lun] == serial || (crossedOnly && want[lun] == "") {
 			continue
 		}
 		t.log.Warn("deleting stale path: the array gives its LUN to another volume", "dev", filepath.Base(p), "lun", lun, "path_serial", serial, "array_serial", want[lun])

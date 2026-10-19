@@ -114,7 +114,7 @@ func TestSweepDeletesPathsOnReassignedLUNs(t *testing.T) {
 
 	tr := &iscsi{log: slog.Default()}
 	want := map[int]string{3: "6fef9ab1157343ec000000aa", 4: "6fef9ab1157343ec000000cc"}
-	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 4); err != nil {
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 4, false); err != nil {
 		t.Fatal(err)
 	}
 	if deleted(t, root, "50:0:0:4") {
@@ -131,6 +131,30 @@ func TestSweepDeletesPathsOnReassignedLUNs(t *testing.T) {
 	}
 	if deleted(t, root, "2:0:0:4") {
 		t.Fatal("touched a non-FlashArray disk")
+	}
+}
+
+// The background check must not cut a path just because its LUN is missing
+// from the array's answer; only a LUN given to another volume counts.
+func TestSweepCrossedOnly(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	fakePath(t, root, "sda", "34:0:0:4", "naa.624a93706fef9ab1157343ec000000bb") // LUN 4 now carries cc
+	fakePath(t, root, "sdb", "34:0:0:9", "naa.624a93706fef9ab1157343ec000000dd") // LUN 9 not in the answer
+
+	tr := &iscsi{log: slog.Default()}
+	want := map[int]string{4: "6fef9ab1157343ec000000cc"}
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", -1, true); err != nil {
+		t.Fatal(err)
+	}
+	if !deleted(t, root, "34:0:0:4") {
+		t.Fatal("kept a path that reaches another volume")
+	}
+	if deleted(t, root, "34:0:0:9") {
+		t.Fatal("cut a path only because its LUN was missing from the answer")
 	}
 }
 
@@ -183,10 +207,10 @@ func TestSweepFailsOnlyForItsOwnLUN(t *testing.T) {
 	}
 	tr := &iscsi{log: slog.Default()}
 	want := map[int]string{5: "6fef9ab1157343ec000000bb"}
-	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 7); err != nil {
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 7, false); err != nil {
 		t.Fatalf("undeletable path on another LUN failed the sweep: %v", err)
 	}
-	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 5); err == nil {
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 5, false); err == nil {
 		t.Fatal("undeletable stale path on our own LUN must fail")
 	}
 }

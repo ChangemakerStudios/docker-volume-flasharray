@@ -42,10 +42,11 @@ type Transport interface {
 	// namespace rescan). Best effort.
 	PostDisconnect(ctx context.Context) error
 	// Sweep removes this array's host paths whose LUN number the array now
-	// gives to another volume, or to none. want is LUN -> volume serial for
-	// this host; arrayPrefix is the leading part every serial of this array
-	// shares; only a stale path on ownLUN that cannot be removed is an error.
-	Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int) error
+	// gives to another volume, or (unless crossedOnly) to none. want is LUN ->
+	// volume serial for this host; arrayPrefix is the leading part every
+	// serial of this array shares; only a stale path on ownLUN that cannot be
+	// removed is an error.
+	Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int, crossedOnly bool) error
 	// Exclusive runs fn with rescans held off; see iscsi.Exclusive.
 	Exclusive(fn func() error) error
 	// CheckLUN reports an error unless every path under dev sits on lun.

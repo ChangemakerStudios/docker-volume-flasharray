@@ -92,6 +92,7 @@ func run() error {
 	log.Info("serving", "socket", "/run/docker/plugins/"+socketName+".sock")
 	srvCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	go drv.RunPathCheck(srvCtx)
 	return h.ServeUnix(srvCtx, socketName)
 }
 

@@ -204,8 +204,12 @@ itself deletes, unflushed, any path whose LUN no longer carries the volume.
 A mount checks every path of its device sits on the LUN the array assigned,
 and ignores a map that has no paths. Rollback of a failed mount disconnects on
 the array only once the host-side devices are gone. A stale path that cannot
-be deleted fails only the mount whose LUN it sits on. (NVMe/TCP has no such
-sweep yet.)
+be deleted fails only the mount whose LUN it sits on. The sweep also runs just
+before each connect, so no leftover path sits on a LUN number the connect may
+hand out, and every 30 seconds in the background, where it deletes only paths
+on a LUN the array gives to a different volume: a LUN missing from the
+array's answer is never reason enough to cut a live volume's path. (NVMe/TCP
+has no such sweep yet.)
 
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has

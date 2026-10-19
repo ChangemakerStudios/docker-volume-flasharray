@@ -335,10 +335,10 @@ func (t *fakeTransport) Detach(_ context.Context, serial, _ string, _ map[int]st
 	return nil
 }
 func (t *fakeTransport) PostDisconnect(context.Context) error { return nil }
-func (t *fakeTransport) Sweep(_ context.Context, want map[int]string, prefix string, own int) error {
+func (t *fakeTransport) Sweep(_ context.Context, want map[int]string, prefix string, own int, crossedOnly bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.sweeps = append(t.sweeps, sweepCall{want, prefix, own})
+	t.sweeps = append(t.sweeps, sweepCall{want, prefix, own, crossedOnly})
 	return nil
 }
 func (t *fakeTransport) Exclusive(fn func() error) error {
@@ -348,9 +348,10 @@ func (t *fakeTransport) Exclusive(fn func() error) error {
 }
 
 type sweepCall struct {
-	want   map[int]string
-	prefix string
-	own    int
+	want        map[int]string
+	prefix      string
+	own         int
+	crossedOnly bool
 }
 
 func (t *fakeTransport) CheckLUN(string, int) error { return t.lunErr }
@@ -667,9 +668,9 @@ func TestPreemptGraceRestartsWhenHolderChanges(t *testing.T) {
 	}
 }
 
-// Every attach sweeps stale paths with the array's LUN map, which already
-// includes the LUN it was just given.
-func TestMountSweepsStalePathsAfterConnect(t *testing.T) {
+// Every attach sweeps stale paths before connecting, so no leftover sits on a
+// LUN the connect hands out, and after, with a LUN map that includes its own.
+func TestMountSweepsStalePathsAroundConnect(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
 	_ = d.Create(&plugin.CreateRequest{Name: "v"})
@@ -679,8 +680,38 @@ func TestMountSweepsStalePathsAfterConnect(t *testing.T) {
 	}
 	lun := fa.conns[an]["node1"]
 	serial := strings.ToLower(fa.vols[an].Serial)
-	if len(tr.sweeps) != 1 || tr.sweeps[0].want[lun] != serial || tr.sweeps[0].own != lun || !strings.HasPrefix(serial, tr.sweeps[0].prefix) {
-		t.Fatalf("sweeps = %+v, want one covering LUN %d scoped to this array", tr.sweeps, lun)
+	if len(tr.sweeps) != 2 {
+		t.Fatalf("sweeps = %+v, want one before and one after the connect", tr.sweeps)
+	}
+	before, after := tr.sweeps[0], tr.sweeps[1]
+	if _, ok := before.want[lun]; ok || before.own != -1 || before.crossedOnly {
+		t.Fatalf("pre-connect sweep = %+v", before)
+	}
+	if after.want[lun] != serial || after.own != lun || after.crossedOnly || !strings.HasPrefix(serial, after.prefix) {
+		t.Fatalf("post-connect sweep = %+v, want one covering LUN %d scoped to this array", after, lun)
+	}
+}
+
+// The background check may only cut a path the array positively maps to
+// another volume.
+func TestPathCheckSweepsCrossedPathsOnly(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.checkPaths(context.Background())
+	if len(tr.sweeps) != 0 {
+		t.Fatalf("swept before the array prefix was known: %+v", tr.sweeps)
+	}
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	n := len(tr.sweeps)
+	d.checkPaths(context.Background())
+	if len(tr.sweeps) != n+1 {
+		t.Fatal("path check did not sweep")
+	}
+	if c := tr.sweeps[n]; !c.crossedOnly || c.own != -1 || c.prefix == "" {
+		t.Fatalf("path check sweep = %+v, want crossedOnly with no own LUN", c)
 	}
 }
 
