@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+// CI runners and dev hosts may run a real multipathd; tests that want one
+// fake it (fakeMultipath), and none may reach the real one.
+func TestMain(m *testing.M) {
+	multipathdRunning = func() bool { return false }
+	os.Exit(m.Run())
+}
+
 // fakeBlock builds a sysfs entry and a /dev link pointing at it, the shape a
 // udev by-id link has: link -> devNode, with identity under sys/<devNode>.
 func fakeBlock(t *testing.T, root, devNode, idFile, id string) string {
