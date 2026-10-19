@@ -273,7 +273,11 @@ func (t *iscsi) addPath(ctx context.Context, p, wwid string, known map[string]st
 		return
 	}
 	if u, ok := udevWWID(p); ok && u != wwid {
-		t.log.Warn("udev has not read this path's identity yet; asking it to before multipathd takes the path", "path", p, "udev_wwid", u, "wwid", wwid)
+		if u == "" {
+			// udev is still on this new path; multipathd gets it when udev is done.
+			return
+		}
+		t.log.Warn("udev still files this path under another volume; asking it to re-read the path before multipathd takes it", "path", p, "udev_wwid", u, "wwid", wwid)
 		t.reprobe(p)
 		return
 	}

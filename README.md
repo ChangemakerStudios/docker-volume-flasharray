@@ -240,9 +240,9 @@ reuses a name for another LUN it can add the path to the old volume's map. A
 path found in another volume's map is pulled out and re-read, and before
 asking multipathd to add a path the plugin drops a stale record of it.
 multipathd files a path under the identity udev recorded (`ID_SERIAL`), so a
-path udev has not re-read yet is re-announced to udev instead of added, and
-one multipathd already has right is left alone. (NVMe/TCP has no such sweep
-yet.)
+path udev still files under another volume is re-announced to udev instead of
+added, one udev is still reading is left to finish, and one multipathd already
+has right is left alone. (NVMe/TCP has no such sweep yet.)
 
 A device that does not appear within `FA_ATTACH_TIMEOUT` is usually only late:
 udev and multipathd fall behind while a node starts many containers. Rolling

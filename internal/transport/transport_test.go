@@ -443,7 +443,7 @@ func TestAddPath(t *testing.T) {
 		{"new to multipathd", map[string]string{}, want, []string{"multipathd add path sdt"}, false},
 		// multipathd files a path by udev's record: added now, it would join the old volume's map.
 		{"udev not caught up", map[string]string{"sdt": other}, other, nil, true},
-		{"udev has no identity yet", map[string]string{}, "", nil, true},
+		{"udev still on a new path", map[string]string{}, "", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
