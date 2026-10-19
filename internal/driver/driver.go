@@ -37,8 +37,11 @@ type Driver struct {
 	host  string // FlashArray host object name for this node
 	ports []flasharray.Port
 
-	mu    sync.Mutex // guards locks, mounts, names and known maps
-	locks map[string]*sync.Mutex
+	mu sync.Mutex // guards locks, mounts, names and known maps
+	// attachMu serializes array connects with the stale-path sweep; see
+	// connectSwept.
+	attachMu sync.Mutex
+	locks    map[string]*sync.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
 	// names caches dockerName -> array volume name once resolved.
@@ -417,43 +420,24 @@ func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharra
 	if err != nil {
 		return nil, fmt.Errorf("clone %s to %s: %w", src, an, err)
 	}
-	if err := d.array.SetTag(ctx, an, flasharray.TagKeyClonePending, src); err != nil {
-		d.log.Error("marking clone failed; mounting it next to its source may fail on a duplicate filesystem UUID", "array_name", an, "source", src, "err", err)
-	}
 	return v, nil
 }
 
-// mountOptions returns the mount options for an, first giving a pending clone
-// its own filesystem UUID: the copy carries its source's, and XFS refuses to
-// mount a UUID that is already mounted on the host. If that fails (a dirty log
-// from cloning a volume in use) XFS mounts with nouuid, which replays the log,
-// and the next mount tries again.
-func (d *Driver) mountOptions(ctx context.Context, an, dockerName, dev string) string {
+// mountOptions adds nouuid for XFS. A copy of a volume carries its source's
+// filesystem UUID, and XFS refuses to mount a UUID already mounted on the host.
+// Rewriting the UUID instead (xfs_admin -U) is a write to the volume the
+// driver must never make on its own; the Pure plugin also always used nouuid.
+// XFS's own duplicate-mount guard is then off, so Mount refuses a device that
+// is already mounted on this node itself.
+func (d *Driver) mountOptions() string {
 	opts := d.cfg.MountOptions
-	tags, err := d.array.GetTags(ctx, an)
-	if err != nil {
-		d.log.Warn("cannot read volume tags; assuming it is not a pending clone", "volume", dockerName, "array_name", an, "err", err)
+	if d.cfg.FSType != "xfs" || slices.Contains(strings.Split(opts, ","), "nouuid") {
 		return opts
 	}
-	if _, ok := tags[flasharray.TagKeyClonePending]; !ok {
-		return opts
+	if opts == "" {
+		return "nouuid"
 	}
-	if err := d.mnt.RegenerateUUID(ctx, dev, d.cfg.FSType); err != nil {
-		if d.cfg.FSType != "xfs" {
-			d.log.Warn("could not give clone a new filesystem UUID", "volume", dockerName, "dev", dev, "err", err)
-			return opts
-		}
-		d.log.Warn("could not give clone a new filesystem UUID; mounting with nouuid this time", "volume", dockerName, "dev", dev, "err", err)
-		if opts == "" {
-			return "nouuid"
-		}
-		return opts + ",nouuid"
-	}
-	if err := d.array.DeleteTag(ctx, an, flasharray.TagKeyClonePending); err != nil {
-		d.log.Warn("clear clone marker failed; the UUID will be regenerated again on next mount", "array_name", an, "err", err)
-	}
-	d.log.Info("gave cloned volume a new filesystem UUID", "volume", dockerName, "dev", dev)
-	return opts
+	return opts + ",nouuid"
 }
 
 // importVolume adopts an existing array volume under a Docker name without
@@ -615,16 +599,19 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 
-	lun, err := d.array.Connect(ctx, d.host, an)
+	lun, err := d.connectSwept(ctx, an, req.Name, vol.Serial)
 	if err != nil {
-		return nil, fmt.Errorf("connect %s to %s: %w", req.Name, d.host, err)
+		return nil, err
 	}
-	d.log.Info("attached on array", "volume", req.Name, "lun", lun, "serial", vol.Serial)
 
 	dev, err := d.tr.WaitForDevice(ctx, vol.Serial)
 	if err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, "")
 		return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host: %w", req.Name, vol.Serial, err)
+	}
+	if err := d.tr.CheckLUN(dev, lun); err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}
 
 	// The device is ours, so a mount of it elsewhere on this node is a leftover
@@ -647,7 +634,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 	mp := filepath.Join(d.cfg.MountRoot, req.Name)
-	if err := d.mountFS(ctx, dev, mp, d.mountOptions(ctx, an, req.Name, dev), req.Name); err != nil {
+	if err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, d.mountOptions()); err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, err
 	}
@@ -658,6 +645,30 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	d.mu.Unlock()
 	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "formatted", formatted)
 	return &plugin.MountResponse{Mountpoint: mp}, nil
+}
+
+// connectSwept connects an to this host, then deletes host paths whose LUN
+// number the array now gives to another volume (transport Sweep). Every
+// connect on this host runs under attachMu, so the LUN map the sweep reads
+// covers every path a rescan can have created, and a volume connected later
+// cannot lose a fresh path to this sweep.
+func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string) (int, error) {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
+	lun, err := d.array.Connect(ctx, d.host, an)
+	if err != nil {
+		return 0, fmt.Errorf("connect %s to %s: %w", dockerName, d.host, err)
+	}
+	d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
+	want, err := d.array.HostLUNs(ctx, d.host)
+	if err == nil {
+		err = d.tr.Sweep(ctx, want)
+	}
+	if err != nil {
+		d.rollbackAttach(ctx, an, serial, "")
+		return 0, fmt.Errorf("volume %s: clear stale paths before attaching: %w", dockerName, err)
+	}
+	return lun, nil
 }
 
 // releasePoll and maxReleaseWait are variables so tests needn't wait.
@@ -782,38 +793,14 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 	return nil
 }
 
-// mountFS mounts dev and, when XFS refuses because another filesystem on this
-// node has the same UUID (volumes copied outside the driver carry their
-// source's), gives this one a new UUID and retries. A dirty log stops the UUID
-// change, so the last resort is nouuid, which replays the log.
-func (d *Driver) mountFS(ctx context.Context, dev, mp, opts, dockerName string) error {
-	err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
-	if err == nil || d.cfg.FSType != "xfs" {
-		return err
-	}
-	dup, derr := d.mnt.DuplicateFSUUID(ctx, dev)
-	if derr != nil || !dup {
-		return err
-	}
-	rerr := d.mnt.RegenerateUUID(ctx, dev, d.cfg.FSType)
-	if rerr == nil {
-		d.log.Warn("filesystem UUID was already mounted on this node by another volume; gave this one a new UUID", "volume", dockerName, "dev", dev)
-		return d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
-	}
-	d.log.Warn("duplicate filesystem UUID and regenerating it failed; mounting with nouuid", "volume", dockerName, "dev", dev, "err", rerr)
-	if opts == "" {
-		opts = "nouuid"
-	} else {
-		opts += ",nouuid"
-	}
-	return d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, opts)
-}
-
-// rollbackAttach is best effort; failures are logged because a leftover array
-// connection makes the next mount elsewhere preempt this host.
+// rollbackAttach is best effort and logs its failures. It disconnects on the
+// array only once the host side is gone: disconnecting under paths the host
+// keeps frees their LUN number for the next volume, which those paths then
+// silently reach.
 func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
 	if err := d.tr.Detach(ctx, serial, dev); err != nil {
-		d.log.Error("rollback: host detach failed", "array_name", an, "serial", serial, "err", err)
+		d.log.Error("rollback: host detach failed; array connection left in place so its LUN is not reused under this host's paths", "array_name", an, "serial", serial, "err", err)
+		return
 	}
 	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
 		d.log.Error("rollback: array disconnect failed; volume is still connected to this host", "array_name", an, "host", d.host, "err", err)

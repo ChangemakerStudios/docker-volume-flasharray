@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -27,9 +28,6 @@ import (
 const (
 	TagNamespace = "dvfa"
 	TagKeyName   = "name"
-	// TagKeyClonePending marks a clone whose filesystem still carries its
-	// source's UUID; the value is the source array volume.
-	TagKeyClonePending = "clone-pending"
 )
 
 // ErrNotFound is returned when a volume/host/connection does not exist.
@@ -86,6 +84,9 @@ type Array interface {
 	Connect(ctx context.Context, host, volume string) (int, error)
 	Disconnect(ctx context.Context, host, volume string) error
 	ListConnections(ctx context.Context, volume string) ([]Connection, error)
+	// HostLUNs returns LUN -> lowercase volume serial for every volume
+	// connected to host: the array's word on what each LUN number carries.
+	HostLUNs(ctx context.Context, host string) (map[int]string, error)
 	Ports(ctx context.Context) ([]Port, error)
 }
 
@@ -699,6 +700,43 @@ func (c *Client) ListConnections(ctx context.Context, volume string) ([]Connecti
 	res := make([]Connection, 0, len(out.Items))
 	for _, i := range out.Items {
 		res = append(res, Connection{Host: i.Host.Name, Volume: i.Volume.Name, LUN: i.LUN})
+	}
+	return res, nil
+}
+
+func (c *Client) HostLUNs(ctx context.Context, host string) (map[int]string, error) {
+	q := url.Values{"host_names": {host}, "limit": {"1000"}}
+	lunOf := map[string]int{}
+	for {
+		var out page[connItem]
+		if err := c.do(ctx, http.MethodGet, "/connections", q, nil, &out); err != nil {
+			if IsNotFound(err) {
+				break
+			}
+			return nil, err
+		}
+		for _, i := range out.Items {
+			lunOf[i.Volume.Name] = i.LUN
+		}
+		if !out.MoreItemsRemain || out.ContinuationToken == "" {
+			break
+		}
+		q.Set("continuation_token", out.ContinuationToken)
+	}
+	res := make(map[int]string, len(lunOf))
+	for names := range slices.Chunk(slices.Sorted(maps.Keys(lunOf)), 50) {
+		var out page[volumeItem]
+		if err := c.do(ctx, http.MethodGet, "/volumes", url.Values{"names": {strings.Join(names, ",")}}, nil, &out); err != nil {
+			return nil, err
+		}
+		for _, v := range out.Items {
+			if lun, ok := lunOf[v.Name]; ok {
+				res[lun] = strings.ToLower(v.Serial)
+			}
+		}
+	}
+	if len(res) != len(lunOf) {
+		return nil, fmt.Errorf("host %s has %d connections but serials came back for %d", host, len(lunOf), len(res))
 	}
 	return res, nil
 }

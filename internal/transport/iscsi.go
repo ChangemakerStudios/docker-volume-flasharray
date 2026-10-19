@@ -341,3 +341,116 @@ func (t *iscsi) removeMap(ctx context.Context, name string) error {
 }
 
 func (t *iscsi) PostDisconnect(context.Context) error { return nil }
+
+// purePrefix is the NAA prefix of every FlashArray LUN's WWID in sysfs.
+const purePrefix = "naa.624a9370"
+
+// Sweep deletes every FlashArray SCSI path whose LUN number the array gives to
+// a different volume than the path's cached WWID names, or to none. Linux
+// reads a path's identity once, at scan time: when a volume is disconnected
+// while the host keeps its paths (a failed detach, or a peer preempting this
+// host) and the array hands the LUN number to the next volume connected, the
+// old path still claims the old volume while its I/O reaches the new one. On
+// staging that cross-wrote volumes. Stale paths are deleted without a flush,
+// since anything buffered for them belongs to a volume they no longer reach,
+// and even under an open map, whose filesystem then gets I/O errors instead.
+func (t *iscsi) Sweep(ctx context.Context, want map[int]string) error {
+	devs, _ := filepath.Glob(filepath.Join(sysClassBlock, "sd*"))
+	var stale []string
+	holderMaps := map[string]bool{}
+	for _, p := range devs {
+		b, err := readFileTimeout(filepath.Join(p, "device", "wwid"), 3*time.Second)
+		if err != nil {
+			continue
+		}
+		id := strings.ToLower(strings.TrimSpace(string(b)))
+		if !strings.HasPrefix(id, purePrefix) {
+			continue
+		}
+		lun, ok := pathLUN(p)
+		if !ok {
+			continue
+		}
+		serial := strings.TrimPrefix(id, purePrefix)
+		if want[lun] == serial {
+			continue
+		}
+		name := filepath.Base(p)
+		t.log.Warn("deleting stale path: the array gives its LUN to another volume", "dev", name, "lun", lun, "path_serial", serial, "array_serial", want[lun])
+		holders, _ := os.ReadDir(filepath.Join(p, "holders"))
+		for _, h := range holders {
+			holderMaps[h.Name()] = true
+		}
+		stale = append(stale, name)
+	}
+	var errs []error
+	for _, name := range stale {
+		if err := writeFileTimeout(filepath.Join(sysClassBlock, name, "device", "delete"), "1", 10*time.Second); err != nil {
+			errs = append(errs, fmt.Errorf("delete stale path %s: %w", name, err))
+		}
+	}
+	for dm := range holderMaps {
+		t.dropPathlessMap(ctx, dm)
+	}
+	return errors.Join(errs...)
+}
+
+// dropPathlessMap removes a map the sweep left without paths, after switching
+// off queueing so I/O on it fails instead of hanging. An open one stays.
+func (t *iscsi) dropPathlessMap(ctx context.Context, dm string) {
+	if slaves, _ := os.ReadDir(filepath.Join(sysClassBlock, dm, "slaves")); len(slaves) > 0 {
+		return
+	}
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, dm, "dm", "name"), 3*time.Second)
+	if err != nil {
+		return
+	}
+	name := strings.TrimSpace(string(b))
+	if _, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "message", name, "0", "fail_if_no_path"); err != nil {
+		t.log.Warn("fail_if_no_path failed", "map", name, "err", err)
+	}
+	out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name)
+	if n, perr := strconv.Atoi(strings.TrimSpace(out)); err != nil || perr != nil || n > 0 {
+		t.log.Error("map lost all its paths to the sweep but is still open; whatever holds it gets I/O errors", "map", name)
+		return
+	}
+	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "remove", "map", name); err != nil {
+		t.log.Warn("remove pathless map failed", "map", name, "err", err)
+	}
+}
+
+func (t *iscsi) CheckLUN(dev string, lun int) error {
+	resolved, err := filepath.EvalSymlinks(dev)
+	if err != nil {
+		return err
+	}
+	base := filepath.Base(resolved)
+	paths := []string{base}
+	if slaves, err := os.ReadDir(filepath.Join(sysClassBlock, base, "slaves")); err == nil && len(slaves) > 0 {
+		paths = paths[:0]
+		for _, s := range slaves {
+			paths = append(paths, s.Name())
+		}
+	}
+	for _, p := range paths {
+		got, ok := pathLUN(filepath.Join(sysClassBlock, p))
+		if !ok || got != lun {
+			return fmt.Errorf("%s: path %s is not on LUN %d, where the array connected the volume", dev, p, lun)
+		}
+	}
+	return nil
+}
+
+// pathLUN reads a SCSI disk's LUN from its device link, .../H:C:T:L.
+func pathLUN(sysBlock string) (int, bool) {
+	target, err := filepath.EvalSymlinks(filepath.Join(sysBlock, "device"))
+	if err != nil {
+		return 0, false
+	}
+	f := strings.Split(filepath.Base(target), ":")
+	if len(f) != 4 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(f[3])
+	return n, err == nil
+}

@@ -171,3 +171,9 @@ func (t *nvmeTCP) PostDisconnect(ctx context.Context) error {
 	t.rescan(ctx)
 	return nil
 }
+
+// Sweep and CheckLUN are iSCSI-only for now: NVMe namespace IDs are reused the
+// same way, but no deployment of this driver runs NVMe/TCP yet.
+func (t *nvmeTCP) Sweep(context.Context, map[int]string) error { return nil }
+
+func (t *nvmeTCP) CheckLUN(string, int) error { return nil }

@@ -28,8 +28,6 @@ type Mounter interface {
 	// if it formatted.
 	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error)
 	Mount(ctx context.Context, dev, target, fstype, opts string) error
-	// RegenerateUUID gives the (unmounted) filesystem on dev a new UUID.
-	RegenerateUUID(ctx context.Context, dev, fstype string) error
 	Unmount(ctx context.Context, target string) error
 	// IsMounted reports whether target is a mountpoint per /proc/self/mountinfo.
 	IsMounted(target string) (bool, error)
@@ -39,21 +37,11 @@ type Mounter interface {
 	// Busy reports whether the kernel still holds dev, e.g. a filesystem
 	// mounted in a container's mount namespace this process can't see.
 	Busy(dev string) (bool, error)
-	// DuplicateFSUUID reports whether another block device the kernel holds
-	// carries the same filesystem UUID as dev.
-	DuplicateFSUUID(ctx context.Context, dev string) (bool, error)
 	// InUseByContainer reports whether a mount namespace other than the
 	// host's and this process's has the filesystem at mountpoint mounted.
 	// Needs the host PID namespace (pidhost).
 	InUseByContainer(mountpoint string) (bool, error)
 }
-
-// blockGlobs and nvmePathNode are variables so tests can use fixtures; the
-// per-path nodes nvmeXcYnZ of native NVMe multipath are skipped.
-var (
-	blockGlobs   = []string{"/sys/class/block/dm-*", "/sys/class/block/nvme*n*"}
-	nvmePathNode = regexp.MustCompile(`^nvme\d+c\d+n\d+$`)
-)
 
 // mountinfoPath and procRoot are variables so tests can substitute fixtures.
 var (
@@ -96,23 +84,6 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 		return false, fmt.Errorf("mkfs.%s %s: %w: %s", fstype, dev, err, strings.TrimSpace(string(b)))
 	}
 	return true, nil
-}
-
-func (m *execMounter) RegenerateUUID(ctx context.Context, dev, fstype string) error {
-	var name string
-	var args []string
-	switch fstype {
-	case "xfs":
-		name, args = "xfs_admin", []string{"-U", "generate", dev}
-	case "ext2", "ext3", "ext4":
-		name, args = "tune2fs", []string{"-U", "random", dev}
-	default:
-		return fmt.Errorf("regenerate UUID: unsupported filesystem %q", fstype)
-	}
-	if b, err := hostexec.Command(ctx, name, args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(b)))
-	}
-	return nil
 }
 
 func (m *execMounter) Mount(ctx context.Context, dev, target, fstype, opts string) error {
@@ -202,34 +173,6 @@ func (m *execMounter) Busy(dev string) (bool, error) {
 	return false, err
 }
 
-func (m *execMounter) DuplicateFSUUID(ctx context.Context, dev string) (bool, error) {
-	want, err := m.fsUUID(ctx, dev)
-	if err != nil || want == "" {
-		return false, err
-	}
-	self, err := filepath.EvalSymlinks(dev)
-	if err != nil {
-		return false, err
-	}
-	for _, g := range blockGlobs {
-		matches, _ := filepath.Glob(g)
-		for _, sys := range matches {
-			name := filepath.Base(sys)
-			other := filepath.Join(filepath.Dir(self), name)
-			if other == self || nvmePathNode.MatchString(name) {
-				continue
-			}
-			if busy, _ := m.Busy(other); !busy {
-				continue
-			}
-			if u, _ := m.fsUUID(ctx, other); u == want {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
 // InUseByContainer only sees namespaces that still have a process in them,
 // which is what matters: a stopped container's namespace has none.
 func (m *execMounter) InUseByContainer(mountpoint string) (bool, error) {
@@ -282,18 +225,6 @@ func mountsDevice(path, want string) bool {
 		}
 	}
 	return false
-}
-
-func (m *execMounter) fsUUID(ctx context.Context, dev string) (string, error) {
-	out, err := hostexec.Command(ctx, "blkid", "-p", "-o", "value", "-s", "UUID", dev).Output()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && ee.ExitCode() == 2 {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("blkid %s: %w", dev, err)
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 // unescape handles the \040 style escapes mountinfo uses for spaces etc.

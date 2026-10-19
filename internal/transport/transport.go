@@ -40,6 +40,12 @@ type Transport interface {
 	// PostDisconnect runs after the array connection is deleted (e.g. NVMe
 	// namespace rescan). Best effort.
 	PostDisconnect(ctx context.Context) error
+	// Sweep removes host paths whose LUN number the array now gives to another
+	// volume, or to none. want is LUN -> volume serial for this host, from the
+	// array.
+	Sweep(ctx context.Context, want map[int]string) error
+	// CheckLUN reports an error unless every path under dev sits on lun.
+	CheckLUN(dev string, lun int) error
 }
 
 // ErrTimeout is returned when a device doesn't appear within the deadline.

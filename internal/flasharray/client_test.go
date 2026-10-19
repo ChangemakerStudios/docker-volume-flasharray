@@ -138,3 +138,34 @@ func TestReloginOn401(t *testing.T) {
 		t.Fatalf("requests = %d, want 2", n.Load())
 	}
 }
+
+// The sweep trusts this map to decide which host paths are stale, so a
+// connection whose serial cannot be resolved must fail rather than vanish.
+func TestHostLUNs(t *testing.T) {
+	missing := false
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/2.26/connections":
+			if r.URL.Query().Get("host_names") != "node1" {
+				t.Errorf("query = %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"items":[{"host":{"name":"node1"},"volume":{"name":"a"},"lun":3},{"host":{"name":"node1"},"volume":{"name":"b"},"lun":7}]}`))
+		case "/api/2.26/volumes":
+			if missing {
+				_, _ = w.Write([]byte(`{"items":[{"name":"a","serial":"6FEF9AB1157343EC00000001"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"items":[{"name":"a","serial":"6FEF9AB1157343EC00000001"},{"name":"b","serial":"6FEF9AB1157343EC00000002"}]}`))
+		default:
+			t.Errorf("unexpected %s", r.URL.Path)
+		}
+	})
+	got, err := c.HostLUNs(context.Background(), "node1")
+	if err != nil || len(got) != 2 || got[3] != "6fef9ab1157343ec00000001" || got[7] != "6fef9ab1157343ec00000002" {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	missing = true
+	if _, err := c.HostLUNs(context.Background(), "node1"); err == nil {
+		t.Fatal("expected an error when a connected volume has no serial")
+	}
+}

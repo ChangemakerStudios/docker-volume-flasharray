@@ -164,10 +164,12 @@ container still starting and always keep it mounted. Mount and Unmount
 finish inside Docker's own limits (2 and 1 minute), past which Docker counts
 the call as failed while the plugin would carry on unseen.
 
-**Upgrade or disable the plugin only on a drained node, and without `-f`.**
-Plain `docker plugin disable` refuses while any volume is still in use;
-`-f` tears the plugin's mounts out from under running containers
-([moby#32515](https://github.com/moby/moby/issues/32515)).
+**Upgrade or disable the plugin only on a drained node.** Docker refuses a
+plain `docker plugin disable` while it knows any volume of the plugin, mounted
+or not, so `-f` is needed; under running containers it tears the plugin's
+mounts out from under them ([moby#32515](https://github.com/moby/moby/issues/32515)).
+Before `-f`, check the node has no running container on a flasharray volume,
+nothing under the plugin's `propagated-mount`, and no open Pure device.
 
 On unmount the plugin refuses to touch a map that still has holders, turns
 queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
@@ -186,6 +188,19 @@ is a stale mount: reconnecting would let multipathd revive its paths and the
 stale filesystem write old metadata over the volume, so the mount is refused
 until whatever holds it is stopped or the node rebooted.
 
+The array reuses LUN numbers: disconnect a volume and the next one connected
+to the host may get its number. Linux reads a SCSI path's identity once, at
+scan time, so a path the host kept for the old volume still claims to be it
+while its I/O reaches the new one, which cross-wrote volumes on staging. Right
+after each connect, holding a host-wide lock, the plugin asks the array which
+volume every LUN number on the host carries and deletes each FlashArray path
+whose LUN and cached WWID disagree (without flushing it: its buffers belong to
+a volume it no longer reaches). A map left with no paths is removed, or, if
+still open, fails I/O instead of reaching another volume. The mount then
+checks every path of its device sits on the LUN the array assigned. Rollback
+of a failed mount disconnects on the array only once the host-side devices are
+gone, for the same reason. (NVMe/TCP has no such sweep yet.)
+
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has
 given to another LUN, so the device is used only after its sysfs `dm/uuid`
@@ -195,10 +210,11 @@ formatted only if the array's `space.virtual` is 0; otherwise the mount fails
 with the bytes written, since a damaged superblock also reads as "no
 filesystem".
 
-XFS refuses to mount a filesystem whose UUID is already mounted on the node,
-which happens with volumes copied outside the plugin. When a mount fails that
-way, the plugin gives the volume a new UUID (`xfs_admin -U generate`) and
-retries, falling back to `nouuid` if a dirty log blocks the change.
+XFS volumes are always mounted with `nouuid`, as the Pure plugin did: copies
+of a volume carry its filesystem UUID, and XFS would otherwise refuse to mount
+two of them on one node. The plugin never rewrites a UUID, since that is a
+write to the volume. With XFS's own duplicate check off, the plugin's refusal
+to mount a device already mounted on the node is what stops a double mount.
 
 ## Use
 
@@ -229,13 +245,9 @@ docker volume create -d flasharray -o source=pgdata pgdata-test
 
 A clone is instant and crash-consistent: cloning a volume that is mounted and
 being written gives you what a power cut would have left. Stop the writer, or
-snapshot at the application level, when that matters. The copy also carries
-its source's filesystem UUID, and XFS refuses to mount a UUID that is already
-mounted on the host, so the first mount of a clone gives it a new one
-(`xfs_admin -U generate`, or `tune2fs -U random` for ext4). If that fails
-because the clone's log is dirty, XFS mounts it with `nouuid` once, which
-replays the log, and the next mount tries again. Clones are marked on the
-array with a `dvfa:clone-pending=<source>` tag until that is done.
+snapshot at the application level, when that matters. The copy carries its
+source's filesystem UUID, which `nouuid` (above) lets it mount beside its
+source.
 
 New volumes are named `<namespace>-<name>` on the array, as the Pure plugin
 named them (with a short hash suffix when the Docker name contains

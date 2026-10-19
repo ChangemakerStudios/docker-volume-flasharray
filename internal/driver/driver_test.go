@@ -235,6 +235,17 @@ func (f *fakeArray) Disconnect(_ context.Context, host, volume string) error {
 	return nil
 }
 
+func (f *fakeArray) HostLUNs(_ context.Context, host string) (map[int]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[int]string{}
+	for vol, hosts := range f.conns {
+		if lun, ok := hosts[host]; ok {
+			out[lun] = strings.ToLower(f.vols[vol].Serial)
+		}
+	}
+	return out, nil
+}
 func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flasharray.Connection, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -254,13 +265,16 @@ func (f *fakeArray) Ports(context.Context) ([]flasharray.Port, error) {
 }
 
 type fakeTransport struct {
-	mu       sync.Mutex
-	connects int
-	waits    []string
-	detaches []string
-	failWait bool
-	devs     map[string]string // serial -> device, overriding the default path
-	present  map[string]bool   // serial -> device exists on this node (attached, or a planted leftover)
+	mu        sync.Mutex
+	connects  int
+	waits     []string
+	detaches  []string
+	failWait  bool
+	devs      map[string]string // serial -> device, overriding the default path
+	sweeps    []map[int]string  // the LUN maps Sweep was given
+	lunErr    error             // returned by CheckLUN
+	detachErr error             // returned by Detach
+	present   map[string]bool   // serial -> device exists on this node (attached, or a planted leftover)
 }
 
 func (t *fakeTransport) dev(serial string) string {
@@ -313,27 +327,34 @@ func (t *fakeTransport) Detach(_ context.Context, serial, _ string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.detaches = append(t.detaches, serial)
+	if t.detachErr != nil {
+		return t.detachErr
+	}
 	t.setPresent(serial, false)
 	return nil
 }
 func (t *fakeTransport) PostDisconnect(context.Context) error { return nil }
+func (t *fakeTransport) Sweep(_ context.Context, want map[int]string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sweeps = append(t.sweeps, want)
+	return nil
+}
+func (t *fakeTransport) CheckLUN(string, int) error { return t.lunErr }
 
 type fakeMounter struct {
 	mu        sync.Mutex
 	formatted map[string]bool
 	mounted   map[string]string // target -> dev
 	opts      map[string]string // target -> mount options
-	uuidErr   error             // returned by RegenerateUUID
-	uuidRegen []string          // devs given a new UUID
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
-	dupUUID   map[string]bool   // dev -> its filesystem UUID is already mounted on the node
 	inUse     map[string]bool   // mountpoint -> a container namespace still has it
 	// inUseChecks counts InUseByContainer calls.
 	inUseChecks int
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, dupUUID: map[string]bool{}, inUse: map[string]bool{}}
+	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, inUse: map[string]bool{}}
 }
 func (m *fakeMounter) Busy(dev string) (bool, error) {
 	m.mu.Lock()
@@ -366,11 +387,6 @@ func (m *fakeMounter) MountedAt(dev string) (string, error) {
 	}
 	return "", nil
 }
-func (m *fakeMounter) DuplicateFSUUID(_ context.Context, dev string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.dupUUID[dev], nil
-}
 func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -380,21 +396,8 @@ func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
 func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.dupUUID[dev] && !strings.Contains(opts, "nouuid") {
-		return errors.New("mount: wrong fs type, bad option, bad superblock")
-	}
 	m.mounted[target] = dev
 	m.opts[target] = opts
-	return nil
-}
-func (m *fakeMounter) RegenerateUUID(_ context.Context, dev, _ string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.uuidErr != nil {
-		return m.uuidErr
-	}
-	m.uuidRegen = append(m.uuidRegen, dev)
-	delete(m.dupUUID, dev)
 	return nil
 }
 func (m *fakeMounter) Unmount(_ context.Context, target string) error {
@@ -651,6 +654,58 @@ func TestPreemptGraceRestartsWhenHolderChanges(t *testing.T) {
 	}
 }
 
+// Every attach sweeps stale paths with the array's LUN map, which already
+// includes the LUN it was just given.
+func TestMountSweepsStalePathsAfterConnect(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	lun := fa.conns[an]["node1"]
+	if len(tr.sweeps) != 1 || tr.sweeps[0][lun] != strings.ToLower(fa.vols[an].Serial) {
+		t.Fatalf("sweeps = %v, want one covering LUN %d", tr.sweeps, lun)
+	}
+}
+
+func TestMountRefusesPathsOnAnotherLUN(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	tr.lunErr = errors.New("path sdq is not on LUN 3, where the array connected the volume")
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "not on LUN") {
+		t.Fatalf("expected a wrong-LUN refusal, got %v", err)
+	}
+	if len(fm.mounted) != 0 {
+		t.Fatal("mounted a device with a path on another LUN")
+	}
+	if len(tr.detaches) != 1 || len(fa.conns[an]) != 0 {
+		t.Fatalf("not rolled back: detach=%v conns=%v", tr.detaches, fa.conns[an])
+	}
+}
+
+// Disconnecting under paths the host keeps frees their LUN number for the next
+// volume, which those paths then reach.
+func TestRollbackKeepsConnectionWhenHostDetachFails(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	tr.lunErr = errors.New("wrong LUN")
+	tr.detachErr = errors.New("multipath map mpathq is still open (1)")
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the mount to fail")
+	}
+	if _, ok := fa.conns[an]["node1"]; !ok {
+		t.Fatal("disconnected on the array although the host still has the device")
+	}
+}
+
 func TestMountRemovesIdleLeftoverBeforeReconnecting(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
@@ -708,41 +763,6 @@ func TestMountKeepsDeviceOfVolumeStillConnectedHere(t *testing.T) {
 	}
 	if len(tr.detaches) != 0 {
 		t.Fatalf("detached a device in use on this node: %v", tr.detaches)
-	}
-}
-
-func TestMountGivesDuplicateFilesystemUUIDANewOne(t *testing.T) {
-	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-	d := newTestDriver(t, fa, tr, fm)
-	_ = d.Create(&plugin.CreateRequest{Name: "v"})
-	dev := tr.dev(fa.vols[d.arrayName("v")].Serial)
-	fm.formatted[dev] = true // an existing filesystem copied from another volume
-	fm.dupUUID[dev] = true
-
-	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fm.uuidRegen) != 1 || fm.uuidRegen[0] != dev || strings.Contains(fm.opts[r.Mountpoint], "nouuid") {
-		t.Fatalf("expected a new UUID and a normal mount: regen=%v opts=%q", fm.uuidRegen, fm.opts[r.Mountpoint])
-	}
-}
-
-func TestMountFallsBackToNouuidWhenUUIDChangeFails(t *testing.T) {
-	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-	d := newTestDriver(t, fa, tr, fm)
-	_ = d.Create(&plugin.CreateRequest{Name: "v"})
-	dev := tr.dev(fa.vols[d.arrayName("v")].Serial)
-	fm.formatted[dev] = true
-	fm.dupUUID[dev] = true
-	fm.uuidErr = errors.New("xfs_admin: log is dirty")
-
-	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(fm.opts[r.Mountpoint], "nouuid") {
-		t.Fatalf("expected nouuid fallback, opts=%q", fm.opts[r.Mountpoint])
 	}
 }
 
@@ -1187,47 +1207,40 @@ func TestCloneFromSource(t *testing.T) {
 	if c == nil || c.Provisioned != 10<<30 {
 		t.Fatalf("clone = %+v", c)
 	}
-	if fa.tags[an] != "node1/pg_copy" || fa.extra[an][flasharray.TagKeyClonePending] != "node1-pg" {
-		t.Fatalf("tags: name=%q extra=%v", fa.tags[an], fa.extra[an])
+	if fa.tags[an] != "node1/pg_copy" {
+		t.Fatalf("name tag = %q", fa.tags[an])
 	}
-	// First mount gives the clone its own filesystem UUID and clears the marker.
-	r, err := d.Mount(&plugin.MountRequest{Name: "pg_copy", ID: "c1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fm.uuidRegen) != 1 || fm.opts[r.Mountpoint] != "" {
-		t.Fatalf("regen=%v opts=%q", fm.uuidRegen, fm.opts[r.Mountpoint])
-	}
-	if _, ok := fa.extra[an][flasharray.TagKeyClonePending]; ok {
-		t.Fatal("clone marker not cleared")
-	}
-	// A plain volume never gets its UUID touched.
-	if _, err := d.Mount(&plugin.MountRequest{Name: "pg", ID: "c2"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(fm.uuidRegen) != 1 {
-		t.Fatalf("regenerated UUID on a non-clone: %v", fm.uuidRegen)
+	// The clone carries its source's filesystem UUID; nouuid mounts both side by side.
+	for _, name := range []string{"pg", "pg_copy"} {
+		r, err := d.Mount(&plugin.MountRequest{Name: name, ID: "c-" + name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fm.opts[r.Mountpoint] != "nouuid" {
+			t.Fatalf("%s opts = %q, want nouuid", name, fm.opts[r.Mountpoint])
+		}
 	}
 }
 
-func TestCloneFallsBackToNouuid(t *testing.T) {
-	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-	fm.uuidErr = errors.New("xfs_admin: log is dirty")
-	d := newTestDriver(t, fa, tr, fm)
-	src, _ := fa.CreateVolume(context.Background(), "legacy-data", 1<<30)
-	// source may be a raw array volume name, as with the Pure plugin.
-	if err := d.Create(&plugin.CreateRequest{Name: "copy", Options: map[string]string{"source": src.Name}}); err != nil {
-		t.Fatal(err)
-	}
-	r, err := d.Mount(&plugin.MountRequest{Name: "copy", ID: "c1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fm.opts[r.Mountpoint] != "nouuid" {
-		t.Fatalf("opts = %q, want nouuid", fm.opts[r.Mountpoint])
-	}
-	if _, ok := fa.extra["node1-copy"][flasharray.TagKeyClonePending]; !ok {
-		t.Fatal("marker must stay so the next mount retries")
+// The driver never rewrites a filesystem UUID; xfs_admin -U is a write to the volume.
+func TestXFSMountsUseNouuid(t *testing.T) {
+	for _, tc := range []struct{ fstype, opts, want string }{
+		{"xfs", "", "nouuid"},
+		{"xfs", "discard", "discard,nouuid"},
+		{"xfs", "nouuid,discard", "nouuid,discard"},
+		{"ext4", "discard", "discard"},
+	} {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		d.cfg.FSType, d.cfg.MountOptions = tc.fstype, tc.opts
+		_ = d.Create(&plugin.CreateRequest{Name: "v"})
+		r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fm.opts[r.Mountpoint]; got != tc.want {
+			t.Errorf("%s with %q: opts = %q, want %q", tc.fstype, tc.opts, got, tc.want)
+		}
 	}
 }
 

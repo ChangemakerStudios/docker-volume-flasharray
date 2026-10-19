@@ -77,7 +77,8 @@ func (m *memArray) Disconnect(context.Context, string, string) error     { retur
 func (m *memArray) ListConnections(context.Context, string) ([]flasharray.Connection, error) {
 	return nil, nil
 }
-func (m *memArray) Ports(context.Context) ([]flasharray.Port, error) { return nil, nil }
+func (m *memArray) HostLUNs(context.Context, string) (map[int]string, error) { return nil, nil }
+func (m *memArray) Ports(context.Context) ([]flasharray.Port, error)         { return nil, nil }
 
 func TestAdoptPrefix(t *testing.T) {
 	a := &memArray{
