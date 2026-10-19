@@ -184,4 +184,4 @@ func (t *nvmeTCP) Exclusive(fn func() error) error {
 	return fn()
 }
 
-func (t *nvmeTCP) CheckLUN(string, int) error { return nil }
+func (t *nvmeTCP) CheckLUN(context.Context, string, int) error { return nil }

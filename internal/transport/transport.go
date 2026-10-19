@@ -49,12 +49,17 @@ type Transport interface {
 	Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int, crossedOnly bool) error
 	// Exclusive runs fn with rescans held off; see iscsi.Exclusive.
 	Exclusive(fn func() error) error
-	// CheckLUN reports an error unless every path under dev sits on lun.
-	CheckLUN(dev string, lun int) error
+	// CheckLUN reports an error unless every path under dev sits on lun and
+	// nothing on the host is set to join dev under a stale identity.
+	CheckLUN(ctx context.Context, dev string, lun int) error
 }
 
 // ErrTimeout is returned when a device doesn't appear within the deadline.
 var ErrTimeout = errors.New("timed out waiting for device")
+
+// ErrPathsHeld is returned when multipathd still holds SCSI paths that were
+// deleted. Until it lets go, the kernel may give their names to new disks.
+var ErrPathsHeld = errors.New("multipathd still holds deleted paths")
 
 // Options shared by both transports.
 type Options struct {

@@ -56,6 +56,15 @@ type Driver struct {
 	// to its current other holders, so the preempt grace spans Docker's mount
 	// retries but restarts when the holder changes.
 	heldSince map[string]holdState
+	// pending holds, by array volume name, attachments kept after their device
+	// was too slow to appear; see keepAttached.
+	pending map[string]*pendingAttach
+}
+
+type pendingAttach struct {
+	serial string
+	timer  *time.Timer
+	gen    int
 }
 
 type holdState struct {
@@ -107,6 +116,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		known:  map[string]string{},
 
 		heldSince: map[string]holdState{},
+		pending:   map[string]*pendingAttach{},
 	}
 	iqns, nqns, err := drv.tr.InitiatorIDs()
 	if err != nil {
@@ -528,6 +538,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	defer unlock()
 	if err != nil {
 		if flasharray.IsNotFound(err) {
+			d.cancelKeep(an)
 			d.forget(req.Name)
 			d.setKnown(req.Name, "")
 			return nil
@@ -543,6 +554,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 				return err
 			}
 		}
+		d.cancelKeep(an)
 		d.forget(req.Name)
 		d.setKnown(req.Name, "")
 		d.log.Info("volume already destroyed on the array; dropped this node's record", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
@@ -590,6 +602,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 			return disconnectErr
 		}
 	}
+	d.cancelKeep(an) // released above; a later release would hit a destroyed volume
 	// A destroyed volume keeps its name for 24h, and Get still answers for it
 	// so Docker never swaps in an empty local volume for one destroyed by
 	// accident. That also blocked recreating a name just removed on purpose,
@@ -625,6 +638,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
 	if ok {
+		d.cancelKeep(an)
 		d.cancelTeardown(st)
 		st.refs[req.ID] = time.Now()
 		return &plugin.MountResponse{Mountpoint: st.mountpoint}, nil
@@ -654,10 +668,13 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 
 	dev, err := d.tr.WaitForDevice(ctx, vol.Serial)
 	if err != nil {
+		if d.keepAttached(an, vol.Serial) {
+			return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host in time; it stays attached for %s so a retry can use it: %w", req.Name, vol.Serial, d.keepFor(), err)
+		}
 		d.rollbackAttach(ctx, an, vol.Serial, "")
 		return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host: %w", req.Name, vol.Serial, err)
 	}
-	if err := d.tr.CheckLUN(dev, lun); err != nil {
+	if err := d.tr.CheckLUN(ctx, dev, lun); err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}
@@ -686,11 +703,18 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, err
 	}
+	// multipathd can change the map between the check above and the mount.
+	if err := d.tr.CheckLUN(ctx, dev, lun); err != nil {
+		return nil, d.abandonMount(ctx, an, vol.Serial, dev, mp, req.Name, err)
+	}
 
 	st = &mountState{dockerName: req.Name, serial: vol.Serial, dev: dev, mountpoint: mp, refs: map[string]time.Time{req.ID: time.Now()}}
 	d.mu.Lock()
 	d.mounts[an] = st
 	d.mu.Unlock()
+	// Only now: a retry that fails before this leaves a kept attachment's
+	// release scheduled, and one firing meanwhile waited on an's lock.
+	d.cancelKeep(an)
 	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "formatted", formatted)
 	return &plugin.MountResponse{Mountpoint: mp}, nil
 }
@@ -714,6 +738,9 @@ func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string
 			return fmt.Errorf("volume %s: read this host's LUN map before attaching: %w", dockerName, err)
 		}
 		if err := d.tr.Sweep(ctx, want, prefix, -1, false); err != nil {
+			if errors.Is(err, transport.ErrPathsHeld) {
+				return fmt.Errorf("volume %s: not attaching: %w", dockerName, err)
+			}
 			d.log.Warn("pre-attach sweep left stale paths", "volume", dockerName, "err", err)
 		}
 		lun, err = d.array.Connect(ctx, d.host, an)
@@ -978,6 +1005,91 @@ func (d *Driver) rollbackLocked(ctx context.Context, an, serial, dev string) {
 	}
 }
 
+// abandonMount backs out of a mount whose device turned out to reach another
+// volume. The filesystem is shut down first, without flushing its log, so not
+// even the unmount writes through the foreign path.
+func (d *Driver) abandonMount(ctx context.Context, an, serial, dev, mp, dockerName string, cause error) error {
+	d.log.Error("device reached another volume right after mounting; shutting the filesystem down and backing out", "volume", dockerName, "dev", dev, "err", cause)
+	if err := d.mnt.Shutdown(mp); err != nil {
+		d.log.Error("filesystem shutdown failed; unmounting anyway", "volume", dockerName, "err", err)
+	}
+	if err := d.mnt.Unmount(ctx, mp); err != nil {
+		return fmt.Errorf("volume %s: %w; unmounting it failed too, so it stays mounted at %s: %w", dockerName, cause, mp, err)
+	}
+	d.rollbackAttach(ctx, an, serial, dev)
+	return fmt.Errorf("volume %s: %w", dockerName, cause)
+}
+
+// keepFor is how long an attachment whose device was too slow to appear stays
+// for a retry: half the preempt grace, so a node waiting to take the volume
+// over sees it released before it would preempt.
+func (d *Driver) keepFor() time.Duration { return d.cfg.PreemptGrace / 2 }
+
+// keepAttached keeps an connected after its device did not appear in time,
+// instead of rolling the attach back. Such a device is usually only late: on
+// staging, udev and multipathd fell tens of seconds behind while a node started
+// dozens of containers, and the rollbacks deleted paths multipathd was still
+// building maps from and freed their LUNs for the next attaches, which mixed
+// two volumes in one map. Docker retries the mount within seconds and then
+// finds the device; one nothing mounts within keepFor is released then, once
+// the host has caught up. It reports false when keeping is off (no grace).
+// The caller holds an's lock.
+func (d *Driver) keepAttached(an, serial string) bool {
+	wait := d.keepFor()
+	if wait <= 0 {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.pending[an]
+	if p == nil {
+		p = &pendingAttach{}
+		d.pending[an] = p
+	} else {
+		p.timer.Stop()
+	}
+	p.serial = serial
+	p.gen++
+	gen := p.gen
+	p.timer = time.AfterFunc(wait, func() { d.keepExpired(an, gen) })
+	return true
+}
+
+// cancelKeep hands a kept attachment to the caller, which holds an's lock.
+func (d *Driver) cancelKeep(an string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if p := d.pending[an]; p != nil {
+		p.timer.Stop()
+		delete(d.pending, an)
+	}
+}
+
+func (d *Driver) keepExpired(an string, gen int) {
+	unlock := d.lock(an)
+	defer unlock()
+	d.mu.Lock()
+	p, ok := d.pending[an]
+	current := ok && p.gen == gen && !d.closing
+	if current {
+		delete(d.pending, an)
+	}
+	_, mounted := d.mounts[an]
+	d.mu.Unlock()
+	if !current || mounted {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
+	defer cancel()
+	detachErr, disconnectErr := d.releaseHost(ctx, an, p.serial, "")
+	if detachErr == nil && disconnectErr == nil {
+		d.log.Info("released an attachment no mount came back for", "array_name", an)
+		return
+	}
+	d.log.Error("releasing a kept attachment failed; trying again later", "array_name", an, "detach_err", detachErr, "disconnect_err", disconnectErr)
+	d.keepAttached(an, p.serial)
+}
+
 // Unmount implements plugin.Driver.
 func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	ctx, cancel := d.ctxWithin(unmountBudget)
@@ -1145,7 +1257,12 @@ func (d *Driver) Shutdown(ctx context.Context) {
 			idle = append(idle, an)
 		}
 	}
+	kept := len(d.pending)
 	d.mu.Unlock()
+	if kept > 0 {
+		// Releasing waits on multipathd, which can take longer than shutdown has.
+		d.log.Warn("shutdown: attachments kept for a retry stay connected; the next mount here reuses them, another node preempts them", "count", kept)
+	}
 	for _, an := range idle {
 		if ctx.Err() != nil {
 			d.log.Warn("shutdown: out of time; lingering volumes left mounted", "err", ctx.Err())

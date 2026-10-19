@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
@@ -43,6 +44,10 @@ type Mounter interface {
 	// host's and this process's has the filesystem at mountpoint mounted.
 	// Needs the host PID namespace (pidhost).
 	InUseByContainer(mountpoint string) (bool, error)
+	// Shutdown stops all I/O to the filesystem at target at once, without
+	// flushing its log, so nothing more reaches its device; the next mount
+	// replays the log.
+	Shutdown(target string) error
 }
 
 // mountinfoPath and procRoot are variables so tests can substitute fixtures.
@@ -181,6 +186,26 @@ func (m *execMounter) Busy(dev string) (bool, error) {
 func (m *execMounter) Sync(ctx context.Context, target string) error {
 	if b, err := hostexec.Command(ctx, "sync", "-f", target).CombinedOutput(); err != nil {
 		return fmt.Errorf("sync -f %s: %w: %s", target, err, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// XFS_IOC_GOINGDOWN with XFS_FSOP_GOING_FLAGS_NOLOGFLUSH; ext4 takes the same
+// ioctl and flag as EXT4_IOC_SHUTDOWN.
+const (
+	ioctlGoingDown = 0x8004587d // _IOR('X', 125, __u32)
+	goingDownNoLog = 2
+)
+
+func (m *execMounter) Shutdown(target string) error {
+	f, err := os.Open(target)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	flags := uint32(goingDownNoLog)
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), ioctlGoingDown, uintptr(unsafe.Pointer(&flags))); e != 0 {
+		return fmt.Errorf("shut down filesystem at %s: %w", target, e)
 	}
 	return nil
 }

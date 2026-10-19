@@ -15,6 +15,7 @@ import (
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/transport"
 )
 
 // --- fakes -----------------------------------------------------------------
@@ -276,6 +277,10 @@ type fakeTransport struct {
 	lunErr    error           // returned by CheckLUN
 	detachErr error           // returned by Detach
 	present   map[string]bool // serial -> device exists on this node (attached, or a planted leftover)
+	// lunErrAfter > 0 makes CheckLUN pass that many times before returning lunErr.
+	lunErrAfter int
+	lunChecks   int
+	sweepErr    error // returned by Sweep
 }
 
 func (t *fakeTransport) dev(serial string) string {
@@ -339,7 +344,7 @@ func (t *fakeTransport) Sweep(_ context.Context, want map[int]string, prefix str
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sweeps = append(t.sweeps, sweepCall{want, prefix, own, crossedOnly})
-	return nil
+	return t.sweepErr
 }
 func (t *fakeTransport) Exclusive(fn func() error) error {
 	t.excl.Lock()
@@ -354,7 +359,15 @@ type sweepCall struct {
 	crossedOnly bool
 }
 
-func (t *fakeTransport) CheckLUN(string, int) error { return t.lunErr }
+func (t *fakeTransport) CheckLUN(context.Context, string, int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lunChecks++
+	if t.lunChecks <= t.lunErrAfter {
+		return nil
+	}
+	return t.lunErr
+}
 
 type fakeMounter struct {
 	mu        sync.Mutex
@@ -364,8 +377,16 @@ type fakeMounter struct {
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
 	inUse     map[string]bool   // mountpoint -> a container namespace still has it
 	syncs     []string          // mountpoints Sync was called for
+	shutdowns []string          // mountpoints Shutdown was called for
 	// inUseChecks counts InUseByContainer calls.
 	inUseChecks int
+}
+
+func (m *fakeMounter) Shutdown(target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.shutdowns = append(m.shutdowns, target)
+	return nil
 }
 
 func newFakeMounter() *fakeMounter {
@@ -1755,4 +1776,133 @@ func TestStaleHoldRecordRestartsGrace(t *testing.T) {
 	if !fa.connected(an, "other") {
 		t.Fatal("preempted on a stale hold record")
 	}
+}
+
+// --- slow devices and maps that change under a mount -----------------------
+
+func (f *fakeArray) disconnectCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "disconnect:") {
+			n++
+		}
+	}
+	return n
+}
+
+// A device that is only late must not be rolled back: on staging the rollbacks
+// deleted paths multipathd was still building maps from and freed their LUNs
+// for the next attaches.
+func TestSlowDeviceStaysAttachedForTheRetry(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{failWait: true}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the mount to fail while the device is missing")
+	}
+	if tr.detachCount() != 0 || fa.disconnectCalls() != 0 || !fa.connected(an, "node1") {
+		t.Fatal("rolled back an attach whose device was only late")
+	}
+	lun := fa.conns[an]["node1"]
+
+	tr.mu.Lock()
+	tr.failWait = false
+	tr.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c2"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if fa.conns[an]["node1"] != lun || tr.detachCount() != 0 {
+		t.Fatal("the retry did not reuse the kept attachment")
+	}
+	d.mu.Lock()
+	_, pending := d.pending[an]
+	d.mu.Unlock()
+	if pending {
+		t.Fatal("the retry left the release scheduled")
+	}
+}
+
+func TestKeptAttachmentReleasedWhenNoMountComes(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{failWait: true}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = 40 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the mount to fail")
+	}
+	eventually(t, "kept attachment never released", func() bool {
+		return tr.detachCount() == 1 && !fa.connected(an, "node1")
+	})
+}
+
+// A change to the map between the pre-mount check and the mount is caught
+// after it, and the filesystem is shut down before the unmount can write
+// through a path that reaches another volume.
+func TestMapChangedUnderTheMountIsBackedOut(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{lunErrAfter: 1}, newFakeMounter()
+	tr.lunErr = errors.New("multipathd files path sdq under this volume, but it reaches another volume")
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the mount to be refused")
+	}
+	mp := filepath.Join(d.cfg.MountRoot, "v")
+	if len(fm.shutdowns) != 1 || fm.shutdowns[0] != mp {
+		t.Fatalf("filesystem not shut down before the unmount: %v", fm.shutdowns)
+	}
+	if fm.isMounted(mp) || tr.detachCount() != 1 || fa.connected(an, "node1") {
+		t.Fatal("mount not backed out")
+	}
+	d.mu.Lock()
+	_, tracked := d.mounts[an]
+	d.mu.Unlock()
+	if tracked {
+		t.Fatal("abandoned mount still tracked")
+	}
+}
+
+// Until multipathd drops deleted paths, a connect would let the kernel hand
+// their names to the new volume's disks.
+func TestNoConnectWhileMultipathdHoldsDeletedPaths(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	tr.sweepErr = fmt.Errorf("%w: [sdq]", transport.ErrPathsHeld)
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !errors.Is(err, transport.ErrPathsHeld) {
+		t.Fatalf("expected the mount to stop on held paths, got %v", err)
+	}
+	if fa.connectCalls() != 0 {
+		t.Fatal("connected while multipathd still held deleted paths")
+	}
+}
+
+// A retry that fails for another reason must not orphan the kept attachment.
+func TestKeptAttachmentReleasedAfterARetryFailsOtherwise(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{failWait: true}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = 80 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the mount to fail")
+	}
+	tr.mu.Lock()
+	tr.failWait = false
+	tr.sweepErr = fmt.Errorf("%w: [sdq]", transport.ErrPathsHeld)
+	tr.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c2"}); err == nil {
+		t.Fatal("expected the retry to fail")
+	}
+	tr.mu.Lock()
+	tr.sweepErr = nil
+	tr.mu.Unlock()
+	eventually(t, "kept attachment orphaned by a failed retry", func() bool {
+		return tr.detachCount() == 1 && !fa.connected(an, "node1")
+	})
 }

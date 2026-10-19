@@ -205,26 +205,79 @@ func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath, requi
 }
 
 // pathvec returns multipathd's own record of each path's WWID (sdX -> wwid).
-func (t *iscsi) pathvec(ctx context.Context) map[string]string {
+// A path it lists without an identity yet maps to "".
+func (t *iscsi) pathvec(ctx context.Context) (map[string]string, error) {
 	out, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "show", "paths", "raw", "format", "%d %w")
-	m := map[string]string{}
 	if err != nil {
-		return m
+		return nil, err
 	}
+	m := map[string]string{}
 	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Fields(line); len(f) == 2 {
+		switch f := strings.Fields(line); len(f) {
+		case 1:
+			m[f[0]] = ""
+		case 2:
 			m[f[0]] = strings.ToLower(f[1])
 		}
 	}
-	return m
+	return m, nil
 }
 
-// addPath asks multipathd to take p for wwid, first dropping a stale entry.
-// multipathd keeps the identity it read for an sdX name; once the kernel
-// reuses the name for another LUN, "add path" would put it into the old
-// volume's map, as happened on staging.
+// udevDataDir holds udev's per-device properties; a variable so tests can
+// plant them.
+var udevDataDir = hostexec.Path("/run/udev/data")
+
+// udevWWID is the identity udev recorded for SCSI disk sd (ID_SERIAL), which
+// is what multipathd groups paths by. ok is false only when udev's database
+// can't be read at all; "" with ok means udev has no identity for sd yet.
+func udevWWID(sd string) (wwid string, ok bool) {
+	if _, err := os.Stat(udevDataDir); err != nil {
+		return "", false
+	}
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, sd, "dev"), 3*time.Second)
+	if err != nil {
+		return "", true
+	}
+	data, err := readFileTimeout(filepath.Join(udevDataDir, "b"+strings.TrimSpace(string(b))), 3*time.Second)
+	if err != nil {
+		return "", true
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, found := strings.CutPrefix(line, "E:ID_SERIAL="); found {
+			return strings.ToLower(strings.TrimSpace(v)), true
+		}
+	}
+	return "", true
+}
+
+// reprobe has the kernel re-announce sd so udev reads its identity again.
+func (t *iscsi) reprobe(sd string) {
+	if err := writeFileTimeout(filepath.Join(sysClassBlock, sd, "uevent"), "change", 5*time.Second); err != nil {
+		t.log.Warn("asking udev to re-read a path failed", "path", sd, "err", err)
+	}
+}
+
+// addPath asks multipathd to take p for wwid, but only when that can help.
+// multipathd groups paths by the identity udev recorded and keeps what it read
+// per sdX name, so after the kernel reuses a name for another LUN a stale udev
+// record or multipathd entry files the path under the old volume. On staging
+// that put one volume's paths into another's map, and re-added paths the
+// membership check had just pulled out. A path udev has not re-read yet is
+// re-announced instead of added, a stale multipathd entry is dropped first,
+// and one multipathd already has right is left alone: "add path" only fails
+// for it, and under load that floods a daemon that is already behind.
 func (t *iscsi) addPath(ctx context.Context, p, wwid string, known map[string]string) {
-	if have, ok := known[p]; ok && have != strings.ToLower(wwid) {
+	wwid = strings.ToLower(wwid)
+	have, inPathvec := known[p]
+	if inPathvec && have == wwid {
+		return
+	}
+	if u, ok := udevWWID(p); ok && u != wwid {
+		t.log.Warn("udev has not read this path's identity yet; asking it to before multipathd takes the path", "path", p, "udev_wwid", u, "wwid", wwid)
+		t.reprobe(p)
+		return
+	}
+	if inPathvec {
 		t.log.Warn("multipathd remembers this path as another volume; dropping its entry first", "path", p, "multipathd_wwid", have, "wwid", wwid)
 		if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "del", "path", p); err != nil {
 			t.log.Warn("multipathd del path failed; not adding it", "path", p, "err", err)
@@ -233,6 +286,62 @@ func (t *iscsi) addPath(ctx context.Context, p, wwid string, known map[string]st
 	}
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "add", "path", p); err != nil {
 		t.log.Warn("multipathd add path failed", "path", p, "err", err)
+	}
+}
+
+// forgetPoll and forgetWait are variables so tests needn't wait.
+var (
+	forgetPoll = 250 * time.Millisecond
+	forgetWait = 20 * time.Second
+)
+
+// forgetDeleted waits until multipathd has dropped the deleted SCSI paths,
+// removing any it still keeps once forgetWait is up. The kernel gives a freed
+// sdX name to the next disk it scans, and while multipathd still holds the old
+// entry it files that disk under the old volume. On staging a burst of
+// attaches left multipathd behind on its uevents, and a rollback's freed names
+// came back as other volumes' paths inside the wrong maps.
+func (t *iscsi) forgetDeleted(ctx context.Context, deleted []string) error {
+	if len(deleted) == 0 || !multipathdRunning() {
+		return nil
+	}
+	held := func() ([]string, error) {
+		known, err := t.pathvec(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var out []string
+		for _, p := range deleted {
+			if _, ok := known[p]; ok {
+				out = append(out, p)
+			}
+		}
+		return out, nil
+	}
+	deadline := time.Now().Add(forgetWait)
+	for {
+		left, err := held()
+		if err == nil && len(left) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			for _, p := range left {
+				if _, derr := runTimeout(context.WithoutCancel(ctx), t.log, 10*time.Second, "multipathd", "del", "path", p); derr != nil {
+					t.log.Warn("multipathd del path failed", "path", p, "err", derr)
+				}
+			}
+			if left, err = held(); err == nil && len(left) == 0 {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("%w: cannot ask multipathd: %w", ErrPathsHeld, err)
+			}
+			return fmt.Errorf("%w: %v", ErrPathsHeld, left)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(forgetPoll):
+		}
 	}
 }
 
@@ -263,7 +372,10 @@ func mapWWID(dm string) string {
 // fixMembership pulls every path of this array out of a map that serves a
 // different volume, then lets multipathd re-read it so it joins its own map.
 // The LUN check in Sweep cannot see this: the path's identity and LUN agree
-// with the array, it is only in the wrong map.
+// with the array, it is only in the wrong map. It also drops multipathd
+// entries that file a path under another volume while in no map yet: the
+// mount check refuses while one names the volume being mounted, and nothing
+// else would ever clear it.
 func (t *iscsi) fixMembership(ctx context.Context, arrayPrefix string) {
 	dms, _ := filepath.Glob(filepath.Join(sysClassBlock, "dm-*"))
 	for _, d := range dms {
@@ -281,12 +393,49 @@ func (t *iscsi) fixMembership(ctx context.Context, arrayPrefix string) {
 			b, _ := readFileTimeout(filepath.Join(d, "dm", "name"), 3*time.Second)
 			name := strings.TrimSpace(string(b))
 			t.log.Error("path is in another volume's map; pulling it out", "path", sl.Name(), "map", name, "map_wwid", mw, "path_wwid", kw)
-			for _, args := range [][]string{{"fail", "path", sl.Name()}, {"del", "path", sl.Name()}, {"add", "path", sl.Name()}} {
-				if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", args...); err != nil {
-					t.log.Warn("multipathd "+args[0]+" path failed", "path", sl.Name(), "err", err)
-				}
-			}
+			t.refile(ctx, sl.Name(), kw, true)
 		}
+	}
+	if !multipathdRunning() {
+		return
+	}
+	known, err := t.pathvec(ctx)
+	if err != nil {
+		t.log.Warn("cannot read multipathd's paths to check their identities", "err", err)
+		return
+	}
+	for sd, w := range known {
+		kw := kernelWWID(sd)
+		if w == "" || kw == "" || w == kw || !strings.HasPrefix(kw, "3624a9370"+arrayPrefix) {
+			continue
+		}
+		t.log.Warn("multipathd files a path under another volume; dropping its entry", "path", sd, "multipathd_wwid", w, "path_wwid", kw)
+		t.refile(ctx, sd, kw, false)
+	}
+}
+
+// refile drops multipathd's entry for sd (failing the path first if it sits
+// in a map) and has it read sd again as kw. Re-added while udev still files
+// it under the old volume, the path would go straight back to it, so then
+// udev is asked to re-read sd and the next sweep adds it.
+func (t *iscsi) refile(ctx context.Context, sd, kw string, inMap bool) {
+	var steps [][]string
+	if inMap {
+		steps = append(steps, []string{"fail", "path", sd})
+	}
+	steps = append(steps, []string{"del", "path", sd})
+	u, ok := udevWWID(sd)
+	readd := !ok || u == kw
+	if readd {
+		steps = append(steps, []string{"add", "path", sd})
+	}
+	for _, args := range steps {
+		if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", args...); err != nil {
+			t.log.Warn("multipathd "+args[0]+" path failed", "path", sd, "err", err)
+		}
+	}
+	if !readd {
+		t.reprobe(sd)
 	}
 }
 
@@ -331,7 +480,11 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 			if !useMultipath {
 				return
 			}
-			known := t.pathvec(ctx)
+			known, err := t.pathvec(ctx)
+			if err != nil {
+				t.log.Warn("cannot read multipathd's paths; not adding any", "err", err)
+				return
+			}
 			for _, p := range sysBlockMatching("sd*", strings.TrimPrefix(wwid, "3")) {
 				t.addPath(ctx, p, wwid, known)
 			}
@@ -415,6 +568,7 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string, want map[int]strin
 		mapName = name
 	}
 	var errs []error
+	var gone []string
 	paths := sysBlockMatching("sd*", needle)
 	if want != nil {
 		var valid []string
@@ -426,6 +580,8 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string, want map[int]strin
 			t.log.Warn("deleting path unflushed: its LUN no longer carries this volume", "dev", p, "serial", serial)
 			if err := deletePath(p); err != nil {
 				errs = append(errs, err)
+			} else {
+				gone = append(gone, p)
 			}
 		}
 		paths = valid
@@ -447,7 +603,12 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string, want map[int]strin
 		}
 		if err := deletePath(p); err != nil {
 			errs = append(errs, err)
+		} else {
+			gone = append(gone, p)
 		}
+	}
+	if err := t.forgetDeleted(ctx, gone); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -578,6 +739,7 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 		}
 	}
 	var errs []error
+	var gone []string
 	for sd, lun := range stale {
 		if err := deletePath(sd); err != nil {
 			if lun == ownLUN {
@@ -585,12 +747,17 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 			} else {
 				t.log.Error("could not delete stale path", "dev", sd, "lun", lun, "err", err)
 			}
+		} else {
+			gone = append(gone, sd)
 		}
 	}
 	for _, name := range whollyStale {
 		if err := t.dropMap(ctx, name, false); err != nil {
 			t.log.Error("map left without paths by the sweep is still open; whatever holds it gets I/O errors", "map", name, "err", err)
 		}
+	}
+	if err := t.forgetDeleted(ctx, gone); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -609,7 +776,11 @@ func holderMaps(paths map[string]int) map[string]string {
 	return out
 }
 
-func (t *iscsi) CheckLUN(dev string, lun int) error {
+// CheckLUN also refuses while multipathd files a path of another volume under
+// this map's WWID: it adds such a path whenever it next handles it, and on
+// staging that happened between this check passing and the mount, so the
+// mount read one volume's log through another's paths.
+func (t *iscsi) CheckLUN(ctx context.Context, dev string, lun int) error {
 	resolved, err := filepath.EvalSymlinks(dev)
 	if err != nil {
 		return err
@@ -630,6 +801,21 @@ func (t *iscsi) CheckLUN(dev string, lun int) error {
 		}
 		if mw != "" && kernelWWID(p) != mw {
 			return fmt.Errorf("%s: path %s belongs to another volume (%s)", dev, p, kernelWWID(p))
+		}
+	}
+	if mw == "" || !multipathdRunning() {
+		return nil
+	}
+	known, err := t.pathvec(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: cannot ask multipathd which paths it files under this volume: %w", dev, err)
+	}
+	for p, w := range known {
+		if w != mw {
+			continue
+		}
+		if kw := kernelWWID(p); kw != "" && kw != mw {
+			return fmt.Errorf("%s: multipathd files path %s under this volume, but it reaches another volume (%s)", dev, p, kw)
 		}
 	}
 	return nil

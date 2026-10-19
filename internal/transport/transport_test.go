@@ -2,12 +2,14 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeBlock builds a sysfs entry and a /dev link pointing at it, the shape a
@@ -175,16 +177,16 @@ func TestCheckLUN(t *testing.T) {
 	}
 
 	tr := &iscsi{log: slog.Default()}
-	if err := tr.CheckLUN(dev, 3); err != nil {
+	if err := tr.CheckLUN(context.Background(), dev, 3); err != nil {
 		t.Fatalf("all paths on LUN 3: %v", err)
 	}
-	if err := tr.CheckLUN(dev, 4); err == nil {
+	if err := tr.CheckLUN(context.Background(), dev, 4); err == nil {
 		t.Fatal("accepted paths on the wrong LUN")
 	}
 	if err := os.MkdirAll(filepath.Join(root, "sys", "dm-5", "slaves", "sdb"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := tr.CheckLUN(dev, 3); err == nil {
+	if err := tr.CheckLUN(context.Background(), dev, 3); err == nil {
 		t.Fatal("accepted a map with a path on another LUN")
 	}
 }
@@ -373,6 +375,7 @@ func TestSweepPullsPathOutOfAnotherVolumesMap(t *testing.T) {
 	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+a)
 	fakePath(t, root, "sdb", "34:0:0:4", "naa.624a9370"+b)
 	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda", "sdb")
+	fakeUdev(t, root, "sdb", "8:16", WWID(b))
 	cmds := fakeMultipath(t, WWID(a), nil)
 
 	tr := &iscsi{log: slog.Default()}
@@ -392,18 +395,170 @@ func TestSweepPullsPathOutOfAnotherVolumesMap(t *testing.T) {
 	}
 }
 
-func TestAddPathDropsStaleMultipathdEntry(t *testing.T) {
-	cmds := fakeMultipath(t, "", nil)
-	tr := &iscsi{log: slog.Default()}
-	want := WWID("6fef9ab1157343ec000000aa")
-	tr.addPath(context.Background(), "sdt", want, map[string]string{"sdt": WWID("6fef9ab1157343ec000000bb")})
-	if len(*cmds) != 2 || (*cmds)[0] != "multipathd del path sdt" || (*cmds)[1] != "multipathd add path sdt" {
-		t.Fatalf("stale entry: cmds = %v, want del then add", *cmds)
+// fakeUdev gives sd a device number and a udev record naming wwid.
+func fakeUdev(t *testing.T, root, sd, majmin, wwid string) {
+	t.Helper()
+	old := udevDataDir
+	udevDataDir = filepath.Join(root, "udev")
+	t.Cleanup(func() { udevDataDir = old })
+	for p, v := range map[string]string{
+		filepath.Join(root, "sys", sd, "dev"):    majmin + "\n",
+		filepath.Join(root, "sys", sd, "uevent"): "",
+		filepath.Join(root, "udev", "b"+majmin):  "E:ID_SERIAL=" + wwid + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	*cmds = nil
-	tr.addPath(context.Background(), "sdt", want, map[string]string{"sdt": want})
-	if len(*cmds) != 1 || (*cmds)[0] != "multipathd add path sdt" {
-		t.Fatalf("matching entry: cmds = %v, want add only", *cmds)
+}
+
+func reprobed(t *testing.T, root, sd string) bool {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, "sys", sd, "uevent"))
+	return err == nil && string(b) == "change"
+}
+
+func TestAddPath(t *testing.T) {
+	want := WWID("6fef9ab1157343ec000000aa")
+	other := WWID("6fef9ab1157343ec000000bb")
+	for _, tc := range []struct {
+		name  string
+		known map[string]string
+		udev  string
+		cmds  []string
+		probe bool
+	}{
+		{"stale multipathd entry", map[string]string{"sdt": other}, want, []string{"multipathd del path sdt", "multipathd add path sdt"}, false},
+		{"multipathd has it right", map[string]string{"sdt": want}, want, nil, false},
+		{"new to multipathd", map[string]string{}, want, []string{"multipathd add path sdt"}, false},
+		// multipathd files a path by udev's record: added now, it would join the old volume's map.
+		{"udev not caught up", map[string]string{"sdt": other}, other, nil, true},
+		{"udev has no identity yet", map[string]string{}, "", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			old := sysClassBlock
+			sysClassBlock = filepath.Join(root, "sys")
+			t.Cleanup(func() { sysClassBlock = old })
+			fakeUdev(t, root, "sdt", "65:48", tc.udev)
+			cmds := fakeMultipath(t, "", nil)
+			tr := &iscsi{log: slog.Default()}
+			tr.addPath(context.Background(), "sdt", want, tc.known)
+			if strings.Join(*cmds, "|") != strings.Join(tc.cmds, "|") {
+				t.Fatalf("cmds = %v, want %v", *cmds, tc.cmds)
+			}
+			if got := reprobed(t, root, "sdt"); got != tc.probe {
+				t.Fatalf("reprobe = %v, want %v", got, tc.probe)
+			}
+		})
+	}
+}
+
+// Re-adding a pulled-out path while udev still files it under the old volume
+// put it straight back into that volume's map on staging.
+func TestMembershipFixWaitsForUdevBeforeReadding(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const a, b = "6fef9ab1157343ec000000aa", "6fef9ab1157343ec000000bb"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+a)
+	fakePath(t, root, "sdb", "34:0:0:4", "naa.624a9370"+b)
+	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda", "sdb")
+	fakeUdev(t, root, "sdb", "8:16", WWID(a)) // udev still has the old identity
+	cmds := fakeMultipath(t, WWID(a), nil)
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Sweep(context.Background(), map[int]string{3: a, 4: b}, "6fef9ab1157343ec", -1, true); err != nil {
+		t.Fatal(err)
+	}
+	if !ran(*cmds, "multipathd del path sdb") || ran(*cmds, "multipathd add path sdb") {
+		t.Fatalf("want sdb pulled out and not re-added yet: %v", *cmds)
+	}
+	if !reprobed(t, root, "sdb") {
+		t.Fatal("udev not asked to re-read sdb")
+	}
+}
+
+// multipathd still listing a deleted path means the kernel may hand its name to
+// the next disk while multipathd files that disk under the old volume.
+func TestDetachWaitsForMultipathdToForgetDeletedPaths(t *testing.T) {
+	const serial = "6fef9ab1157343ec000000aa"
+	for _, tc := range []struct {
+		name      string
+		heldFor   int // "show paths" calls that still list sda; <0 = always
+		wantError bool
+	}{
+		{"forgets in time", 3, false},
+		{"never forgets", -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			old := sysClassBlock
+			sysClassBlock = filepath.Join(root, "sys")
+			oldPoll, oldWait := forgetPoll, forgetWait
+			forgetPoll, forgetWait = time.Millisecond, 50*time.Millisecond
+			t.Cleanup(func() { sysClassBlock, forgetPoll, forgetWait = old, oldPoll, oldWait })
+			fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+serial)
+			cmds := fakeMultipath(t, WWID(serial), nil)
+			inner := runner
+			shows := 0
+			runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+				c := name + " " + strings.Join(args, " ")
+				if strings.HasPrefix(c, "multipathd show paths") {
+					shows++
+					if tc.heldFor < 0 || shows <= tc.heldFor {
+						return "sda " + WWID(serial), nil
+					}
+					return "", nil
+				}
+				return inner(ctx, log, name, args...)
+			}
+
+			tr := &iscsi{log: slog.Default()}
+			err := tr.Detach(context.Background(), serial, "", map[int]string{3: serial})
+			if got := errors.Is(err, ErrPathsHeld); got != tc.wantError {
+				t.Fatalf("ErrPathsHeld = %v, want %v (err %v)", got, tc.wantError, err)
+			}
+			if tc.heldFor > 0 && shows <= tc.heldFor {
+				t.Fatal("returned before multipathd let go of the path")
+			}
+			if tc.wantError && !ran(*cmds, "multipathd del path sda") {
+				t.Fatal("did not ask multipathd to drop the path it kept")
+			}
+		})
+	}
+}
+
+// A path multipathd files under this map but which reaches another volume is
+// one multipathd may add to the map at any moment, so the mount must wait.
+func TestCheckLUNRefusesWhileMultipathdFilesAForeignPath(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const a, b = "6fef9ab1157343ec000000aa", "6fef9ab1157343ec000000bb"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+a)
+	fakePath(t, root, "sdc", "34:0:0:5", "naa.624a9370"+b)
+	dev := fakeBlock(t, root, "dm-5", "dm/uuid", "mpath-"+WWID(a))
+	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda")
+	fakeMultipath(t, WWID(a), nil)
+	inner := runner
+	runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+		if name == "multipathd" && len(args) > 1 && args[0] == "show" && args[1] == "paths" {
+			return "sda " + WWID(a) + "\nsdc " + WWID(a), nil
+		}
+		return inner(ctx, log, name, args...)
+	}
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.CheckLUN(context.Background(), dev, 3); err == nil || !strings.Contains(err.Error(), "sdc") {
+		t.Fatalf("expected a refusal naming sdc, got %v", err)
 	}
 }
 
@@ -420,7 +575,36 @@ func TestCheckLUNRejectsAnotherVolumesPath(t *testing.T) {
 	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda", "sdb")
 
 	tr := &iscsi{log: slog.Default()}
-	if err := tr.CheckLUN(dev, 3); err == nil || !strings.Contains(err.Error(), "another volume") {
+	if err := tr.CheckLUN(context.Background(), dev, 3); err == nil || !strings.Contains(err.Error(), "another volume") {
 		t.Fatalf("expected a refusal for sdb, got %v", err)
+	}
+}
+
+// An entry filing a path under another volume, outside any map, makes the
+// mount check refuse that volume until something drops it.
+func TestSweepDropsMultipathdEntryWithWrongIdentity(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const a, b = "6fef9ab1157343ec000000aa", "6fef9ab1157343ec000000bb"
+	fakePath(t, root, "sdc", "34:0:0:5", "naa.624a9370"+b)
+	fakeUdev(t, root, "sdc", "8:32", WWID(b))
+	cmds := fakeMultipath(t, WWID(a), nil)
+	inner := runner
+	runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+		if name == "multipathd" && len(args) > 1 && args[0] == "show" && args[1] == "paths" {
+			return "sdc " + WWID(a), nil
+		}
+		return inner(ctx, log, name, args...)
+	}
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Sweep(context.Background(), map[int]string{5: b}, "6fef9ab1157343ec", -1, true); err != nil {
+		t.Fatal(err)
+	}
+	if !ran(*cmds, "multipathd del path sdc") || !ran(*cmds, "multipathd add path sdc") || ran(*cmds, "multipathd fail path sdc") {
+		t.Fatalf("want sdc's entry dropped and re-read, not failed: %v", *cmds)
 	}
 }

@@ -68,7 +68,9 @@ Host prerequisites (the plugin uses these host binaries rather than shipping
 its own): `xfsprogs` (or `e2fsprogs` for ext4); `open-iscsi` (running
 `iscsid`) and `multipath-tools` for iSCSI,
 configured as in [Multipath safety](#multipath-safety); `nvme-cli` and an
-`/etc/nvme/hostnqn` for NVMe/TCP. The host's
+`/etc/nvme/hostnqn` for NVMe/TCP. On cgroup v2 hosts (Ubuntu 22.04+), Docker
+must put containers in their own slice; see item 5 of
+[Multipath safety](#multipath-safety). The host's
 `/etc/iscsi/initiatorname.iscsi` or `/etc/nvme/hostnqn` is what identifies
 the node to the array; the plugin creates (or reuses) a FlashArray host
 object named after `FA_HOST_NAME` (default: hostname).
@@ -147,6 +149,29 @@ processes in uninterruptible sleep, recoverable only by a reboot.
        }
    }
    ```
+5. **On cgroup v2 hosts (Ubuntu 22.04 and later), give containers their own
+   slice.** There Docker uses the systemd cgroup driver, and each container
+   becomes a scope in `system.slice` beside `systemd-udevd`, `multipathd`,
+   `iscsid` and this plugin, at the same CPU weight. When a node starts many
+   containers at once (a drain, a failover), udev and multipathd get a sliver
+   of the CPU and new LUNs take longer than `FA_ATTACH_TIMEOUT` to become a
+   map. The failed attaches then free LUN numbers while multipathd still holds
+   their old paths, which on staging put one volume's paths into another's
+   map. cgroup v1 hosts (Ubuntu 20.04, `cgroupfs` driver) are unaffected: all
+   containers share one `/docker` group. Add to `/etc/docker/daemon.json`,
+   keeping its other keys:
+
+   ```json
+   "cgroup-parent": "docker.slice"
+   ```
+
+   Restart Docker on a drained node; containers move as they are recreated.
+   The plugin is not a container scope and stays in `system.slice`. `docker
+   info --format '{{.CgroupVersion}} {{.CgroupDriver}}'` shows which case a
+   host is in, and a container's `/proc/<pid>/cgroup` should read
+   `0::/docker.slice/…`. In a burst test on 4 vCPUs under CPU load (100
+   container starts across 50 volumes), half the starts failed without it and
+   none with it.
 
 Before any teardown the plugin waits, up to `FA_ATTACH_TIMEOUT`, until an
 exclusive open of the device succeeds. A stopped container's filesystem can
@@ -214,7 +239,25 @@ multipathd keeps its own record of each sdX name, and after the kernel
 reuses a name for another LUN it can add the path to the old volume's map. A
 path found in another volume's map is pulled out and re-read, and before
 asking multipathd to add a path the plugin drops a stale record of it.
-(NVMe/TCP has no such sweep yet.)
+multipathd files a path under the identity udev recorded (`ID_SERIAL`), so a
+path udev has not re-read yet is re-announced to udev instead of added, and
+one multipathd already has right is left alone. (NVMe/TCP has no such sweep
+yet.)
+
+A device that does not appear within `FA_ATTACH_TIMEOUT` is usually only late:
+udev and multipathd fall behind while a node starts many containers. Rolling
+such an attach back deleted paths multipathd was still building maps from and
+freed their LUNs for the next attaches, which on staging mixed two volumes in
+one map. So the volume stays connected for half of `FA_PREEMPT_GRACE`, Docker's
+retry finds the device, and one nothing mounts by then is released. Every
+detach and sweep waits until multipathd has dropped the paths it deleted (and
+drops any it keeps) before the lock that holds off rescans is released, so the
+kernel cannot hand their names to new disks multipathd would file under the
+old volume; a connect waits while it cannot. The mount check also refuses
+while multipathd files another volume's path under the map, and runs again
+right after the mount: a map that changed in between gets its filesystem shut
+down without a log flush before it is unmounted, so nothing more is written
+through it.
 
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has
