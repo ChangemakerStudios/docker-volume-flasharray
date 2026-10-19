@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/ctxlock"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
@@ -34,15 +35,17 @@ type iscsi struct {
 
 	// scanMu makes rescans exclusive with Exclusive callers, which change
 	// what LUN numbers carry on this host.
-	scanMu sync.Mutex
+	scanMu ctxlock.Mutex
 }
 
 // Exclusive runs fn with rescans held off. A rescan between a detach and the
 // array disconnect rebuilds the volume's paths onto a LUN about to be freed,
 // and one in flight across a connect can scan a reassigned LUN under its old
 // identity.
-func (t *iscsi) Exclusive(fn func() error) error {
-	t.scanMu.Lock()
+func (t *iscsi) Exclusive(ctx context.Context, fn func() error) error {
+	if err := t.scanMu.Lock(ctx); err != nil {
+		return fmt.Errorf("wait for this host's attach lock: %w", err)
+	}
 	defer t.scanMu.Unlock()
 	return fn()
 }
@@ -472,7 +475,9 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 	defer cancel()
 	scan := func(f func()) func() {
 		return func() {
-			t.scanMu.Lock()
+			if t.scanMu.Lock(ctx) != nil {
+				return // out of time; the loop below reports it
+			}
 			defer t.scanMu.Unlock()
 			f()
 		}

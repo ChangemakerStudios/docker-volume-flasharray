@@ -47,8 +47,9 @@ type Transport interface {
 	// serial of this array shares; only a stale path on ownLUN that cannot be
 	// removed is an error.
 	Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int, crossedOnly bool) error
-	// Exclusive runs fn with rescans held off; see iscsi.Exclusive.
-	Exclusive(fn func() error) error
+	// Exclusive runs fn with rescans held off; see iscsi.Exclusive. It gives
+	// up, without running fn, if ctx ends while waiting for the lock.
+	Exclusive(ctx context.Context, fn func() error) error
 	// CheckLUN reports an error unless every path under dev sits on lun and
 	// nothing on the host is set to join dev under a stale identity.
 	CheckLUN(ctx context.Context, dev string, lun int) error

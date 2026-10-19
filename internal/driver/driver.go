@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/ctxlock"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
@@ -43,7 +44,7 @@ type Driver struct {
 	closing bool
 	// prefix is this array's serial prefix (string) once known; see arrayPrefix.
 	prefix atomic.Value
-	locks  map[string]*sync.Mutex
+	locks  map[string]*ctxlock.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
 	// names caches dockerName -> array volume name once resolved.
@@ -110,7 +111,7 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		tr:     d.Transport,
 		mnt:    d.Mounter,
 		log:    d.Logger.With("component", "driver"),
-		locks:  map[string]*sync.Mutex{},
+		locks:  map[string]*ctxlock.Mutex{},
 		mounts: map[string]*mountState{},
 		names:  map[string]string{},
 		known:  map[string]string{},
@@ -255,14 +256,18 @@ func (d *Driver) resolveLocked(ctx context.Context, dockerName string) (an strin
 	if err != nil {
 		return "", nil, func() {}, err
 	}
-	unlock = d.lock(an)
+	if unlock, err = d.lockCtx(ctx, an); err != nil {
+		return "", nil, unlock, err
+	}
 	v, err = d.array.GetVolume(ctx, an)
 	if cached && stale(v, err) {
 		unlock()
 		if an, err = d.reresolve(ctx, dockerName, an); err != nil {
 			return "", nil, func() {}, err
 		}
-		unlock = d.lock(an)
+		if unlock, err = d.lockCtx(ctx, an); err != nil {
+			return "", nil, unlock, err
+		}
 		v, err = d.array.GetVolume(ctx, an)
 	}
 	return an, v, unlock, err
@@ -322,15 +327,27 @@ func (d *Driver) cachedName(dockerName string) string {
 }
 
 func (d *Driver) lock(name string) func() {
+	unlock, _ := d.lockCtx(context.Background(), name)
+	return unlock
+}
+
+// lockCtx is lock that gives up when ctx ends. Mount, Create and Remove wait
+// with it: Docker abandons a Mount after 2 minutes and counts it failed, and a
+// Mount queued behind a long one on the same volume used to start its work
+// only after that, unseen. Unmount and the deferred teardowns wait as long as
+// it takes, since giving up there would leave a mount nothing cleans up.
+func (d *Driver) lockCtx(ctx context.Context, name string) (func(), error) {
 	d.mu.Lock()
 	l, ok := d.locks[name]
 	if !ok {
-		l = &sync.Mutex{}
+		l = &ctxlock.Mutex{}
 		d.locks[name] = l
 	}
 	d.mu.Unlock()
-	l.Lock()
-	return l.Unlock
+	if err := l.Lock(ctx); err != nil {
+		return func() {}, fmt.Errorf("another operation on this volume is still running: %w", err)
+	}
+	return l.Unlock, nil
 }
 
 func (d *Driver) ctx() (context.Context, context.CancelFunc) {
@@ -339,8 +356,9 @@ func (d *Driver) ctx() (context.Context, context.CancelFunc) {
 
 // Docker gives up on a Mount after 2 minutes and an Unmount after 1
 // (volume/drivers/proxy.go) and treats it as failed, while the driver would
-// finish it unseen. Mount and Unmount stay inside those limits.
-const (
+// finish it unseen. Mount and Unmount stay inside those limits. Variables so
+// tests needn't wait.
+var (
 	mountBudget   = 110 * time.Second
 	unmountBudget = 55 * time.Second
 )
@@ -397,7 +415,9 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 			return err
 		}
 		unlock()
-		unlock = d.lock(an)
+		if unlock, err = d.lockCtx(ctx, an); err != nil {
+			return err
+		}
 		d.log.Info("array volume under this name is destroyed; creating a new one beside it", "volume", req.Name, "destroyed", old, "array_name", an)
 	}
 
@@ -479,8 +499,11 @@ func (d *Driver) mountOptions() string {
 // importVolume adopts an existing array volume under a Docker name without
 // renaming or touching its data: it only writes the dvfa:name tag.
 func (d *Driver) importVolume(ctx context.Context, dockerName, arrayName string) error {
-	unlock := d.lock(arrayName)
+	unlock, err := d.lockCtx(ctx, arrayName)
 	defer unlock()
+	if err != nil {
+		return err
+	}
 	if err := Adopt(ctx, d.array, d.cfg.Namespace, dockerName, arrayName, d.log); err != nil {
 		return err
 	}
@@ -729,7 +752,7 @@ func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string
 	var lun int
 	prefix := arrayPrefix(serial)
 	d.prefix.Store(prefix)
-	err := d.tr.Exclusive(func() error {
+	err := d.tr.Exclusive(ctx, func() error {
 		// First clear paths on LUN numbers the array does not map here: the
 		// connect may hand one of them out, and until the sweep after it a
 		// leftover path there would reach the newly connected volume.
@@ -796,7 +819,7 @@ func (d *Driver) RunPathCheck(ctx context.Context) {
 func (d *Driver) checkPaths(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, pathCheckInterval)
 	defer cancel()
-	_ = d.tr.Exclusive(func() error {
+	err := d.tr.Exclusive(ctx, func() error {
 		want, err := d.array.HostLUNs(ctx, d.host)
 		if err != nil {
 			d.log.Warn("path check: cannot read this host's LUN map", "err", err)
@@ -816,6 +839,9 @@ func (d *Driver) checkPaths(ctx context.Context) {
 		}
 		return nil
 	})
+	if err != nil {
+		d.log.Warn("path check skipped: attaches held the host's lock all round", "err", err)
+	}
 }
 
 // arrayPrefix is the part of a FlashArray volume serial all volumes of one
@@ -842,15 +868,17 @@ func (d *Driver) detachLocked(ctx context.Context, serial, dev string) error {
 // and disconnecting under paths the host keeps hands their LUN number to the
 // next volume, which they then silently reach.
 func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detachErr, disconnectErr error) {
-	_ = d.tr.Exclusive(func() error {
-		ctx, cancel := cleanupCtx(ctx)
-		defer cancel()
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.tr.Exclusive(ctx, func() error {
 		if detachErr = d.detachLocked(ctx, serial, dev); detachErr != nil {
 			return nil
 		}
 		disconnectErr = d.array.Disconnect(ctx, d.host, an)
 		return nil
-	})
+	}); err != nil {
+		detachErr = err
+	}
 	return detachErr, disconnectErr
 }
 
@@ -972,7 +1000,7 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 		return fmt.Errorf("volume %s: %s is still held on this node by a mount from before the volume was disconnected from it; reconnecting would let that stale mount write over the volume (stop what holds it, or reboot the node)", dockerName, dev)
 	}
 	d.log.Warn("removing a leftover device from an earlier attachment before reconnecting", "volume", dockerName, "dev", dev)
-	if err := d.tr.Exclusive(func() error { return d.detachLocked(ctx, serial, dev) }); err != nil {
+	if err := d.tr.Exclusive(ctx, func() error { return d.detachLocked(ctx, serial, dev) }); err != nil {
 		return fmt.Errorf("volume %s: remove leftover device %s: %w", dockerName, dev, err)
 	}
 	return nil
@@ -983,10 +1011,16 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 // keeps frees their LUN number for the next volume, which those paths then
 // silently reach.
 func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
-	_ = d.tr.Exclusive(func() error {
+	// Its own budget: the request's may be spent, and a skipped rollback
+	// leaves the attachment for the next mount or a preempting node.
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.tr.Exclusive(ctx, func() error {
 		d.rollbackLocked(ctx, an, serial, dev)
 		return nil
-	})
+	}); err != nil {
+		d.log.Error("rollback skipped; the attachment stays in place", "array_name", an, "serial", serial, "err", err)
+	}
 }
 
 // rollbackLocked is rollbackAttach for a caller holding the Exclusive lock.

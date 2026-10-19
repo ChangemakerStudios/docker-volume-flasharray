@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/ctxlock"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/hostexec"
 )
@@ -31,7 +32,7 @@ type nvmeTCP struct {
 	connected map[string]bool // "nqn|portal"
 	nqns      map[string]bool // subsystem NQNs we connected to
 
-	excl sync.Mutex // see Exclusive
+	excl ctxlock.Mutex // see Exclusive
 }
 
 const hostNQNFile = "/etc/nvme/hostnqn"
@@ -178,8 +179,10 @@ func (t *nvmeTCP) PostDisconnect(ctx context.Context) error {
 // same way, but no deployment of this driver runs NVMe/TCP yet.
 func (t *nvmeTCP) Sweep(context.Context, map[int]string, string, int, bool) error { return nil }
 
-func (t *nvmeTCP) Exclusive(fn func() error) error {
-	t.excl.Lock()
+func (t *nvmeTCP) Exclusive(ctx context.Context, fn func() error) error {
+	if err := t.excl.Lock(ctx); err != nil {
+		return fmt.Errorf("wait for this host's attach lock: %w", err)
+	}
 	defer t.excl.Unlock()
 	return fn()
 }

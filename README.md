@@ -187,7 +187,12 @@ Unmount leaves IDs behind, it checks the mount namespaces of every process
 still has the filesystem; IDs younger than two minutes may belong to a
 container still starting and always keep it mounted. Mount and Unmount
 finish inside Docker's own limits (2 and 1 minute), past which Docker counts
-the call as failed while the plugin would carry on unseen.
+the call as failed while the plugin would carry on unseen. That includes time
+a Mount spends queued behind another operation on the same volume or behind
+the host-wide attach lock: it gives up there, before connecting anything,
+rather than start late. Unmount waits as long as it takes, since giving up
+would leave a mount behind, and rollbacks and teardowns get a budget of their
+own.
 
 **Upgrade or disable the plugin only on a drained node.** Docker refuses a
 plain `docker plugin disable` while it knows any volume of the plugin, mounted

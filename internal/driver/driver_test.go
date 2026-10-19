@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/ctxlock"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
 	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
@@ -266,7 +267,7 @@ func (f *fakeArray) Ports(context.Context) ([]flasharray.Port, error) {
 }
 
 type fakeTransport struct {
-	excl      sync.Mutex
+	excl      ctxlock.Mutex
 	mu        sync.Mutex
 	connects  int
 	waits     []string
@@ -346,8 +347,10 @@ func (t *fakeTransport) Sweep(_ context.Context, want map[int]string, prefix str
 	t.sweeps = append(t.sweeps, sweepCall{want, prefix, own, crossedOnly})
 	return t.sweepErr
 }
-func (t *fakeTransport) Exclusive(fn func() error) error {
-	t.excl.Lock()
+func (t *fakeTransport) Exclusive(ctx context.Context, fn func() error) error {
+	if err := t.excl.Lock(ctx); err != nil {
+		return err
+	}
 	defer t.excl.Unlock()
 	return fn()
 }
@@ -1905,4 +1908,63 @@ func TestKeptAttachmentReleasedAfterARetryFailsOtherwise(t *testing.T) {
 	eventually(t, "kept attachment orphaned by a failed retry", func() bool {
 		return tr.detachCount() == 1 && !fa.connected(an, "node1")
 	})
+}
+
+// A Mount queued behind a long operation must give up within its own budget:
+// Docker abandons it after 2 minutes, and work it started after that ran
+// unseen.
+func TestMountGivesUpWaitingForTheVolumeLock(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := mountBudget
+	mountBudget = 100 * time.Millisecond
+	t.Cleanup(func() { mountBudget = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	unlock := d.lock(d.arrayName("v")) // a long teardown holds the volume
+	defer unlock()
+	start := time.Now()
+	_, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err == nil || !strings.Contains(err.Error(), "still running") {
+		t.Fatalf("want a give-up on the volume lock, got %v", err)
+	}
+	if time.Since(start) > 2*time.Second || fa.connectCalls() != 0 {
+		t.Fatal("mount did not give up promptly, or connected anyway")
+	}
+}
+
+// Likewise behind the host-wide attach lock, before anything is connected.
+func TestMountGivesUpWaitingForTheHostLock(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := mountBudget
+	mountBudget = 100 * time.Millisecond
+	t.Cleanup(func() { mountBudget = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	if err := tr.excl.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.excl.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("want the mount to give up on the host lock")
+	}
+	if fa.connectCalls() != 0 {
+		t.Fatal("connected without the host lock")
+	}
+}
+
+// A rollback gets its own budget for the host lock: the request's may be spent.
+func TestRollbackWaitsWithItsOwnBudget(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := fa.Connect(context.Background(), "node1", an); err != nil {
+		t.Fatal(err)
+	}
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	d.rollbackAttach(spent, an, fa.vols[an].Serial, "")
+	if fa.connected(an, "node1") {
+		t.Fatal("rollback skipped because the request's context had ended")
+	}
 }
