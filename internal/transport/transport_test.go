@@ -339,3 +339,88 @@ func TestHasPaths(t *testing.T) {
 		t.Fatal("map with a path rejected")
 	}
 }
+
+// fakeMap builds sys/<dm>/dm/{uuid,name} and slave entries for a multipath map.
+func fakeMap(t *testing.T, root, dm, name, wwid string, slaves ...string) {
+	t.Helper()
+	for f, v := range map[string]string{"uuid": "mpath-" + wwid + "\n", "name": name + "\n"} {
+		p := filepath.Join(root, "sys", dm, "dm", f)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sl := range slaves {
+		if err := os.MkdirAll(filepath.Join(root, "sys", dm, "slaves", sl), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A path whose identity and LUN agree with the array can still sit in another
+// volume's map when multipathd added it under a stale identity. On staging a
+// manual "add path" did exactly that; had the map been mounted, its writes
+// would have gone to the wrong LUN.
+func TestSweepPullsPathOutOfAnotherVolumesMap(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const a, b = "6fef9ab1157343ec000000aa", "6fef9ab1157343ec000000bb"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+a)
+	fakePath(t, root, "sdb", "34:0:0:4", "naa.624a9370"+b)
+	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda", "sdb")
+	cmds := fakeMultipath(t, WWID(a), nil)
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Sweep(context.Background(), map[int]string{3: a, 4: b}, "6fef9ab1157343ec", -1, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"multipathd fail path sdb", "multipathd del path sdb", "multipathd add path sdb"} {
+		if !ran(*cmds, want) {
+			t.Fatalf("missing %q in %v", want, *cmds)
+		}
+	}
+	if ran(*cmds, "multipathd del path sda") {
+		t.Fatal("pulled a path that belongs in the map")
+	}
+	if deleted(t, root, "34:0:0:4") {
+		t.Fatal("deleted a valid path; it only needed to leave the wrong map")
+	}
+}
+
+func TestAddPathDropsStaleMultipathdEntry(t *testing.T) {
+	cmds := fakeMultipath(t, "", nil)
+	tr := &iscsi{log: slog.Default()}
+	want := WWID("6fef9ab1157343ec000000aa")
+	tr.addPath(context.Background(), "sdt", want, map[string]string{"sdt": WWID("6fef9ab1157343ec000000bb")})
+	if len(*cmds) != 2 || (*cmds)[0] != "multipathd del path sdt" || (*cmds)[1] != "multipathd add path sdt" {
+		t.Fatalf("stale entry: cmds = %v, want del then add", *cmds)
+	}
+	*cmds = nil
+	tr.addPath(context.Background(), "sdt", want, map[string]string{"sdt": want})
+	if len(*cmds) != 1 || (*cmds)[0] != "multipathd add path sdt" {
+		t.Fatalf("matching entry: cmds = %v, want add only", *cmds)
+	}
+}
+
+func TestCheckLUNRejectsAnotherVolumesPath(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const a, b = "6fef9ab1157343ec000000aa", "6fef9ab1157343ec000000bb"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+a)
+	fakePath(t, root, "sdb", "35:0:0:3", "naa.624a9370"+b)
+	dev := fakeBlock(t, root, "dm-5", "dm/uuid", "mpath-"+WWID(a))
+	fakeMap(t, root, "dm-5", "mpathq", WWID(a), "sda", "sdb")
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.CheckLUN(dev, 3); err == nil || !strings.Contains(err.Error(), "another volume") {
+		t.Fatalf("expected a refusal for sdb, got %v", err)
+	}
+}

@@ -208,8 +208,13 @@ be deleted fails only the mount whose LUN it sits on. The sweep also runs just
 before each connect, so no leftover path sits on a LUN number the connect may
 hand out, and every 30 seconds in the background, where it deletes only paths
 on a LUN the array gives to a different volume: a LUN missing from the
-array's answer is never reason enough to cut a live volume's path. (NVMe/TCP
-has no such sweep yet.)
+array's answer is never reason enough to cut a live volume's path. Every
+sweep also checks that each path sits in the map of the volume it carries:
+multipathd keeps its own record of each sdX name, and after the kernel
+reuses a name for another LUN it can add the path to the old volume's map. A
+path found in another volume's map is pulled out and re-read, and before
+asking multipathd to add a path the plugin drops a stale record of it.
+(NVMe/TCP has no such sweep yet.)
 
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has
@@ -312,7 +317,10 @@ things prevent it:
   view). When a `Get` or `List` can't reach the array, a volume in that file
   is still reported as existing, with `array_unreachable` in its status and
   a warning in the log. Only lookups fall back; creating, mounting and
-  removing still need the array. A volume this node has never seen is still
+  removing still need the array. Only the array's own answer that an object
+  does not exist (HTTP 400 with its JSON error) counts as "not found": a 404
+  or an HTML page from a controller mid-failover is treated as an outage, so
+  it never bypasses this fallback. A volume this node has never seen is still
   an error.
 
 ## Settings

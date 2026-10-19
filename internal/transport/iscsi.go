@@ -204,6 +204,92 @@ func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath, requi
 	return ""
 }
 
+// pathvec returns multipathd's own record of each path's WWID (sdX -> wwid).
+func (t *iscsi) pathvec(ctx context.Context) map[string]string {
+	out, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "show", "paths", "raw", "format", "%d %w")
+	m := map[string]string{}
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) == 2 {
+			m[f[0]] = strings.ToLower(f[1])
+		}
+	}
+	return m
+}
+
+// addPath asks multipathd to take p for wwid, first dropping a stale entry.
+// multipathd keeps the identity it read for an sdX name; once the kernel
+// reuses the name for another LUN, "add path" would put it into the old
+// volume's map, as happened on staging.
+func (t *iscsi) addPath(ctx context.Context, p, wwid string, known map[string]string) {
+	if have, ok := known[p]; ok && have != strings.ToLower(wwid) {
+		t.log.Warn("multipathd remembers this path as another volume; dropping its entry first", "path", p, "multipathd_wwid", have, "wwid", wwid)
+		if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "del", "path", p); err != nil {
+			t.log.Warn("multipathd del path failed; not adding it", "path", p, "err", err)
+			return
+		}
+	}
+	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "add", "path", p); err != nil {
+		t.log.Warn("multipathd add path failed", "path", p, "err", err)
+	}
+}
+
+// kernelWWID is a SCSI disk's WWID as the kernel read it ("3624a9370..."), or
+// "" if it cannot be read.
+func kernelWWID(sd string) string {
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, sd, "device", "wwid"), 3*time.Second)
+	if err != nil {
+		return ""
+	}
+	id := strings.ToLower(strings.TrimSpace(string(b)))
+	if rest, ok := strings.CutPrefix(id, "naa."); ok {
+		return "3" + rest
+	}
+	return ""
+}
+
+// mapWWID is the WWID a multipath map serves, from its dm uuid, or "".
+func mapWWID(dm string) string {
+	b, err := readFileTimeout(filepath.Join(sysClassBlock, dm, "dm", "uuid"), 3*time.Second)
+	if err != nil {
+		return ""
+	}
+	w, _ := strings.CutPrefix(strings.ToLower(strings.TrimSpace(string(b))), "mpath-")
+	return w
+}
+
+// fixMembership pulls every path of this array out of a map that serves a
+// different volume, then lets multipathd re-read it so it joins its own map.
+// The LUN check in Sweep cannot see this: the path's identity and LUN agree
+// with the array, it is only in the wrong map.
+func (t *iscsi) fixMembership(ctx context.Context, arrayPrefix string) {
+	dms, _ := filepath.Glob(filepath.Join(sysClassBlock, "dm-*"))
+	for _, d := range dms {
+		dm := filepath.Base(d)
+		mw := mapWWID(dm)
+		if !strings.HasPrefix(mw, "3624a9370"+arrayPrefix) {
+			continue
+		}
+		slaves, _ := os.ReadDir(filepath.Join(d, "slaves"))
+		for _, sl := range slaves {
+			kw := kernelWWID(sl.Name())
+			if kw == "" || kw == mw {
+				continue
+			}
+			b, _ := readFileTimeout(filepath.Join(d, "dm", "name"), 3*time.Second)
+			name := strings.TrimSpace(string(b))
+			t.log.Error("path is in another volume's map; pulling it out", "path", sl.Name(), "map", name, "map_wwid", mw, "path_wwid", kw)
+			for _, args := range [][]string{{"fail", "path", sl.Name()}, {"del", "path", sl.Name()}, {"add", "path", sl.Name()}} {
+				if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", args...); err != nil {
+					t.log.Warn("multipathd "+args[0]+" path failed", "path", sl.Name(), "err", err)
+				}
+			}
+		}
+	}
+}
+
 // hasPaths reports whether a multipath map has any path.
 func hasPaths(dev string) bool {
 	resolved, err := filepath.EvalSymlinks(dev)
@@ -245,10 +331,9 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 			if !useMultipath {
 				return
 			}
+			known := t.pathvec(ctx)
 			for _, p := range sysBlockMatching("sd*", strings.TrimPrefix(wwid, "3")) {
-				if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "add", "path", p); err != nil {
-					t.log.Warn("multipathd add path failed", "path", p, "err", err)
-				}
+				t.addPath(ctx, p, wwid, known)
 			}
 		},
 	}
@@ -474,6 +559,7 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 		t.log.Warn("deleting stale path: the array gives its LUN to another volume", "dev", filepath.Base(p), "lun", lun, "path_serial", serial, "array_serial", want[lun])
 		stale[filepath.Base(p)] = lun
 	}
+	defer t.fixMembership(ctx, arrayPrefix)
 	if len(stale) == 0 {
 		return nil
 	}
@@ -536,10 +622,14 @@ func (t *iscsi) CheckLUN(dev string, lun int) error {
 			paths = append(paths, s.Name())
 		}
 	}
+	mw := mapWWID(base)
 	for _, p := range paths {
 		got, ok := pathLUN(filepath.Join(sysClassBlock, p))
 		if !ok || got != lun {
 			return fmt.Errorf("%s: path %s is not on LUN %d, where the array connected the volume", dev, p, lun)
+		}
+		if mw != "" && kernelWWID(p) != mw {
+			return fmt.Errorf("%s: path %s belongs to another volume (%s)", dev, p, kernelWWID(p))
 		}
 	}
 	return nil

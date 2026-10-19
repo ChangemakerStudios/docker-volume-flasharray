@@ -181,3 +181,34 @@ func TestHostLUNsNotFoundIsAnError(t *testing.T) {
 		t.Fatal("expected the not-found error, not an empty LUN map")
 	}
 }
+
+// During a Purity upgrade a controller or proxy can answer 404, or a page
+// saying "not found", for a route that is only briefly unavailable. Reading
+// that as "no such volume" makes Docker create an empty local volume.
+func TestNotFoundOnlyFromArrayJSON400(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		notFound bool
+	}{
+		{"array says missing", http.StatusBadRequest, `{"errors":[{"context":"v","message":"Volume does not exist."}]}`, true},
+		{"route unavailable", http.StatusNotFound, `Not Found`, false},
+		{"proxy page", http.StatusBadRequest, `<html><body>404 not found</body></html>`, false},
+		{"404 with array json", http.StatusNotFound, `{"errors":[{"message":"Volume does not exist."}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.GetVolume(context.Background(), "v")
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if IsNotFound(err) != tc.notFound {
+				t.Fatalf("IsNotFound = %v, want %v (err %v)", IsNotFound(err), tc.notFound, err)
+			}
+		})
+	}
+}

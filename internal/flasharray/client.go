@@ -209,20 +209,33 @@ type apiError struct {
 }
 
 func readErr(resp *http.Response) string {
+	msg, _ := readAPIErr(resp)
+	return msg
+}
+
+// readAPIErr is readErr that also reports whether the array said the object
+// does not exist. Only a 400 carrying the array's own JSON error counts. A
+// controller mid-failover (Purity upgrade) or a proxy can answer 404, or a
+// page saying "not found", for a route that is merely unavailable, and
+// calling that a missing volume makes Docker substitute an empty local
+// volume for an external one.
+func readAPIErr(resp *http.Response) (string, bool) {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	var e apiError
 	if json.Unmarshal(b, &e) == nil && len(e.Errors) > 0 {
 		parts := make([]string, 0, len(e.Errors))
+		notFound := false
 		for _, x := range e.Errors {
 			if x.Context != "" {
 				parts = append(parts, x.Context+": "+x.Message)
 			} else {
 				parts = append(parts, x.Message)
 			}
+			notFound = notFound || isNotFound(x.Message)
 		}
-		return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.Join(parts, "; "))
+		return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.Join(parts, "; ")), notFound && resp.StatusCode == http.StatusBadRequest
 	}
-	return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b))), false
 }
 
 // maxAttempts bounds retries of one request (re-login, rate limiting, 5xx).
@@ -297,8 +310,8 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 		}
 		defer resp.Body.Close()
 		if code == http.StatusBadRequest || code == http.StatusNotFound {
-			msg := readErr(resp)
-			if isNotFound(msg) {
+			msg, notFound := readAPIErr(resp)
+			if notFound {
 				return fmt.Errorf("%s %s: %w (%s)", method, path, ErrNotFound, msg)
 			}
 			return fmt.Errorf("%s %s: %s", method, path, msg)
