@@ -37,11 +37,8 @@ type Driver struct {
 	host  string // FlashArray host object name for this node
 	ports []flasharray.Port
 
-	mu sync.Mutex // guards locks, mounts, names and known maps
-	// attachMu serializes array connects with the stale-path sweep; see
-	// connectSwept.
-	attachMu sync.Mutex
-	locks    map[string]*sync.Mutex
+	mu    sync.Mutex // guards locks, mounts, names and known maps
+	locks map[string]*sync.Mutex
 	// mounts is keyed by array volume name.
 	mounts map[string]*mountState
 	// names caches dockerName -> array volume name once resolved.
@@ -538,9 +535,17 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 			return fmt.Errorf("volume %s is connected to host %s; unmount it there first", req.Name, c.Host)
 		}
 	}
-	for _, c := range conns {
-		if err := d.array.Disconnect(ctx, c.Host, an); err != nil {
-			return err
+	if len(conns) > 0 {
+		v, err := d.array.GetVolume(ctx, an)
+		if err != nil {
+			return fmt.Errorf("volume %s: look up serial before detach: %w", req.Name, err)
+		}
+		detachErr, disconnectErr := d.releaseHost(ctx, an, v.Serial, "")
+		if detachErr != nil {
+			return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", req.Name, detachErr)
+		}
+		if disconnectErr != nil {
+			return disconnectErr
 		}
 	}
 	// A destroyed volume keeps its name for 24h, and Get still answers for it
@@ -647,28 +652,77 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	return &plugin.MountResponse{Mountpoint: mp}, nil
 }
 
-// connectSwept connects an to this host, then deletes host paths whose LUN
-// number the array now gives to another volume (transport Sweep). Every
-// connect on this host runs under attachMu, so the LUN map the sweep reads
-// covers every path a rescan can have created, and a volume connected later
-// cannot lose a fresh path to this sweep.
+// connectSwept connects an to this host, then deletes this array's host paths
+// whose LUN number the array now gives to another volume (transport Sweep).
+// Every change to what this host's LUNs carry (connects here, and the
+// detach-then-disconnect of releaseHost) and every rescan runs under the
+// transport's Exclusive lock, so the LUN map the sweep reads covers every path
+// a rescan can have created.
 func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string) (int, error) {
-	d.attachMu.Lock()
-	defer d.attachMu.Unlock()
-	lun, err := d.array.Connect(ctx, d.host, an)
-	if err != nil {
-		return 0, fmt.Errorf("connect %s to %s: %w", dockerName, d.host, err)
-	}
-	d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
+	var lun int
+	err := d.tr.Exclusive(func() error {
+		var err error
+		lun, err = d.array.Connect(ctx, d.host, an)
+		if err != nil {
+			return fmt.Errorf("connect %s to %s: %w", dockerName, d.host, err)
+		}
+		d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
+		want, err := d.array.HostLUNs(ctx, d.host)
+		if err == nil {
+			err = d.tr.Sweep(ctx, want, arrayPrefix(serial), lun)
+		}
+		if err != nil {
+			d.rollbackLocked(ctx, an, serial, "")
+			return fmt.Errorf("volume %s: clear stale paths before attaching: %w", dockerName, err)
+		}
+		return nil
+	})
+	return lun, err
+}
+
+// cleanupBudget bounds teardown under the Exclusive lock. Teardown gets its
+// own deadline because the request's may have run out while it waited for the
+// lock, and a teardown cut short leaves paths or connections behind.
+const cleanupBudget = 60 * time.Second
+
+func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+}
+
+// arrayPrefix is the part of a FlashArray volume serial all volumes of one
+// array share (24 hex digits: 16 identify the array, 8 the volume).
+func arrayPrefix(serial string) string {
+	return strings.ToLower(serial[:min(16, len(serial))])
+}
+
+// detachLocked removes this host's devices for serial, giving the transport
+// the array's LUN map so paths whose LUN no longer carries the volume go
+// unflushed. The caller holds the transport's Exclusive lock.
+func (d *Driver) detachLocked(ctx context.Context, serial, dev string) error {
 	want, err := d.array.HostLUNs(ctx, d.host)
-	if err == nil {
-		err = d.tr.Sweep(ctx, want)
-	}
 	if err != nil {
-		d.rollbackAttach(ctx, an, serial, "")
-		return 0, fmt.Errorf("volume %s: clear stale paths before attaching: %w", dockerName, err)
+		d.log.Warn("cannot read this host's LUN map; detaching without checking paths against it", "serial", serial, "err", err)
+		want = nil
 	}
-	return lun, nil
+	return d.tr.Detach(ctx, serial, dev, want)
+}
+
+// releaseHost detaches serial's devices and, only if that worked, disconnects
+// an from this host, as one step under the transport's Exclusive lock: a
+// rescan in between would rebuild the paths onto a LUN the disconnect frees,
+// and disconnecting under paths the host keeps hands their LUN number to the
+// next volume, which they then silently reach.
+func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detachErr, disconnectErr error) {
+	_ = d.tr.Exclusive(func() error {
+		ctx, cancel := cleanupCtx(ctx)
+		defer cancel()
+		if detachErr = d.detachLocked(ctx, serial, dev); detachErr != nil {
+			return nil
+		}
+		disconnectErr = d.array.Disconnect(ctx, d.host, an)
+		return nil
+	})
+	return detachErr, disconnectErr
 }
 
 // releasePoll and maxReleaseWait are variables so tests needn't wait.
@@ -787,7 +841,7 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 		return fmt.Errorf("volume %s: %s is still held on this node by a mount from before the volume was disconnected from it; reconnecting would let that stale mount write over the volume (stop what holds it, or reboot the node)", dockerName, dev)
 	}
 	d.log.Warn("removing a leftover device from an earlier attachment before reconnecting", "volume", dockerName, "dev", dev)
-	if err := d.tr.Detach(ctx, serial, dev); err != nil {
+	if err := d.tr.Exclusive(func() error { return d.detachLocked(ctx, serial, dev) }); err != nil {
 		return fmt.Errorf("volume %s: remove leftover device %s: %w", dockerName, dev, err)
 	}
 	return nil
@@ -798,7 +852,17 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 // keeps frees their LUN number for the next volume, which those paths then
 // silently reach.
 func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
-	if err := d.tr.Detach(ctx, serial, dev); err != nil {
+	_ = d.tr.Exclusive(func() error {
+		d.rollbackLocked(ctx, an, serial, dev)
+		return nil
+	})
+}
+
+// rollbackLocked is rollbackAttach for a caller holding the Exclusive lock.
+func (d *Driver) rollbackLocked(ctx context.Context, an, serial, dev string) {
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.detachLocked(ctx, serial, dev); err != nil {
 		d.log.Error("rollback: host detach failed; array connection left in place so its LUN is not reused under this host's paths", "array_name", an, "serial", serial, "err", err)
 		return
 	}
@@ -861,17 +925,18 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		d.mu.Unlock()
 		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place", req.Name, err)
 	}
-	if err := d.tr.Detach(ctx, serial, st.dev); err != nil {
+	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, st.dev)
+	if detachErr != nil {
 		// Disconnecting on the array under a device the host still holds turns
 		// a cleanup failure into I/O errors for whatever holds it.
 		d.mu.Lock()
 		delete(d.mounts, an)
 		d.mu.Unlock()
-		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", req.Name, err)
+		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", req.Name, detachErr)
 	}
 	var errs []error
-	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
-		errs = append(errs, err)
+	if disconnectErr != nil {
+		errs = append(errs, disconnectErr)
 	}
 	if err := d.tr.PostDisconnect(ctx); err != nil {
 		errs = append(errs, err)
@@ -927,13 +992,14 @@ func (d *Driver) detachUntracked(ctx context.Context, an, dockerName string) err
 		if err := d.waitIdle(ctx, dev); err != nil {
 			return fmt.Errorf("volume %s: %w; host device and array connection left in place", dockerName, err)
 		}
-		if err := d.tr.Detach(ctx, v.Serial, dev); err != nil {
-			return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", dockerName, err)
-		}
+	}
+	detachErr, disconnectErr := d.releaseHost(ctx, an, v.Serial, dev)
+	if detachErr != nil {
+		return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", dockerName, detachErr)
 	}
 	var errs []error
-	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
-		errs = append(errs, err)
+	if disconnectErr != nil {
+		errs = append(errs, disconnectErr)
 	}
 	if dev != "" {
 		if err := d.tr.PostDisconnect(ctx); err != nil {

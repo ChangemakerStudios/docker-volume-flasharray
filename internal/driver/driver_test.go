@@ -265,16 +265,17 @@ func (f *fakeArray) Ports(context.Context) ([]flasharray.Port, error) {
 }
 
 type fakeTransport struct {
+	excl      sync.Mutex
 	mu        sync.Mutex
 	connects  int
 	waits     []string
 	detaches  []string
 	failWait  bool
 	devs      map[string]string // serial -> device, overriding the default path
-	sweeps    []map[int]string  // the LUN maps Sweep was given
-	lunErr    error             // returned by CheckLUN
-	detachErr error             // returned by Detach
-	present   map[string]bool   // serial -> device exists on this node (attached, or a planted leftover)
+	sweeps    []sweepCall
+	lunErr    error           // returned by CheckLUN
+	detachErr error           // returned by Detach
+	present   map[string]bool // serial -> device exists on this node (attached, or a planted leftover)
 }
 
 func (t *fakeTransport) dev(serial string) string {
@@ -323,7 +324,7 @@ func (t *fakeTransport) FindDevice(_ context.Context, serial string) string {
 	}
 	return t.dev(serial)
 }
-func (t *fakeTransport) Detach(_ context.Context, serial, _ string) error {
+func (t *fakeTransport) Detach(_ context.Context, serial, _ string, _ map[int]string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.detaches = append(t.detaches, serial)
@@ -334,12 +335,24 @@ func (t *fakeTransport) Detach(_ context.Context, serial, _ string) error {
 	return nil
 }
 func (t *fakeTransport) PostDisconnect(context.Context) error { return nil }
-func (t *fakeTransport) Sweep(_ context.Context, want map[int]string) error {
+func (t *fakeTransport) Sweep(_ context.Context, want map[int]string, prefix string, own int) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.sweeps = append(t.sweeps, want)
+	t.sweeps = append(t.sweeps, sweepCall{want, prefix, own})
 	return nil
 }
+func (t *fakeTransport) Exclusive(fn func() error) error {
+	t.excl.Lock()
+	defer t.excl.Unlock()
+	return fn()
+}
+
+type sweepCall struct {
+	want   map[int]string
+	prefix string
+	own    int
+}
+
 func (t *fakeTransport) CheckLUN(string, int) error { return t.lunErr }
 
 type fakeMounter struct {
@@ -665,8 +678,9 @@ func TestMountSweepsStalePathsAfterConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	lun := fa.conns[an]["node1"]
-	if len(tr.sweeps) != 1 || tr.sweeps[0][lun] != strings.ToLower(fa.vols[an].Serial) {
-		t.Fatalf("sweeps = %v, want one covering LUN %d", tr.sweeps, lun)
+	serial := strings.ToLower(fa.vols[an].Serial)
+	if len(tr.sweeps) != 1 || tr.sweeps[0].want[lun] != serial || tr.sweeps[0].own != lun || !strings.HasPrefix(serial, tr.sweeps[0].prefix) {
+		t.Fatalf("sweeps = %+v, want one covering LUN %d scoped to this array", tr.sweeps, lun)
 	}
 }
 
@@ -703,6 +717,53 @@ func TestRollbackKeepsConnectionWhenHostDetachFails(t *testing.T) {
 	}
 	if _, ok := fa.conns[an]["node1"]; !ok {
 		t.Fatal("disconnected on the array although the host still has the device")
+	}
+}
+
+func TestUnmountKeepsConnectionWhenHostDetachFails(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	tr.detachErr = errors.New("multipath map mpathq is still open (1)")
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("expected the detach failure")
+	}
+	if _, ok := fa.conns[an]["node1"]; !ok {
+		t.Fatal("disconnected on the array although the host still has the device")
+	}
+}
+
+// A connection left behind must not be dropped under the host's paths: their
+// LUN would go to the next volume connected.
+func TestRemoveDetachesHostBeforeDisconnect(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	serial := fa.vols[an].Serial
+	fa.conns[an] = map[string]int{"node1": 4} // leaked by an earlier attach
+
+	tr.detachErr = errors.New("multipath map mpathq is still open (1)")
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err == nil {
+		t.Fatal("expected the detach failure")
+	}
+	if _, ok := fa.conns[an]["node1"]; !ok {
+		t.Fatal("disconnected although the host detach failed")
+	}
+
+	tr.detachErr = nil
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(tr.detaches); n == 0 || tr.detaches[n-1] != serial {
+		t.Fatalf("host side not detached before disconnect: %v", tr.detaches)
+	}
+	if len(fa.conns[an]) != 0 {
+		t.Fatalf("connection not removed: %v", fa.conns[an])
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +67,9 @@ func TestDeviceIdentityChecks(t *testing.T) {
 // delete file, the sysfs shape of one SCSI path.
 func fakePath(t *testing.T, root, sd, hctl, wwid string) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("H:C:T:L is not a valid file name on Windows")
+	}
 	dir := filepath.Join(root, "scsi", hctl)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -104,10 +109,16 @@ func TestSweepDeletesPathsOnReassignedLUNs(t *testing.T) {
 	fakePath(t, root, "sdc", "34:0:0:9", "naa.624a93706fef9ab1157343ec000000dd")
 	fakePath(t, root, "sdd", "2:0:0:4", "naa.6000c2900000000000000000000000ee")
 
+	// Another array's volume on LUN 4 of its own target: LUN numbers are per array.
+	fakePath(t, root, "sde", "50:0:0:4", "naa.624a93700123456789abcdef000000ff")
+
 	tr := &iscsi{log: slog.Default()}
 	want := map[int]string{3: "6fef9ab1157343ec000000aa", 4: "6fef9ab1157343ec000000cc"}
-	if err := tr.Sweep(context.Background(), want); err != nil {
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 4); err != nil {
 		t.Fatal(err)
+	}
+	if deleted(t, root, "50:0:0:4") {
+		t.Fatal("deleted another array's path")
 	}
 	if deleted(t, root, "34:0:0:3") {
 		t.Fatal("deleted a path the array still maps to its volume")
@@ -151,5 +162,156 @@ func TestCheckLUN(t *testing.T) {
 	}
 	if err := tr.CheckLUN(dev, 3); err == nil {
 		t.Fatal("accepted a map with a path on another LUN")
+	}
+}
+
+// One wedged path must not block every mount on the node: only a stale path on
+// the LUN being attached is worth failing for.
+func TestSweepFailsOnlyForItsOwnLUN(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	fakePath(t, root, "sda", "34:0:0:5", "naa.624a93706fef9ab1157343ec000000aa")
+	stuck := filepath.Join(root, "scsi", "34:0:0:5", "delete")
+	if err := os.Remove(stuck); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stuck, 0o755); err != nil { // writes to it now fail
+		t.Fatal(err)
+	}
+	tr := &iscsi{log: slog.Default()}
+	want := map[int]string{5: "6fef9ab1157343ec000000bb"}
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 7); err != nil {
+		t.Fatalf("undeletable path on another LUN failed the sweep: %v", err)
+	}
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", 5); err == nil {
+		t.Fatal("undeletable stale path on our own LUN must fail")
+	}
+}
+
+func TestDeletePathAlreadyGone(t *testing.T) {
+	old := sysClassBlock
+	sysClassBlock = t.TempDir()
+	t.Cleanup(func() { sysClassBlock = old })
+	if err := deletePath("sdzz"); err != nil {
+		t.Fatalf("a path that is already gone counts as deleted: %v", err)
+	}
+}
+
+// fakeMultipath pretends multipathd is up with map mpathq for wwid, and records
+// every command cleanup runs.
+func fakeMultipath(t *testing.T, wwid string, lookupErr error) *[]string {
+	t.Helper()
+	oldRun, oldMP := runner, multipathdRunning
+	t.Cleanup(func() { runner, multipathdRunning = oldRun, oldMP })
+	multipathdRunning = func() bool { return true }
+	var cmds []string
+	runner = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		c := name + " " + strings.Join(args, " ")
+		cmds = append(cmds, c)
+		if strings.HasPrefix(c, "multipathd show maps") {
+			return "mpathq " + wwid, lookupErr
+		}
+		return "", nil
+	}
+	return &cmds
+}
+
+func ran(cmds []string, want string) bool {
+	for _, c := range cmds {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// Detach must not trust a path's cached WWID: one whose LUN the array gives to
+// another volume is deleted unflushed, before the map is flushed, and with no
+// path left that reaches the volume nothing is flushed at all.
+func TestDetachDeletesStalePathsBeforeAnyFlush(t *testing.T) {
+	const serial = "6fef9ab1157343ec000000aa"
+	for _, tc := range []struct {
+		name      string
+		want      map[int]string
+		flushMap  bool
+		flushPath bool
+	}{
+		{"connected", map[int]string{3: serial, 8: "6fef9ab1157343ec000000cc"}, true, true},
+		{"leftover", map[int]string{8: "6fef9ab1157343ec000000cc"}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			old := sysClassBlock
+			sysClassBlock = filepath.Join(root, "sys")
+			t.Cleanup(func() { sysClassBlock = old })
+			fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+serial)
+			fakePath(t, root, "sdb", "35:0:0:8", "naa.624a9370"+serial)
+			cmds := fakeMultipath(t, WWID(serial), nil)
+			oldRun := runner
+			runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+				if name == "blockdev" && !deleted(t, root, "35:0:0:8") {
+					t.Errorf("%s %v ran while a path into another volume's LUN was still present", name, args)
+				}
+				return oldRun(ctx, log, name, args...)
+			}
+
+			tr := &iscsi{log: slog.Default()}
+			if err := tr.Detach(context.Background(), serial, "", tc.want); err != nil {
+				t.Fatal(err)
+			}
+			if !deleted(t, root, "34:0:0:3") || !deleted(t, root, "35:0:0:8") {
+				t.Fatal("both paths of the volume must go")
+			}
+			if ran(*cmds, "blockdev --flushbufs /dev/sdb") {
+				t.Fatal("flushed a path whose LUN carries another volume")
+			}
+			if got := ran(*cmds, "blockdev --flushbufs /dev/mapper/mpathq"); got != tc.flushMap {
+				t.Fatalf("map flushed = %v, want %v (cmds %v)", got, tc.flushMap, *cmds)
+			}
+			if got := ran(*cmds, "blockdev --flushbufs /dev/sda"); got != tc.flushPath {
+				t.Fatalf("valid path flushed = %v, want %v", got, tc.flushPath)
+			}
+		})
+	}
+}
+
+// Deleting paths under a map that could not be looked up would leave it
+// queueing I/O with nothing beneath it.
+func TestDetachTouchesNothingWhenMapLookupFails(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+	const serial = "6fef9ab1157343ec000000aa"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+serial)
+	fakeMultipath(t, WWID(serial), context.DeadlineExceeded)
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Detach(context.Background(), serial, "", map[int]string{3: serial}); err == nil {
+		t.Fatal("expected the lookup failure")
+	}
+	if deleted(t, root, "34:0:0:3") {
+		t.Fatal("deleted a path although the map could not be found")
+	}
+}
+
+func TestHasPaths(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	dev := fakeBlock(t, root, "dm-7", "dm/uuid", "mpath-3624a93706fef9ab1157343ec000000aa")
+	if hasPaths(dev) {
+		t.Fatal("a map without paths is not a usable device")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "sys", "dm-7", "slaves", "sda"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !hasPaths(dev) {
+		t.Fatal("map with a path rejected")
 	}
 }

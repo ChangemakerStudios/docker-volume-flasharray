@@ -31,6 +31,20 @@ type iscsi struct {
 
 	mu       sync.Mutex
 	loggedIn map[string]bool // "iqn|portal"
+
+	// scanMu makes rescans exclusive with Exclusive callers, which change
+	// what LUN numbers carry on this host.
+	scanMu sync.Mutex
+}
+
+// Exclusive runs fn with rescans held off. A rescan between a detach and the
+// array disconnect rebuilds the volume's paths onto a LUN about to be freed,
+// and one in flight across a connect can scan a reassigned LUN under its old
+// identity.
+func (t *iscsi) Exclusive(fn func() error) error {
+	t.scanMu.Lock()
+	defer t.scanMu.Unlock()
+	return fn()
 }
 
 const (
@@ -43,7 +57,8 @@ const (
 	multipathdAbstractSocket = "@/org/kernel/linux/storage/multipathd"
 )
 
-func multipathdRunning() bool {
+// multipathdRunning is a variable so tests can pretend multipathd is up.
+var multipathdRunning = func() bool {
 	b, err := readFileTimeout("/proc/net/unix", 3*time.Second)
 	return err == nil && bytes.Contains(b, []byte(multipathdAbstractSocket))
 }
@@ -142,23 +157,27 @@ func (t *iscsi) scanSCSIHosts() {
 
 // mpathMap returns the name of multipathd's map for wwid, or "". Asking
 // multipathd directly doesn't depend on udev having created by-id links yet.
-func (t *iscsi) mpathMap(ctx context.Context, wwid string) string {
+func (t *iscsi) mpathMap(ctx context.Context, wwid string) (string, error) {
 	out, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "show", "maps", "raw", "format", "%n %w")
 	if err != nil {
-		return ""
+		return "", err
 	}
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) == 2 && strings.EqualFold(f[1], wwid) {
-			return f[0]
+			return f[0], nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // findDevice only returns a path whose sysfs identity is wwid: a stale udev
 // link once mounted one volume's filesystem from another volume's LUN.
-func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath bool) string {
+// With requirePaths a multipath map counts only once it has a path: one can
+// outlive its paths, or exist before multipathd adds them, and is no device to
+// mount. Leftover checks pass false, since an open map without paths is
+// exactly the stale mount they must see.
+func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath, requirePaths bool) string {
 	if !useMultipath {
 		p := "/dev/disk/by-id/scsi-" + wwid
 		if exists(p) {
@@ -169,23 +188,34 @@ func (t *iscsi) findDevice(ctx context.Context, wwid string, useMultipath bool) 
 		}
 		return ""
 	}
-	if name := t.mpathMap(ctx, wwid); name != "" {
-		if p := "/dev/mapper/" + name; dmCarries(p, wwid) {
+	if name, _ := t.mpathMap(ctx, wwid); name != "" {
+		if p := "/dev/mapper/" + name; dmCarries(p, wwid) && (!requirePaths || hasPaths(p)) {
 			return p
 		}
 	}
 	p := "/dev/disk/by-id/dm-uuid-mpath-" + wwid
 	if exists(p) {
-		if dmCarries(p, wwid) {
+		if !dmCarries(p, wwid) {
+			t.log.Warn("ignoring stale by-id link: it points at another LUN", "link", p, "wwid", wwid)
+		} else if !requirePaths || hasPaths(p) {
 			return p
 		}
-		t.log.Warn("ignoring stale by-id link: it points at another LUN", "link", p, "wwid", wwid)
 	}
 	return ""
 }
 
+// hasPaths reports whether a multipath map has any path.
+func hasPaths(dev string) bool {
+	resolved, err := filepath.EvalSymlinks(dev)
+	if err != nil {
+		return false
+	}
+	slaves, err := os.ReadDir(filepath.Join(sysClassBlock, filepath.Base(resolved), "slaves"))
+	return err == nil && len(slaves) > 0
+}
+
 func (t *iscsi) FindDevice(ctx context.Context, serial string) string {
-	return t.findDevice(ctx, WWID(serial), multipathdRunning())
+	return t.findDevice(ctx, WWID(serial), multipathdRunning(), false)
 }
 
 // WaitForDevice probes first, then escalates in rounds (session rescan, SCSI
@@ -196,14 +226,21 @@ func (t *iscsi) FindDevice(ctx context.Context, serial string) string {
 func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error) {
 	wwid := WWID(serial)
 	useMultipath := multipathdRunning()
-	if dev := t.findDevice(ctx, wwid, useMultipath); dev != "" {
+	if dev := t.findDevice(ctx, wwid, useMultipath, true); dev != "" {
 		return dev, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, t.opts.Timeout)
 	defer cancel()
+	scan := func(f func()) func() {
+		return func() {
+			t.scanMu.Lock()
+			defer t.scanMu.Unlock()
+			f()
+		}
+	}
 	steps := []func(){
-		func() { t.rescan(ctx) },
-		t.scanSCSIHosts,
+		scan(func() { t.rescan(ctx) }),
+		scan(t.scanSCSIHosts),
 		func() {
 			if !useMultipath {
 				return
@@ -216,7 +253,7 @@ func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error
 		},
 	}
 	probe := func() (string, bool) {
-		d := t.findDevice(ctx, wwid, useMultipath)
+		d := t.findDevice(ctx, wwid, useMultipath, true)
 		return d, d != ""
 	}
 	for {
@@ -255,7 +292,7 @@ func (t *iscsi) describe(wwid string, useMultipath bool) string {
 	case !useMultipath:
 		b.WriteString("  multipathd: not running (no " + multipathdAbstractSocket + " in /proc/net/unix); expecting a single-path device\n")
 	default:
-		if name := t.mpathMap(ctx, wwid); name != "" {
+		if name, _ := t.mpathMap(ctx, wwid); name != "" {
 			fmt.Fprintf(&b, "  multipath map: %s (/dev/mapper/%s present: %v)\n", name, name, exists("/dev/mapper/"+name))
 		} else {
 			b.WriteString("  multipath map: none (paths not claimed; check the multipath.conf blacklist and find_multipaths)\n")
@@ -271,25 +308,51 @@ func (t *iscsi) describe(wwid string, useMultipath bool) string {
 // are gone blocks forever, so queueing is switched off first; only this map
 // is removed (never `multipath -F`, which flushes every unused map on the
 // host); and each path is checked to still carry this WWID before deletion,
-// since the kernel reuses sdX names as soon as they are freed.
-func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
+// since the kernel reuses sdX names as soon as they are freed. With want (the
+// array's LUN map for this host), a path whose LUN no longer carries this
+// volume is deleted unflushed first: its cached WWID is stale, and anything
+// flushed through it would land in whichever volume holds that LUN now.
+func (t *iscsi) Detach(ctx context.Context, serial, _ string, want map[int]string) error {
 	if serial == "" {
 		// WWID("") is the bare Pure prefix, which would match every FlashArray LUN on the host.
 		return errors.New("detach: empty volume serial; refusing to touch host SCSI devices")
 	}
 	wwid := WWID(serial)
 	needle := strings.TrimPrefix(wwid, "3")
-	paths := sysBlockMatching("sd*", needle)
+	var mapName string
 	if multipathdRunning() {
-		if name := t.mpathMap(ctx, wwid); name != "" {
-			if err := t.removeMap(ctx, name); err != nil {
-				return err
-			}
+		// Deleting paths under a map we could not find leaves it queueing I/O
+		// with nothing beneath it.
+		name, err := t.mpathMap(ctx, wwid)
+		if err != nil {
+			return fmt.Errorf("detach: look up multipath map for %s: %w", wwid, err)
 		}
+		mapName = name
 	}
 	var errs []error
+	paths := sysBlockMatching("sd*", needle)
+	if want != nil {
+		var valid []string
+		for _, p := range paths {
+			if lun, ok := pathLUN(filepath.Join(sysClassBlock, p)); ok && want[lun] == strings.ToLower(serial) {
+				valid = append(valid, p)
+				continue
+			}
+			t.log.Warn("deleting path unflushed: its LUN no longer carries this volume", "dev", p, "serial", serial)
+			if err := deletePath(p); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		paths = valid
+	}
+	if mapName != "" {
+		// With no path left that reaches the volume, a flush has nowhere right to go.
+		if err := t.removeMap(ctx, mapName, want == nil || len(paths) > 0); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+	}
 	for _, p := range paths {
-		if b, err := readFileTimeout(filepath.Join("/sys/class/block", p, "device", "wwid"), 3*time.Second); err == nil &&
+		if b, err := readFileTimeout(filepath.Join(sysClassBlock, p, "device", "wwid"), 3*time.Second); err == nil &&
 			!strings.Contains(strings.ToLower(string(b)), needle) {
 			t.log.Warn("not deleting path: device name now belongs to another LUN", "dev", p, "want", wwid, "have", strings.TrimSpace(string(b)))
 			continue
@@ -297,28 +360,53 @@ func (t *iscsi) Detach(ctx context.Context, serial, _ string) error {
 		if _, err := runTimeout(ctx, t.log, 10*time.Second, "blockdev", "--flushbufs", "/dev/"+p); err != nil {
 			t.log.Warn("flush before path delete failed", "dev", p, "err", err)
 		}
-		if err := writeFileTimeout(filepath.Join("/sys/class/block", p, "device", "delete"), "1", 10*time.Second); err != nil {
-			errs = append(errs, fmt.Errorf("delete %s: %w", p, err))
+		if err := deletePath(p); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (t *iscsi) removeMap(ctx context.Context, name string) error {
+// deletePath removes a SCSI disk; one already gone counts as removed.
+func deletePath(p string) error {
+	err := writeFileTimeout(filepath.Join(sysClassBlock, p, "device", "delete"), "1", 10*time.Second)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete %s: %w", p, err)
+	}
+	return nil
+}
+
+func (t *iscsi) removeMap(ctx context.Context, name string, flush bool) error {
 	dev := "/dev/mapper/" + name
 	if dm, err := filepath.EvalSymlinks(dev); err == nil {
-		if holders, _ := os.ReadDir(filepath.Join("/sys/class/block", filepath.Base(dm), "holders")); len(holders) > 0 {
+		if holders, _ := os.ReadDir(filepath.Join(sysClassBlock, filepath.Base(dm), "holders")); len(holders) > 0 {
 			return fmt.Errorf("detach: %s is still in use (%d holder(s) in sysfs, e.g. %s); not removing it", dev, len(holders), holders[0].Name())
 		}
 	}
+	t.stopQueueing(ctx, name)
+	return t.dropMap(ctx, name, flush)
+}
+
+// stopQueueing makes I/O on map name fail once no path is usable, instead of
+// queueing forever. multipathd re-applies no_path_retry on every table reload,
+// so both its own switch and the dm message are needed.
+func (t *iscsi) stopQueueing(ctx context.Context, name string) {
 	if _, err := runTimeout(ctx, t.log, 5*time.Second, "multipathd", "disablequeueing", "map", name); err != nil {
 		t.log.Warn("disable queueing failed", "map", name, "err", err)
 	}
 	if _, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "message", name, "0", "fail_if_no_path"); err != nil {
 		t.log.Warn("fail_if_no_path failed", "map", name, "err", err)
 	}
-	if _, err := runTimeout(ctx, t.log, 10*time.Second, "blockdev", "--flushbufs", dev); err != nil {
-		t.log.Warn("flush map failed", "map", name, "err", err)
+}
+
+// dropMap removes map name, flushing its buffers first only when asked: that
+// is right only while every path still reaches the map's volume.
+func (t *iscsi) dropMap(ctx context.Context, name string, flush bool) error {
+	dev := "/dev/mapper/" + name
+	if flush {
+		if _, err := runTimeout(ctx, t.log, 10*time.Second, "blockdev", "--flushbufs", dev); err != nil {
+			t.log.Warn("flush map failed", "map", name, "err", err)
+		}
 	}
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "remove", "map", name); err == nil && !exists(dev) {
 		return nil
@@ -345,78 +433,89 @@ func (t *iscsi) PostDisconnect(context.Context) error { return nil }
 // purePrefix is the NAA prefix of every FlashArray LUN's WWID in sysfs.
 const purePrefix = "naa.624a9370"
 
-// Sweep deletes every FlashArray SCSI path whose LUN number the array gives to
-// a different volume than the path's cached WWID names, or to none. Linux
-// reads a path's identity once, at scan time: when a volume is disconnected
-// while the host keeps its paths (a failed detach, or a peer preempting this
-// host) and the array hands the LUN number to the next volume connected, the
-// old path still claims the old volume while its I/O reaches the new one. On
-// staging that cross-wrote volumes. Stale paths are deleted without a flush,
-// since anything buffered for them belongs to a volume they no longer reach,
-// and even under an open map, whose filesystem then gets I/O errors instead.
-func (t *iscsi) Sweep(ctx context.Context, want map[int]string) error {
+// Sweep deletes every SCSI path from this array whose LUN number the array
+// gives to a different volume than the path's cached WWID names, or to none.
+// Linux reads a path's identity once, at scan time: when a volume is
+// disconnected while the host keeps its paths (a failed detach, or a peer
+// preempting this host) and the array hands the LUN number to the next volume
+// connected, the old path still claims the old volume while its I/O reaches
+// the new one. On staging that cross-wrote volumes.
+//
+// Only paths whose serial starts with arrayPrefix are judged: LUN numbers are
+// per array, and another array's paths are none of this map's business. A map
+// whose every path is stale has queueing switched off first, so whatever still
+// holds it gets I/O errors rather than hanging, and is removed unflushed
+// afterwards (its buffers belong to a volume it no longer reaches). Only a
+// stale path on ownLUN that cannot be deleted is an error; others are logged,
+// so one wedged device does not block every mount on the node.
+func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int) error {
+	arrayPrefix = strings.ToLower(arrayPrefix)
 	devs, _ := filepath.Glob(filepath.Join(sysClassBlock, "sd*"))
-	var stale []string
-	holderMaps := map[string]bool{}
+	stale := map[string]int{} // sd -> LUN
 	for _, p := range devs {
 		b, err := readFileTimeout(filepath.Join(p, "device", "wwid"), 3*time.Second)
 		if err != nil {
 			continue
 		}
 		id := strings.ToLower(strings.TrimSpace(string(b)))
-		if !strings.HasPrefix(id, purePrefix) {
+		serial, ok := strings.CutPrefix(id, purePrefix)
+		if !ok || !strings.HasPrefix(serial, arrayPrefix) {
 			continue
 		}
 		lun, ok := pathLUN(p)
-		if !ok {
+		if !ok || want[lun] == serial {
 			continue
 		}
-		serial := strings.TrimPrefix(id, purePrefix)
-		if want[lun] == serial {
-			continue
+		t.log.Warn("deleting stale path: the array gives its LUN to another volume", "dev", filepath.Base(p), "lun", lun, "path_serial", serial, "array_serial", want[lun])
+		stale[filepath.Base(p)] = lun
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	var whollyStale []string
+	for dm, name := range holderMaps(stale) {
+		slaves, _ := os.ReadDir(filepath.Join(sysClassBlock, dm, "slaves"))
+		all := true
+		for _, sl := range slaves {
+			if _, ok := stale[sl.Name()]; !ok {
+				all = false
+			}
 		}
-		name := filepath.Base(p)
-		t.log.Warn("deleting stale path: the array gives its LUN to another volume", "dev", name, "lun", lun, "path_serial", serial, "array_serial", want[lun])
-		holders, _ := os.ReadDir(filepath.Join(p, "holders"))
-		for _, h := range holders {
-			holderMaps[h.Name()] = true
+		if all {
+			t.stopQueueing(ctx, name)
+			whollyStale = append(whollyStale, name)
 		}
-		stale = append(stale, name)
 	}
 	var errs []error
-	for _, name := range stale {
-		if err := writeFileTimeout(filepath.Join(sysClassBlock, name, "device", "delete"), "1", 10*time.Second); err != nil {
-			errs = append(errs, fmt.Errorf("delete stale path %s: %w", name, err))
+	for sd, lun := range stale {
+		if err := deletePath(sd); err != nil {
+			if lun == ownLUN {
+				errs = append(errs, err)
+			} else {
+				t.log.Error("could not delete stale path", "dev", sd, "lun", lun, "err", err)
+			}
 		}
 	}
-	for dm := range holderMaps {
-		t.dropPathlessMap(ctx, dm)
+	for _, name := range whollyStale {
+		if err := t.dropMap(ctx, name, false); err != nil {
+			t.log.Error("map left without paths by the sweep is still open; whatever holds it gets I/O errors", "map", name, "err", err)
+		}
 	}
 	return errors.Join(errs...)
 }
 
-// dropPathlessMap removes a map the sweep left without paths, after switching
-// off queueing so I/O on it fails instead of hanging. An open one stays.
-func (t *iscsi) dropPathlessMap(ctx context.Context, dm string) {
-	if slaves, _ := os.ReadDir(filepath.Join(sysClassBlock, dm, "slaves")); len(slaves) > 0 {
-		return
+// holderMaps returns dm device -> map name for the maps holding paths.
+func holderMaps(paths map[string]int) map[string]string {
+	out := map[string]string{}
+	for sd := range paths {
+		holders, _ := os.ReadDir(filepath.Join(sysClassBlock, sd, "holders"))
+		for _, h := range holders {
+			if b, err := readFileTimeout(filepath.Join(sysClassBlock, h.Name(), "dm", "name"), 3*time.Second); err == nil {
+				out[h.Name()] = strings.TrimSpace(string(b))
+			}
+		}
 	}
-	b, err := readFileTimeout(filepath.Join(sysClassBlock, dm, "dm", "name"), 3*time.Second)
-	if err != nil {
-		return
-	}
-	name := strings.TrimSpace(string(b))
-	if _, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "message", name, "0", "fail_if_no_path"); err != nil {
-		t.log.Warn("fail_if_no_path failed", "map", name, "err", err)
-	}
-	out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name)
-	if n, perr := strconv.Atoi(strings.TrimSpace(out)); err != nil || perr != nil || n > 0 {
-		t.log.Error("map lost all its paths to the sweep but is still open; whatever holds it gets I/O errors", "map", name)
-		return
-	}
-	if _, err := runTimeout(ctx, t.log, 10*time.Second, "multipathd", "remove", "map", name); err != nil {
-		t.log.Warn("remove pathless map failed", "map", name, "err", err)
-	}
+	return out
 }
 
 func (t *iscsi) CheckLUN(dev string, lun int) error {

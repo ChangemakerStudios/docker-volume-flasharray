@@ -709,10 +709,10 @@ func (c *Client) HostLUNs(ctx context.Context, host string) (map[int]string, err
 	lunOf := map[string]int{}
 	for {
 		var out page[connItem]
+		// A host with no connections answers 200 with no items; any error,
+		// not-found included, must not read as "nothing is connected", which
+		// would make every path on the node look stale.
 		if err := c.do(ctx, http.MethodGet, "/connections", q, nil, &out); err != nil {
-			if IsNotFound(err) {
-				break
-			}
 			return nil, err
 		}
 		for _, i := range out.Items {

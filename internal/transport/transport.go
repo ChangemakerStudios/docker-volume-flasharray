@@ -35,15 +35,19 @@ type Transport interface {
 	// without rescanning, or "".
 	FindDevice(ctx context.Context, serial string) string
 	// Detach removes host-side state for a device before the array connection
-	// is deleted (flush multipath map, delete SCSI paths). Best effort.
-	Detach(ctx context.Context, serial, devPath string) error
+	// is deleted (flush multipath map, delete SCSI paths). want is the array's
+	// LUN -> serial map for this host, or nil if it could not be read.
+	Detach(ctx context.Context, serial, devPath string, want map[int]string) error
 	// PostDisconnect runs after the array connection is deleted (e.g. NVMe
 	// namespace rescan). Best effort.
 	PostDisconnect(ctx context.Context) error
-	// Sweep removes host paths whose LUN number the array now gives to another
-	// volume, or to none. want is LUN -> volume serial for this host, from the
-	// array.
-	Sweep(ctx context.Context, want map[int]string) error
+	// Sweep removes this array's host paths whose LUN number the array now
+	// gives to another volume, or to none. want is LUN -> volume serial for
+	// this host; arrayPrefix is the leading part every serial of this array
+	// shares; only a stale path on ownLUN that cannot be removed is an error.
+	Sweep(ctx context.Context, want map[int]string, arrayPrefix string, ownLUN int) error
+	// Exclusive runs fn with rescans held off; see iscsi.Exclusive.
+	Exclusive(fn func() error) error
 	// CheckLUN reports an error unless every path under dev sits on lun.
 	CheckLUN(dev string, lun int) error
 }
@@ -134,8 +138,11 @@ func run(ctx context.Context, log *slog.Logger, name string, args ...string) (st
 func runTimeout(ctx context.Context, log *slog.Logger, d time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
-	return run(ctx, log, name, args...)
+	return runner(ctx, log, name, args...)
 }
+
+// runner is a variable so tests can see which commands cleanup runs.
+var runner = run
 
 func exitCode(err error) int {
 	var ee *exec.ExitError
@@ -179,7 +186,7 @@ func waitFor(ctx context.Context, timeout, interval time.Duration, fn func() (st
 // needle (lowercase compare). pattern is a glob like "sd*" or "nvme*n*".
 func sysBlockMatching(pattern, needle string) []string {
 	needle = strings.ToLower(needle)
-	matches, _ := filepath.Glob("/sys/class/block/" + pattern)
+	matches, _ := filepath.Glob(filepath.Join(sysClassBlock, pattern))
 	var out []string
 	for _, m := range matches {
 		for _, f := range []string{"wwid", "device/wwid"} {

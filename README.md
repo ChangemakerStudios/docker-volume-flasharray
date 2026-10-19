@@ -192,14 +192,20 @@ The array reuses LUN numbers: disconnect a volume and the next one connected
 to the host may get its number. Linux reads a SCSI path's identity once, at
 scan time, so a path the host kept for the old volume still claims to be it
 while its I/O reaches the new one, which cross-wrote volumes on staging. Right
-after each connect, holding a host-wide lock, the plugin asks the array which
-volume every LUN number on the host carries and deletes each FlashArray path
-whose LUN and cached WWID disagree (without flushing it: its buffers belong to
-a volume it no longer reaches). A map left with no paths is removed, or, if
-still open, fails I/O instead of reaching another volume. The mount then
-checks every path of its device sits on the LUN the array assigned. Rollback
-of a failed mount disconnects on the array only once the host-side devices are
-gone, for the same reason. (NVMe/TCP has no such sweep yet.)
+after each connect the plugin asks the array which volume every LUN number on
+the host carries and deletes each path of this array (matched by serial
+prefix; another array's LUNs are its own) whose LUN and cached WWID disagree,
+without flushing it: its buffers belong to a volume it no longer reaches. A
+map whose every path is stale has queueing switched off first, so whatever
+holds it gets I/O errors instead of hanging, and is then removed. Connects,
+detach-then-disconnect and every rescan hold one host-wide lock, so no rescan
+can rebuild a volume's paths between its detach and its disconnect. Detach
+itself deletes, unflushed, any path whose LUN no longer carries the volume.
+A mount checks every path of its device sits on the LUN the array assigned,
+and ignores a map that has no paths. Rollback of a failed mount disconnects on
+the array only once the host-side devices are gone. A stale path that cannot
+be deleted fails only the mount whose LUN it sits on. (NVMe/TCP has no such
+sweep yet.)
 
 On mount the same rule applies to dm names: a `/dev/disk/by-id` or
 `/dev/mapper` link can outlive its map and point at a dm number the kernel has

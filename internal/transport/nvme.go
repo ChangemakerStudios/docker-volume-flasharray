@@ -30,6 +30,8 @@ type nvmeTCP struct {
 	mu        sync.Mutex
 	connected map[string]bool // "nqn|portal"
 	nqns      map[string]bool // subsystem NQNs we connected to
+
+	excl sync.Mutex // see Exclusive
 }
 
 const hostNQNFile = "/etc/nvme/hostnqn"
@@ -158,7 +160,7 @@ func (t *nvmeTCP) WaitForDevice(ctx context.Context, serial string) (string, err
 
 // Detach is a no-op for NVMe: namespaces vanish on rescan once the array
 // disconnects them, so the work happens in PostDisconnect.
-func (t *nvmeTCP) Detach(ctx context.Context, _, devPath string) error {
+func (t *nvmeTCP) Detach(ctx context.Context, _, devPath string, _ map[int]string) error {
 	if devPath != "" {
 		if _, err := run(ctx, t.log, "blockdev", "--flushbufs", devPath); err != nil {
 			t.log.Warn("flush before disconnect failed", "dev", devPath, "err", err)
@@ -174,6 +176,12 @@ func (t *nvmeTCP) PostDisconnect(ctx context.Context) error {
 
 // Sweep and CheckLUN are iSCSI-only for now: NVMe namespace IDs are reused the
 // same way, but no deployment of this driver runs NVMe/TCP yet.
-func (t *nvmeTCP) Sweep(context.Context, map[int]string) error { return nil }
+func (t *nvmeTCP) Sweep(context.Context, map[int]string, string, int) error { return nil }
+
+func (t *nvmeTCP) Exclusive(fn func() error) error {
+	t.excl.Lock()
+	defer t.excl.Unlock()
+	return fn()
+}
 
 func (t *nvmeTCP) CheckLUN(string, int) error { return nil }

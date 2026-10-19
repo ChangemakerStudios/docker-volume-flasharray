@@ -169,3 +169,15 @@ func TestHostLUNs(t *testing.T) {
 		t.Fatal("expected an error when a connected volume has no serial")
 	}
 }
+
+// Read as "nothing connected", a not-found error here would make the sweep
+// delete every path on the node.
+func TestHostLUNsNotFoundIsAnError(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"Host does not exist."}]}`))
+	})
+	if _, err := c.HostLUNs(context.Background(), "node1"); err == nil {
+		t.Fatal("expected the not-found error, not an empty LUN map")
+	}
+}
