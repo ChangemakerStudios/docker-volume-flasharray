@@ -363,6 +363,7 @@ type fakeMounter struct {
 	opts      map[string]string // target -> mount options
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
 	inUse     map[string]bool   // mountpoint -> a container namespace still has it
+	syncs     []string          // mountpoints Sync was called for
 	// inUseChecks counts InUseByContainer calls.
 	inUseChecks int
 }
@@ -400,6 +401,12 @@ func (m *fakeMounter) MountedAt(dev string) (string, error) {
 		}
 	}
 	return "", nil
+}
+func (m *fakeMounter) Sync(_ context.Context, target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncs = append(m.syncs, target)
+	return nil
 }
 func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
 	m.mu.Lock()
@@ -636,7 +643,7 @@ func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
 		t.Fatal("preempted before the grace period")
 	}
 
-	d.heldSince[an] = holdState{hosts: "dead-node", since: time.Now().Add(-2 * time.Hour)} // Docker kept retrying past the grace
+	d.heldSince[an] = holdState{hosts: "dead-node", since: time.Now().Add(-2 * time.Hour), seen: time.Now()} // Docker kept retrying past the grace
 	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +665,7 @@ func TestPreemptGraceRestartsWhenHolderChanges(t *testing.T) {
 	_ = d.Create(&plugin.CreateRequest{Name: "v"})
 	an := d.arrayName("v")
 	fa.conns[an] = map[string]int{"new-holder": 7}
-	d.heldSince[an] = holdState{hosts: "old-holder", since: time.Now().Add(-2 * time.Hour)}
+	d.heldSince[an] = holdState{hosts: "old-holder", since: time.Now().Add(-2 * time.Hour), seen: time.Now()}
 
 	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "waiting up to") {
 		t.Fatalf("expected to wait for new-holder, got %v", err)
@@ -1486,5 +1493,266 @@ func TestDestroyedImportedVolumeIsNotListedOrResolved(t *testing.T) {
 	}
 	if g, err := d.Get(&plugin.GetRequest{Name: "migtest"}); err != nil || g.Volume.Status["array_name"] != repl.Name {
 		t.Fatalf("get = %+v, %v", g, err)
+	}
+}
+
+// --- linger after the last Unmount ----------------------------------------
+
+func (t *fakeTransport) detachCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.detaches)
+}
+
+func (f *fakeArray) connected(volume, host string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.conns[volume][host]
+	return ok
+}
+
+func (f *fakeArray) connectCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "connect:") {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *fakeMounter) isMounted(target string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.mounted[target]
+	return ok
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal(what)
+}
+
+// Docker's populate step mounts, unmounts and mounts again within a second or
+// two; the second Mount must reuse the attachment instead of a new connect.
+func TestQuickRemountReusesLingeringVolume(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "populate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "populate"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fm.isMounted(r.Mountpoint) || tr.detachCount() != 0 {
+		t.Fatal("torn down at once despite the linger")
+	}
+	connects := fa.connectCalls()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.connectCalls() != connects || tr.detachCount() != 0 {
+		t.Fatal("the quick re-mount re-attached instead of reusing the volume")
+	}
+	d.mu.Lock()
+	pending := d.mounts[d.arrayName("v")].linger != nil
+	d.mu.Unlock()
+	if pending {
+		t.Fatal("re-mount left the teardown scheduled")
+	}
+}
+
+func TestLingerTearsDownWhenNotRemounted(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = 20 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "not torn down after the linger", func() bool {
+		return !fm.isMounted(r.Mountpoint) && tr.detachCount() == 1 && !fa.connected(an, "node1")
+	})
+}
+
+// The teardown after the linger must not pull a filesystem from under a
+// container that still has it, and must try again rather than give up.
+func TestLingerKeepsVolumeAContainerStillUsesThenRetries(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = 10 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = true
+	fm.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !fm.isMounted(r.Mountpoint) || tr.detachCount() != 0 {
+		t.Fatal("tore down a volume a container still has mounted")
+	}
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = false
+	fm.mu.Unlock()
+	eventually(t, "refused teardown was never retried", func() bool {
+		return !fm.isMounted(r.Mountpoint) && tr.detachCount() == 1
+	})
+}
+
+func TestRemoveReleasesLingeringVolume(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatalf("remove of a lingering volume: %v", err)
+	}
+	if tr.detachCount() != 1 || fa.connected(an, "node1") {
+		t.Fatal("lingering volume not released before remove")
+	}
+}
+
+// A mount left over when the plugin stopped mid-linger is torn down once the
+// restarted plugin's linger runs out and no container uses it.
+func TestRecoveredMountTornDownAfterLinger(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Plugin restart: a new driver over the same mount root finds the mount.
+	if err := os.MkdirAll(r.Mountpoint, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := *d.cfg
+	cfg.UnmountLinger = 10 * time.Millisecond
+	d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "recovered idle mount not torn down", func() bool {
+		return !fm.isMounted(r.Mountpoint) && !fa.connected(an, "node1")
+	})
+	_ = d2
+}
+
+// A lingering volume must not hold unwritten data: the old immediate umount
+// flushed it, and another node may take the volume over.
+func TestLingerFlushesFilesystem(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if len(fm.syncs) != 1 || fm.syncs[0] != r.Mountpoint {
+		t.Fatalf("syncs = %v, want the lingering mountpoint", fm.syncs)
+	}
+}
+
+func TestRemoveRefusesRecoveredMountAContainerUses(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(r.Mountpoint, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = true // a container started before the plugin restart
+	fm.mu.Unlock()
+	cfg := *d.cfg
+	cfg.UnmountLinger = time.Hour
+	d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.Remove(&plugin.RemoveRequest{Name: "v"}); err == nil {
+		t.Fatal("removed a volume a running container still has mounted")
+	}
+	if !fm.isMounted(r.Mountpoint) || tr.detachCount() != 0 {
+		t.Fatal("tore down a volume a running container still has mounted")
+	}
+}
+
+// A plugin stopped right after a drain must not leave lingering volumes
+// mounted and connected for another node to preempt.
+func TestShutdownReleasesLingeringVolumes(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	d.Shutdown(context.Background())
+	if fm.isMounted(r.Mountpoint) || tr.detachCount() != 1 || fa.connected(an, "node1") {
+		t.Fatal("lingering volume still mounted or connected after shutdown")
+	}
+}
+
+// A hold record no Mount refreshed for minutes is from an attempt that gave
+// up; reusing its start time would preempt a live holder at once.
+func TestStaleHoldRecordRestartsGrace(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 5*time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"other": 7}
+	d.heldSince[an] = holdState{hosts: "other", since: time.Now().Add(-2 * time.Hour), seen: time.Now().Add(-time.Hour)}
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait, got %v", err)
+	}
+	if !fa.connected(an, "other") {
+		t.Fatal("preempted on a stale hold record")
 	}
 }

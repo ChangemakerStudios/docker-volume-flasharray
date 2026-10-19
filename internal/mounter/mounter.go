@@ -37,6 +37,8 @@ type Mounter interface {
 	// Busy reports whether the kernel still holds dev, e.g. a filesystem
 	// mounted in a container's mount namespace this process can't see.
 	Busy(dev string) (bool, error)
+	// Sync writes the filesystem mounted at target out to its device (syncfs).
+	Sync(ctx context.Context, target string) error
 	// InUseByContainer reports whether a mount namespace other than the
 	// host's and this process's has the filesystem at mountpoint mounted.
 	// Needs the host PID namespace (pidhost).
@@ -171,6 +173,16 @@ func (m *execMounter) Busy(dev string) (bool, error) {
 		return true, nil
 	}
 	return false, err
+}
+
+// Sync runs `sync -f` (syncfs) in the plugin's own mount namespace, where
+// target lives; the plugin image's coreutils provide it. ctx bounds a sync
+// stuck on a wedged device.
+func (m *execMounter) Sync(ctx context.Context, target string) error {
+	if b, err := hostexec.Command(ctx, "sync", "-f", target).CombinedOutput(); err != nil {
+		return fmt.Errorf("sync -f %s: %w: %s", target, err, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 // InUseByContainer only sees namespaces that still have a process in them,

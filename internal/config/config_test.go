@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseSize(t *testing.T) {
 	cases := map[string]int64{
@@ -43,6 +46,24 @@ func TestValidateNamespace(t *testing.T) {
 	for _, bad := range []string{"", "has_underscore", "has.dot", "with space", "x123456789012345678901234567890123"} {
 		if err := ValidateNamespace(bad); err == nil {
 			t.Errorf("%q: expected error", bad)
+		}
+	}
+}
+
+func TestValidateLinger(t *testing.T) {
+	for _, tc := range []struct {
+		linger, grace time.Duration
+		ok            bool
+	}{
+		{0, 0, true},
+		{15 * time.Second, 90 * time.Second, true},
+		{15 * time.Second, 0, false},                // immediate preemption would cut a lingering volume
+		{30 * time.Second, 5 * time.Minute, false},  // a waiting node gives up a Mount attempt at 30s
+		{20 * time.Second, 30 * time.Second, false}, // too close to the grace
+		{-time.Second, 90 * time.Second, false},
+	} {
+		if err := ValidateLinger(tc.linger, tc.grace); (err == nil) != tc.ok {
+			t.Errorf("linger %s grace %s: err = %v, want ok=%v", tc.linger, tc.grace, err, tc.ok)
 		}
 	}
 }

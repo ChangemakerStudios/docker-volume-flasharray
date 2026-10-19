@@ -33,6 +33,7 @@
     { "name": "FA_ALLOWED_CIDRS", "description": "comma-separated CIDRs; only array portals inside these are used", "value": "", "settable": ["value"] },
     { "name": "FA_PREEMPT_RWO", "description": "take over a volume still connected to another host (swarm reschedule)", "value": "true", "settable": ["value"] },
     { "name": "FA_PREEMPT_GRACE", "description": "how long another host may hold a volume before it is presumed dead and preempted; 0 = at once", "value": "90s", "settable": ["value"] },
+    { "name": "FA_UNMOUNT_LINGER", "description": "how long a volume stays attached after its last container lets go, so a quick re-mount reuses it; 0 = tear down at once", "value": "15s", "settable": ["value"] },
     { "name": "FA_ERADICATE_ON_REMOVE", "description": "eradicate immediately instead of 24h pending", "value": "false", "settable": ["value"] },
     { "name": "FA_CONNECT_ON_START", "description": "log in to array portals at plugin start", "value": "true", "settable": ["value"] },
     { "name": "FA_ATTACH_TIMEOUT", "description": "how long to wait for a device to appear", "value": "60s", "settable": ["value"] },

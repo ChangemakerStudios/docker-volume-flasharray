@@ -341,6 +341,7 @@ must be disabled).
 | `FA_ALLOWED_CIDRS` | all | only log in to array portals inside these CIDRs |
 | `FA_PREEMPT_RWO` | `true` | take over a volume still connected to another host (needed for swarm rescheduling off a dead node; unsafe if the other node is actually alive and writing) |
 | `FA_PREEMPT_GRACE` | `90s` | how long another host may keep a volume after a mount here asks for it before it is presumed dead and preempted; `0` preempts at once |
+| `FA_UNMOUNT_LINGER` | `15s` | how long a volume stays mounted and attached after its last container lets go, so Docker's populate-then-start re-mount (and a quick restart) reuses it instead of a detach and re-attach; `0` tears down at once |
 | `FA_ERADICATE_ON_REMOVE` | `false` | `docker volume rm` eradicates immediately instead of leaving 24h to recover |
 | `FA_CONNECT_ON_START` | `true` | log in to portals at plugin start |
 | `FA_ATTACH_TIMEOUT` | `60s` | how long to wait for the device |
@@ -364,6 +365,22 @@ taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
 "waiting for … to release" error and swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and
 corrupted XFS.
+
+After the last container lets go, a volume stays mounted and attached for
+`FA_UNMOUNT_LINGER` before it is torn down. Docker mounts a volume, unmounts
+it and mounts it again within a second or two when it populates a new
+container from its image; tearing down in between churned LUN numbers, and
+the paths those quick cycles left behind were what the LUN checks above kept
+catching. A Mount during the linger reuses the attachment. The filesystem is
+flushed (`syncfs`) as the linger starts, so a lingering volume holds no
+unwritten data. The teardown never runs while a container namespace still has
+the filesystem (it retries instead), `docker volume rm` releases a lingering
+volume at once, the plugin tears lingering volumes down when it is stopped,
+and a mount left over anyway is torn down after the linger once the plugin
+restarts. On a drain, the old node releases each volume up to
+`FA_UNMOUNT_LINGER` later. The plugin refuses to start unless the linger is
+under 30 seconds and at most half of `FA_PREEMPT_GRACE` (and 0 when the grace
+is 0), so no other node preempts a volume that is only lingering.
 
 **Services on these volumes must update and roll back `stop-first`** (swarm's
 default). With `start-first` the old task keeps the volume until the new one

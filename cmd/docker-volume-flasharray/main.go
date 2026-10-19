@@ -93,7 +93,12 @@ func run() error {
 	srvCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	go drv.RunPathCheck(srvCtx)
-	return h.ServeUnix(srvCtx, socketName)
+	err = h.ServeUnix(srvCtx, socketName)
+	// Docker kills a plugin about 10s after asking it to stop.
+	sctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	drv.Shutdown(sctx)
+	return err
 }
 
 func parseLevel(s string) slog.Level {

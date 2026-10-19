@@ -61,7 +61,11 @@ type Config struct {
 	// PreemptGrace is how long a node may keep a volume that another node
 	// wants before it is presumed dead and preempted; 0 preempts at once.
 	PreemptGrace time.Duration
-	LogLevel     string
+	// UnmountLinger is how long a volume stays attached after its last
+	// container lets go, so Docker's populate-then-start Mount reuses it
+	// instead of a detach and re-attach; 0 tears down at once.
+	UnmountLinger time.Duration
+	LogLevel      string
 	// ConnectOnStart logs into every array portal when the plugin starts so the
 	// first volume mount after boot doesn't pay for a cold login while a
 	// container is waiting on it.
@@ -144,6 +148,13 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("FA_PREEMPT_GRACE: %w", err)
 	}
+	c.UnmountLinger, err = time.ParseDuration(getenv("FA_UNMOUNT_LINGER", "15s"))
+	if err != nil {
+		return nil, fmt.Errorf("FA_UNMOUNT_LINGER: %w", err)
+	}
+	if err := ValidateLinger(c.UnmountLinger, c.PreemptGrace); err != nil {
+		return nil, err
+	}
 
 	f, err := LoadFile(c.ConfigPath)
 	if err != nil {
@@ -151,6 +162,23 @@ func FromEnv() (*Config, error) {
 	}
 	c.Array = f.Arrays[0]
 	return c, nil
+}
+
+// ValidateLinger keeps a lingering volume clear of preemption: another node
+// waiting for it gives up a Mount attempt after 30s and preempts after the
+// grace, and a lingering volume is still mounted on this one.
+func ValidateLinger(linger, grace time.Duration) error {
+	switch {
+	case linger < 0:
+		return fmt.Errorf("FA_UNMOUNT_LINGER=%s: must not be negative", linger)
+	case linger == 0:
+		return nil
+	case grace == 0:
+		return fmt.Errorf("FA_UNMOUNT_LINGER=%s needs FA_PREEMPT_GRACE > 0: with immediate preemption another node could cut a volume still mounted here", linger)
+	case linger >= 30*time.Second || 2*linger > grace:
+		return fmt.Errorf("FA_UNMOUNT_LINGER=%s must be under 30s and at most half of FA_PREEMPT_GRACE (%s)", linger, grace)
+	}
+	return nil
 }
 
 // LoadFile reads and validates the credentials file.

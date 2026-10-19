@@ -39,6 +39,8 @@ type Driver struct {
 	ports []flasharray.Port
 
 	mu sync.Mutex // guards locks, mounts, names and known maps
+	// closing stops deferred teardowns once Shutdown has taken them over.
+	closing bool
 	// prefix is this array's serial prefix (string) once known; see arrayPrefix.
 	prefix atomic.Value
 	locks  map[string]*sync.Mutex
@@ -59,7 +61,13 @@ type Driver struct {
 type holdState struct {
 	hosts string
 	since time.Time
+	seen  time.Time // last time a Mount here found it held
 }
+
+// staleHold drops a hold record no Mount has refreshed for this long: Docker
+// retries a waiting Mount within seconds, so an older record is left from an
+// attempt that gave up, and reusing its start time would preempt at once.
+const staleHold = 2 * time.Minute
 
 type mountState struct {
 	dockerName string
@@ -67,6 +75,11 @@ type mountState struct {
 	dev        string
 	mountpoint string
 	refs       map[string]time.Time // Docker mount ID -> when it was added
+	// linger is the pending teardown after the last ref went (UnmountLinger);
+	// lingerGen tells a timer that was cancelled or replaced to stand down.
+	// Both are guarded by Driver.mu.
+	linger    *time.Timer
+	lingerGen int
 }
 
 // Deps lets tests inject fakes.
@@ -138,6 +151,7 @@ func (d *Driver) recoverMounts(ctx context.Context) {
 		d.log.Error("cannot scan mount root; existing mounts will not be recovered", "mount_root", d.cfg.MountRoot, "err", err)
 		return
 	}
+	recovered := map[string]*mountState{}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -157,8 +171,20 @@ func (d *Driver) recoverMounts(ctx context.Context) {
 			an = d.arrayName(e.Name())
 			d.log.Warn("tag lookup failed; recovering mount under its computed array name", "volume", e.Name(), "array_name", an, "err", err)
 		}
-		d.mounts[an] = &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]time.Time{}}
+		st := &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]time.Time{}}
+		d.mu.Lock()
+		d.mounts[an] = st
+		d.mu.Unlock()
+		recovered[an] = st
 		d.log.Info("recovered existing mount", "volume", e.Name(), "mountpoint", mp)
+	}
+	// Left behind when the plugin stopped during a linger, or kept by a
+	// container that is still running; the check at expiry tells them apart.
+	// Armed only now: each lookup above may wait on the array.
+	if d.cfg.UnmountLinger > 0 {
+		for an, st := range recovered {
+			d.scheduleTeardown(an, st)
+		}
 	}
 }
 
@@ -524,8 +550,21 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	}
 
 	d.mu.Lock()
-	_, mounted := d.mounts[an]
+	st, mounted := d.mounts[an]
 	d.mu.Unlock()
+	if mounted && len(st.refs) == 0 {
+		// A mount recovered at plugin start has no refs even while a running
+		// container owns it.
+		if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
+			return fmt.Errorf("volume %s is mounted on this node and a container may still use it", req.Name)
+		}
+		// Only lingering after its last container: release it now.
+		d.cancelTeardown(st)
+		if err := d.teardown(ctx, an, st, req.Name); err != nil {
+			return err
+		}
+		mounted = false
+	}
 	if mounted {
 		return fmt.Errorf("volume %s is mounted on this node", req.Name)
 	}
@@ -586,6 +625,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
 	if ok {
+		d.cancelTeardown(st)
 		st.refs[req.ID] = time.Now()
 		return &plugin.MountResponse{Mountpoint: st.mountpoint}, nil
 	}
@@ -861,11 +901,13 @@ func (d *Driver) markHeld(an string, others []string) time.Time {
 	hosts := strings.Join(slices.Sorted(slices.Values(others)), ",")
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	now := time.Now()
 	h, ok := d.heldSince[an]
-	if !ok || h.hosts != hosts {
-		h = holdState{hosts: hosts, since: time.Now()}
-		d.heldSince[an] = h
+	if !ok || h.hosts != hosts || now.Sub(h.seen) > staleHold {
+		h = holdState{hosts: hosts, since: now}
 	}
+	h.seen = now
+	d.heldSince[an] = h
 	return h.since
 }
 
@@ -959,6 +1001,23 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		return nil
 	}
 
+	if d.cfg.UnmountLinger > 0 {
+		// The umount that used to follow at once flushed the filesystem; a
+		// lingering one must not hold unwritten data while it waits.
+		if err := d.mnt.Sync(ctx, st.mountpoint); err != nil {
+			d.log.Warn("flushing the lingering volume failed; tearing down now", "volume", req.Name, "err", err)
+			return d.teardown(ctx, an, st, req.Name)
+		}
+		d.scheduleTeardown(an, st)
+		d.log.Info("last container let go; keeping the volume attached briefly in case it is mounted again", "volume", req.Name, "linger", d.cfg.UnmountLinger)
+		return nil
+	}
+	return d.teardown(ctx, an, st, req.Name)
+}
+
+// teardown unmounts an's filesystem, detaches it from this host and
+// disconnects it on the array. The caller holds an's lock.
+func (d *Driver) teardown(ctx context.Context, an string, st *mountState, dockerName string) error {
 	if err := d.mnt.Unmount(ctx, st.mountpoint); err != nil {
 		return err
 	}
@@ -973,7 +1032,7 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 			d.mu.Lock()
 			delete(d.mounts, an)
 			d.mu.Unlock()
-			return fmt.Errorf("volume %s unmounted but serial lookup failed, host devices and array connection left in place: %w", req.Name, err)
+			return fmt.Errorf("volume %s unmounted but serial lookup failed, host devices and array connection left in place: %w", dockerName, err)
 		}
 		serial = v.Serial
 	}
@@ -985,7 +1044,7 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		d.mu.Lock()
 		delete(d.mounts, an)
 		d.mu.Unlock()
-		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place", req.Name, err)
+		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place", dockerName, err)
 	}
 	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, st.dev)
 	if detachErr != nil {
@@ -994,7 +1053,7 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		d.mu.Lock()
 		delete(d.mounts, an)
 		d.mu.Unlock()
-		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", req.Name, detachErr)
+		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", dockerName, detachErr)
 	}
 	var errs []error
 	if disconnectErr != nil {
@@ -1006,8 +1065,106 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 	d.mu.Lock()
 	delete(d.mounts, an)
 	d.mu.Unlock()
-	d.log.Info("unmounted", "volume", req.Name)
+	d.log.Info("unmounted", "volume", dockerName)
 	return errors.Join(errs...)
+}
+
+// Docker mounts a volume, unmounts it and mounts it again within a second or
+// two when it populates a new container from its image. Tearing down and
+// re-attaching in between churned LUN numbers, and the paths left behind by
+// those quick cycles are what the LUN checks kept catching on staging (and,
+// once, a moment of I/O errors on a freshly mounted volume). So the last
+// Unmount only schedules the teardown.
+func (d *Driver) scheduleTeardown(an string, st *mountState) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st.linger != nil {
+		st.linger.Stop()
+	}
+	st.lingerGen++
+	gen := st.lingerGen
+	st.linger = time.AfterFunc(d.cfg.UnmountLinger, func() { d.lingerExpired(an, st, gen) })
+}
+
+func (d *Driver) cancelTeardown(st *mountState) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st.linger != nil {
+		st.linger.Stop()
+		st.linger = nil
+	}
+	st.lingerGen++
+}
+
+// lingerExpired tears an down if nothing mounted it again meanwhile, and only
+// if no container still has its filesystem (a mount recovered at plugin start
+// can belong to a running container; Docker's Unmount for it comes later).
+func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
+	unlock := d.lock(an)
+	defer unlock()
+	d.mu.Lock()
+	cur, ok := d.mounts[an]
+	current := !d.closing && ok && cur == st && st.lingerGen == gen && len(st.refs) == 0
+	if current {
+		st.linger = nil
+	}
+	d.mu.Unlock()
+	if !current {
+		return
+	}
+	// Left mounted with no refs and no timer, the volume would sit until
+	// another node preempts it; so a refused or failed teardown tries again.
+	if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
+		d.log.Warn("not tearing down yet: a container may still have the volume mounted", "volume", st.dockerName, "err", err)
+		d.scheduleTeardown(an, st)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
+	defer cancel()
+	if err := d.teardown(ctx, an, st, st.dockerName); err != nil {
+		d.log.Error("teardown after linger failed", "volume", st.dockerName, "err", err)
+		d.mu.Lock()
+		still := d.mounts[an] == st
+		d.mu.Unlock()
+		if still {
+			d.scheduleTeardown(an, st)
+		}
+	}
+}
+
+// Shutdown tears down volumes that are only lingering, waiting for any
+// teardown already running, so a plugin stopped right after a drain does not
+// leave them mounted and connected for another node to preempt. Mounts a
+// container may still use are left alone.
+func (d *Driver) Shutdown(ctx context.Context) {
+	d.mu.Lock()
+	d.closing = true
+	var idle []string
+	for an, st := range d.mounts {
+		if len(st.refs) == 0 {
+			idle = append(idle, an)
+		}
+	}
+	d.mu.Unlock()
+	for _, an := range idle {
+		if ctx.Err() != nil {
+			d.log.Warn("shutdown: out of time; lingering volumes left mounted", "err", ctx.Err())
+			return
+		}
+		unlock := d.lock(an) // waits for a teardown already running
+		d.mu.Lock()
+		st, ok := d.mounts[an]
+		d.mu.Unlock()
+		if ok && len(st.refs) == 0 {
+			d.cancelTeardown(st)
+			if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err == nil && !inUse {
+				if err := d.teardown(ctx, an, st, st.dockerName); err != nil {
+					d.log.Error("shutdown: teardown failed", "volume", st.dockerName, "err", err)
+				}
+			}
+		}
+		unlock()
+	}
 }
 
 // refPending is a variable so tests needn't wait.
