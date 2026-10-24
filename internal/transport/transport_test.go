@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
 )
 
 // CI runners and dev hosts may run a real multipathd; tests that want one
@@ -613,5 +616,48 @@ func TestSweepDropsMultipathdEntryWithWrongIdentity(t *testing.T) {
 	}
 	if !ran(*cmds, "multipathd del path sdc") || !ran(*cmds, "multipathd add path sdc") || ran(*cmds, "multipathd fail path sdc") {
 		t.Fatalf("want sdc's entry dropped and re-read, not failed: %v", *cmds)
+	}
+}
+
+func TestConnectLogsInAgainWhenSessionsAreGone(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	portal := ln.Addr().String()
+	const iqn = "iqn.2010-06.com.purestorage:flasharray.test"
+	sessions, logins := "", 0
+	old := runner
+	t.Cleanup(func() { runner = old })
+	runner = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		cmd := name + " " + strings.Join(args, " ")
+		switch {
+		case cmd == "iscsiadm -m session":
+			return sessions, nil
+		case strings.HasSuffix(cmd, "--login"):
+			logins++
+			sessions = "tcp: [1] " + portal + ",1 " + iqn + " (non-flash)"
+		}
+		return "", nil
+	}
+	tr := &iscsi{log: slog.Default()}
+	ports := []flasharray.Port{{IQN: iqn, Portal: portal}}
+	connect := func() {
+		t.Helper()
+		if err := tr.Connect(context.Background(), ports); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	connect()
+	connect()
+	if logins != 1 {
+		t.Fatalf("logins with the session up = %d, want 1", logins)
+	}
+	sessions = "" // the Pure plugin logged every session out
+	connect()
+	if logins != 2 {
+		t.Fatalf("logins after the session went away = %d, want 2", logins)
 	}
 }

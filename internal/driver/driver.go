@@ -36,7 +36,8 @@ type Driver struct {
 	mnt   mounter.Mounter
 	log   *slog.Logger
 
-	host  string // FlashArray host object name for this node
+	// host is this node's FlashArray host object name (string); see hostName.
+	host  atomic.Value
 	ports []flasharray.Port
 
 	mu sync.Mutex // guards locks, mounts, names and known maps
@@ -123,11 +124,12 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	drv.host, err = drv.array.EnsureHost(ctx, cfg.HostName, iqns, nqns)
+	host, err := drv.array.EnsureHost(ctx, cfg.HostName, iqns, nqns)
 	if err != nil {
 		return nil, fmt.Errorf("ensure host object: %w", err)
 	}
-	drv.log.Info("host object ready", "host", drv.host, "iqns", iqns, "nqns", nqns)
+	drv.host.Store(host)
+	drv.log.Info("host object ready", "host", host, "iqns", iqns, "nqns", nqns)
 
 	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
 		return nil, err
@@ -142,6 +144,28 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		}
 	}
 	return drv, nil
+}
+
+func (d *Driver) hostName() string {
+	s, _ := d.host.Load().(string)
+	return s
+}
+
+// reensureHost finds or recreates this node's host object after the array
+// stopped knowing it. The Pure plugin deletes its host object once its last
+// volume detaches, and when both plugins run on a node that object is ours too.
+func (d *Driver) reensureHost(ctx context.Context) error {
+	iqns, nqns, err := d.tr.InitiatorIDs()
+	if err != nil {
+		return err
+	}
+	host, err := d.array.EnsureHost(ctx, d.cfg.HostName, iqns, nqns)
+	if err != nil {
+		return fmt.Errorf("recreate host object: %w", err)
+	}
+	d.log.Warn("host object was gone from the array; found or recreated it", "host", host, "was", d.hostName())
+	d.host.Store(host)
+	return nil
 }
 
 // ensureConnected refreshes the port list and logs in to every eligible portal.
@@ -608,7 +632,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		return err
 	}
 	for _, c := range conns {
-		if c.Host != d.host {
+		if c.Host != d.hostName() {
 			return fmt.Errorf("volume %s is connected to host %s; unmount it there first", req.Name, c.Host)
 		}
 	}
@@ -756,7 +780,13 @@ func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string
 		// First clear paths on LUN numbers the array does not map here: the
 		// connect may hand one of them out, and until the sweep after it a
 		// leftover path there would reach the newly connected volume.
-		want, err := d.array.HostLUNs(ctx, d.host)
+		want, err := d.array.HostLUNs(ctx, d.hostName())
+		if flasharray.IsNotFound(err) {
+			if err := d.reensureHost(ctx); err != nil {
+				return fmt.Errorf("volume %s: %w", dockerName, err)
+			}
+			want, err = d.array.HostLUNs(ctx, d.hostName())
+		}
 		if err != nil {
 			return fmt.Errorf("volume %s: read this host's LUN map before attaching: %w", dockerName, err)
 		}
@@ -766,12 +796,12 @@ func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string
 			}
 			d.log.Warn("pre-attach sweep left stale paths", "volume", dockerName, "err", err)
 		}
-		lun, err = d.array.Connect(ctx, d.host, an)
+		lun, err = d.array.Connect(ctx, d.hostName(), an)
 		if err != nil {
-			return fmt.Errorf("connect %s to %s: %w", dockerName, d.host, err)
+			return fmt.Errorf("connect %s to %s: %w", dockerName, d.hostName(), err)
 		}
 		d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
-		want, err = d.array.HostLUNs(ctx, d.host)
+		want, err = d.array.HostLUNs(ctx, d.hostName())
 		if err == nil {
 			err = d.tr.Sweep(ctx, want, prefix, lun, false)
 		}
@@ -820,7 +850,7 @@ func (d *Driver) checkPaths(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, pathCheckInterval)
 	defer cancel()
 	err := d.tr.Exclusive(ctx, func() error {
-		want, err := d.array.HostLUNs(ctx, d.host)
+		want, err := d.array.HostLUNs(ctx, d.hostName())
 		if err != nil {
 			d.log.Warn("path check: cannot read this host's LUN map", "err", err)
 			return nil
@@ -854,7 +884,7 @@ func arrayPrefix(serial string) string {
 // the array's LUN map so paths whose LUN no longer carries the volume go
 // unflushed. The caller holds the transport's Exclusive lock.
 func (d *Driver) detachLocked(ctx context.Context, serial, dev string) error {
-	want, err := d.array.HostLUNs(ctx, d.host)
+	want, err := d.array.HostLUNs(ctx, d.hostName())
 	if err != nil {
 		d.log.Warn("cannot read this host's LUN map; detaching without checking paths against it", "serial", serial, "err", err)
 		want = nil
@@ -874,7 +904,7 @@ func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detac
 		if detachErr = d.detachLocked(ctx, serial, dev); detachErr != nil {
 			return nil
 		}
-		disconnectErr = d.array.Disconnect(ctx, d.host, an)
+		disconnectErr = d.array.Disconnect(ctx, d.hostName(), an)
 		return nil
 	}); err != nil {
 		detachErr = err
@@ -943,7 +973,7 @@ func (d *Driver) otherHosts(ctx context.Context, an string) ([]string, error) {
 	}
 	var out []string
 	for _, c := range conns {
-		if c.Host != d.host {
+		if c.Host != d.hostName() {
 			out = append(out, c.Host)
 		}
 	}
@@ -984,7 +1014,7 @@ func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial strin
 		return err
 	}
 	for _, c := range conns {
-		if c.Host == d.host {
+		if c.Host == d.hostName() {
 			return nil // still connected here: a running container may be using it
 		}
 	}
@@ -1031,8 +1061,8 @@ func (d *Driver) rollbackLocked(ctx context.Context, an, serial, dev string) {
 		d.log.Error("rollback: host detach failed; array connection left in place so its LUN is not reused under this host's paths", "array_name", an, "serial", serial, "err", err)
 		return
 	}
-	if err := d.array.Disconnect(ctx, d.host, an); err != nil {
-		d.log.Error("rollback: array disconnect failed; volume is still connected to this host", "array_name", an, "host", d.host, "err", err)
+	if err := d.array.Disconnect(ctx, d.hostName(), an); err != nil {
+		d.log.Error("rollback: array disconnect failed; volume is still connected to this host", "array_name", an, "host", d.hostName(), "err", err)
 	}
 	if err := d.tr.PostDisconnect(ctx); err != nil {
 		d.log.Warn("rollback: post-disconnect failed", "array_name", an, "err", err)

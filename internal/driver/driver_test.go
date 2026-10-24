@@ -240,6 +240,9 @@ func (f *fakeArray) Disconnect(_ context.Context, host, volume string) error {
 func (f *fakeArray) HostLUNs(_ context.Context, host string) (map[int]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := f.hosts[host]; !ok {
+		return nil, fmt.Errorf("GET /connections: %w (%s: Host does not exist.)", flasharray.ErrNotFound, host)
+	}
 	out := map[int]string{}
 	for vol, hosts := range f.conns {
 		if lun, ok := hosts[host]; ok {
@@ -1966,5 +1969,24 @@ func TestRollbackWaitsWithItsOwnBudget(t *testing.T) {
 	d.rollbackAttach(spent, an, fa.vols[an].Serial, "")
 	if fa.connected(an, "node1") {
 		t.Fatal("rollback skipped because the request's context had ended")
+	}
+}
+
+func TestMountRecreatesHostObjectTheArrayLost(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	fa.mu.Lock()
+	delete(fa.hosts, "node1") // the Pure plugin deleted it after its last detach
+	fa.mu.Unlock()
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fa.hosts["node1"]; !ok {
+		t.Fatal("host object not recreated")
+	}
+	if _, ok := fa.conns[d.arrayName("v")]["node1"]; !ok {
+		t.Fatal("volume not connected after recreating the host object")
 	}
 }

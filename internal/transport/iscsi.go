@@ -30,8 +30,7 @@ type iscsi struct {
 	allowed []*net.IPNet
 	log     *slog.Logger
 
-	mu       sync.Mutex
-	loggedIn map[string]bool // "iqn|portal"
+	mu sync.Mutex // serializes Connect
 
 	// scanMu makes rescans exclusive with Exclusive callers, which change
 	// what LUN numbers carry on this host.
@@ -82,11 +81,16 @@ func (t *iscsi) InitiatorIDs() ([]string, []string, error) {
 	return nil, nil, fmt.Errorf("%s has no InitiatorName", initiatorNameFile)
 }
 
+// Connect logs in to every eligible portal that has no session. It asks
+// iscsiadm each time instead of remembering its own logins: the Pure plugin
+// logs out every session on the host and deletes the node records whenever
+// its host object has no connections, and those sessions are shared.
 func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.loggedIn == nil {
-		t.loggedIn = map[string]bool{}
+	live, err := t.sessions(ctx)
+	if err != nil {
+		t.log.Warn("cannot list iSCSI sessions; logging in to every portal", "err", err)
 	}
 	var errs []error
 	n := 0
@@ -94,14 +98,10 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if p.IQN == "" || !portalAllowed(p.Portal, t.allowed) {
 			continue
 		}
-		key := p.IQN + "|" + p.Portal
-		if t.loggedIn[key] {
+		addr := portalAddr(p.Portal)
+		if live[p.IQN+"|"+addr] {
 			n++
 			continue
-		}
-		addr := p.Portal
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			addr = net.JoinHostPort(addr, "3260")
 		}
 		if err := probePortal(ctx, addr); err != nil {
 			errs = append(errs, err)
@@ -109,23 +109,22 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		}
 		// Create the node record (idempotent) and set manual startup so the
 		// host's iscsid does not race us at boot; the plugin owns these sessions.
-		if _, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "new"); err != nil {
+		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "new"); err != nil {
 			t.log.Debug("node record create", "portal", p.Portal, "err", err)
 		}
-		if _, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual"); err != nil {
+		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual"); err != nil {
 			t.log.Warn("set node.startup=manual failed; host iscsid may also log in at boot", "portal", p.Portal, "err", err)
 		}
 		// Ride out a controller failover or switch reload instead of failing I/O;
 		// set explicitly because a node record may carry a lower value.
-		if _, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.session.timeo.replacement_timeout", "-v", "120"); err != nil {
+		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.session.timeo.replacement_timeout", "-v", "120"); err != nil {
 			t.log.Warn("set replacement_timeout failed", "portal", p.Portal, "err", err)
 		}
-		_, err := run(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
+		_, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
 		if err != nil && exitCode(err) != iscsiadmExitSessionExists && !strings.Contains(err.Error(), "already present") {
 			errs = append(errs, err)
 			continue
 		}
-		t.loggedIn[key] = true
 		n++
 	}
 	if n == 0 {
@@ -138,6 +137,36 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		t.log.Warn("some iSCSI portals failed to log in", "ok", n, "failed", len(errs), "err", errors.Join(errs...))
 	}
 	return nil
+}
+
+// sessions returns the host's iSCSI sessions as "iqn|host:port" keys.
+func (t *iscsi) sessions(ctx context.Context) (map[string]bool, error) {
+	out, err := runTimeout(ctx, t.log, 10*time.Second, "iscsiadm", "-m", "session")
+	if exitCode(err) == iscsiadmExitNoObjects {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	live := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		// tcp: [3] 198.51.100.10:3260,1 iqn.2010-06.com.purestorage:flasharray.x (non-flash)
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		portal, _, _ := strings.Cut(f[2], ",")
+		live[f[3]+"|"+portalAddr(portal)] = true
+	}
+	return live, nil
+}
+
+// portalAddr gives a portal its default port so array and iscsiadm spellings compare equal.
+func portalAddr(portal string) string {
+	if _, _, err := net.SplitHostPort(portal); err != nil {
+		return net.JoinHostPort(portal, "3260")
+	}
+	return portal
 }
 
 func (t *iscsi) rescan(ctx context.Context) {
