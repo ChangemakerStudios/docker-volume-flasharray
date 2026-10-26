@@ -285,6 +285,8 @@ type fakeTransport struct {
 	lunErrAfter int
 	lunChecks   int
 	sweepErr    error // returned by Sweep
+	// loginGate, when set, refuses logins while it has no host "node1", as the array does.
+	loginGate *fakeArray
 }
 
 func (t *fakeTransport) dev(serial string) string {
@@ -313,6 +315,14 @@ func (t *fakeTransport) Connect(context.Context, []flasharray.Port) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.connects++
+	if t.loginGate != nil {
+		t.loginGate.mu.Lock()
+		_, ok := t.loginGate.hosts["node1"]
+		t.loginGate.mu.Unlock()
+		if !ok {
+			return errors.New("no iSCSI sessions established: iSCSI login failed due to authorization failure")
+		}
+	}
 	return nil
 }
 func (t *fakeTransport) WaitForDevice(_ context.Context, serial string) (string, error) {
@@ -459,6 +469,14 @@ func (m *fakeMounter) IsMounted(target string) (bool, error) {
 	defer m.mu.Unlock()
 	_, ok := m.mounted[target]
 	return ok, nil
+}
+func (m *fakeMounter) FilesystemMounted(target string) (bool, error) { return m.IsMounted(target) }
+
+// lose unmounts target the way another plugin's cleanup does, behind the driver's back.
+func (m *fakeMounter) lose(target string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.mounted, target)
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1973,7 +1991,8 @@ func TestRollbackWaitsWithItsOwnBudget(t *testing.T) {
 }
 
 func TestMountRecreatesHostObjectTheArrayLost(t *testing.T) {
-	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	fa, fm := newFakeArray(), newFakeMounter()
+	tr := &fakeTransport{loginGate: fa}
 	d := newTestDriver(t, fa, tr, fm)
 	_ = d.Create(&plugin.CreateRequest{Name: "v"})
 	fa.mu.Lock()
@@ -1989,4 +2008,56 @@ func TestMountRecreatesHostObjectTheArrayLost(t *testing.T) {
 	if _, ok := fa.conns[d.arrayName("v")]["node1"]; !ok {
 		t.Fatal("volume not connected after recreating the host object")
 	}
+}
+
+// The Pure plugin's attach unmounted a volume this driver had just mounted;
+// serving the cached mountpoint then gave containers an empty directory.
+func TestMountRemountsAFilesystemLostBehindItsBack(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm.lose(r.Mountpoint)
+
+	r2, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.Mountpoint != r.Mountpoint || !fm.isMounted(r2.Mountpoint) {
+		t.Fatal("the lost filesystem was not mounted again")
+	}
+	d.mu.Lock()
+	refs := len(d.mounts[d.arrayName("v")].refs)
+	d.mu.Unlock()
+	if refs != 1 {
+		t.Fatalf("refs = %d, want only the new mount's", refs)
+	}
+}
+
+// A lost filesystem leaves a bare directory that every container on the root
+// filesystem appears to use; the linger teardown must not wait on that forever.
+func TestLingerTearsDownALostFilesystem(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.UnmountLinger = 10 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm.lose(r.Mountpoint)
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = true
+	fm.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "lost filesystem not torn down", func() bool {
+		return tr.detachCount() == 1 && !fa.connected(an, "node1")
+	})
 }

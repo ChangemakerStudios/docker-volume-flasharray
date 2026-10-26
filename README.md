@@ -449,14 +449,18 @@ tag on the array, Docker's local record of which driver owns the name, and
    it cannot start. Use the Pure plugin's `PURE_DOCKER_NAMESPACE`
    (`docker plugin inspect pure --format '{{json .Settings.Env}}'`) as
    `FA_NAMESPACE`: the computed array names then equal Pure's, so Docker names
-   and tags line up. Both plugins can be installed side by side; don't use
-   one volume through both at once. Whenever its host object has no
-   connections, the Pure plugin logs out every iSCSI session on the node,
-   deletes the node records and, after its last detach, deletes the host
-   object; both plugins share those. This plugin checks the live sessions
-   and logs in again before each attach, and recreates the host object by
-   IQN when the array no longer knows it, but a mount that arrives while
-   Pure is tearing down can still fail once and be retried.
+   and tags line up. Both plugins can be installed side by side, but don't
+   run volumes of both on the same node at once: migrate everything in one
+   cutover (the steps below), not volume by volume. Each Pure attach reads
+   the host's connections from the array and, about a second later, flushes
+   and unmounts every FlashArray multipath map on the node that wasn't in
+   that list, so a volume this plugin connects in between is torn down right
+   after it mounted. This plugin then fails the container on a read-only
+   directory rather than letting it write to the node's root filesystem,
+   and mounts the volume again on the retry. Whenever its host object has no
+   connections, the Pure plugin also logs out every iSCSI session on the
+   node and, after its last detach, deletes the host object; this plugin
+   logs in again and recreates the host object by IQN when it next attaches.
 2. Snapshot the volumes on the array (instant, free insurance).
 3. Stop the stacks that use them.
 4. On **every** node: `docker plugin disable -f pure`, then for each volume

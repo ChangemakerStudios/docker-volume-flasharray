@@ -106,3 +106,33 @@ func TestInUseByContainer(t *testing.T) {
 		t.Fatalf("container namespace missed: used=%v err=%v", used, err)
 	}
 }
+
+func TestFilesystemMountedLooksPastTheGuard(t *testing.T) {
+	info := strings.Join([]string{
+		"22 1 0:21 / /proc rw,nosuid shared:12 - proc proc rw",
+		"300 29 0:90 / /mnt/flasharray/kept ro,relatime shared:149 - tmpfs " + guardSource + " ro,size=4k,mode=555",
+		"301 300 253:3 / /mnt/flasharray/kept rw,relatime shared:150 - xfs /dev/mapper/mpathb rw,attr2",
+		"302 29 0:91 / /mnt/flasharray/lost ro,relatime shared:151 - tmpfs " + guardSource + " ro,size=4k,mode=555",
+		"303 29 253:4 / /mnt/flasharray/old rw,relatime - xfs /dev/mapper/mpathc rw",
+	}, "\n") + "\n"
+	fixture := filepath.Join(t.TempDir(), "mountinfo")
+	if err := os.WriteFile(fixture, []byte(info), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := mountinfoPath
+	mountinfoPath = fixture
+	t.Cleanup(func() { mountinfoPath = old })
+
+	m := &execMounter{}
+	cases := map[string]bool{
+		"/mnt/flasharray/kept": true,  // filesystem over its guard
+		"/mnt/flasharray/lost": false, // only the guard is left
+		"/mnt/flasharray/old":  true,  // mounted before guards existed
+		"/mnt/flasharray/none": false,
+	}
+	for target, want := range cases {
+		if got, err := m.FilesystemMounted(target); err != nil || got != want {
+			t.Errorf("FilesystemMounted(%s) = %v, %v; want %v", target, got, err, want)
+		}
+	}
+}

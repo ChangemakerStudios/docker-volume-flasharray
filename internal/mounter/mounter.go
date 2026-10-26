@@ -28,10 +28,17 @@ type Mounter interface {
 	// allowFormat is set; otherwise it returns ErrNoFilesystem. Returns true
 	// if it formatted.
 	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error)
+	// Mount mounts dev on target over a read-only guard, so a container given
+	// target after the filesystem went away fails to write instead of writing
+	// to the host's root filesystem.
 	Mount(ctx context.Context, dev, target, fstype, opts string) error
+	// Unmount unmounts the filesystem at target and the guard under it.
 	Unmount(ctx context.Context, target string) error
 	// IsMounted reports whether target is a mountpoint per /proc/self/mountinfo.
 	IsMounted(target string) (bool, error)
+	// FilesystemMounted reports whether a filesystem, not just the guard, is
+	// mounted on target.
+	FilesystemMounted(target string) (bool, error)
 	// MountedAt returns a mountpoint where dev (after resolving symlinks) is
 	// mounted per /proc/self/mountinfo, or "".
 	MountedAt(dev string) (string, error)
@@ -93,9 +100,23 @@ func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, 
 	return true, nil
 }
 
+// guardSource names the read-only tmpfs under each mountpoint. Another
+// plugin's cleanup unmounted a volume right after this one mounted it, and the
+// container Docker started next wrote to the empty directory underneath.
+const guardSource = "flasharray-unmounted"
+
 func (m *execMounter) Mount(ctx context.Context, dev, target, fstype, opts string) error {
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return err
+	}
+	top, err := topMountSource(target)
+	if err != nil {
+		return err
+	}
+	if top != guardSource {
+		if b, err := hostexec.Command(ctx, "mount", "-t", "tmpfs", "-o", "ro,size=4k,mode=0555", guardSource, target).CombinedOutput(); err != nil {
+			return fmt.Errorf("mount guard on %s: %w: %s", target, err, strings.TrimSpace(string(b)))
+		}
 	}
 	args := []string{"-t", fstype}
 	if opts != "" {
@@ -103,19 +124,65 @@ func (m *execMounter) Mount(ctx context.Context, dev, target, fstype, opts strin
 	}
 	args = append(args, dev, target)
 	if b, err := hostexec.Command(ctx, "mount", args...).CombinedOutput(); err != nil {
+		if uerr := m.Unmount(context.WithoutCancel(ctx), target); uerr != nil {
+			m.log.Warn("removing the guard after a failed mount failed", "target", target, "err", uerr)
+		}
 		return fmt.Errorf("mount %s %s: %w: %s", dev, target, err, strings.TrimSpace(string(b)))
 	}
 	return nil
 }
 
 func (m *execMounter) Unmount(ctx context.Context, target string) error {
-	if b, err := hostexec.Command(ctx, "umount", target).CombinedOutput(); err != nil {
-		if strings.Contains(string(b), "not mounted") {
-			return nil
+	// The filesystem, then the guard; a third mount would not be ours.
+	for range 2 {
+		mounted, err := m.IsMounted(target)
+		if err != nil || !mounted {
+			return err
 		}
-		return fmt.Errorf("umount %s: %w: %s", target, err, strings.TrimSpace(string(b)))
+		if b, err := hostexec.Command(ctx, "umount", target).CombinedOutput(); err != nil {
+			if strings.Contains(string(b), "not mounted") {
+				return nil
+			}
+			return fmt.Errorf("umount %s: %w: %s", target, err, strings.TrimSpace(string(b)))
+		}
+	}
+	if mounted, err := m.IsMounted(target); err != nil || mounted {
+		return errors.Join(err, fmt.Errorf("umount %s: something else is still mounted there", target))
 	}
 	return nil
+}
+
+func (m *execMounter) FilesystemMounted(target string) (bool, error) {
+	src, err := topMountSource(target)
+	if err != nil {
+		return false, err
+	}
+	return src != "" && src != guardSource, nil
+}
+
+// topMountSource returns the source of the most recent mount on target (later
+// mountinfo lines stack on earlier ones), or "" when nothing is mounted there.
+func topMountSource(target string) (string, error) {
+	f, err := os.Open(mountinfoPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	var top string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 5 || unescape(fields[4]) != target {
+			continue
+		}
+		for i := 6; i+2 < len(fields); i++ {
+			if fields[i] == "-" {
+				top = unescape(fields[i+2])
+				break
+			}
+		}
+	}
+	return top, sc.Err()
 }
 
 func (m *execMounter) IsMounted(target string) (bool, error) {

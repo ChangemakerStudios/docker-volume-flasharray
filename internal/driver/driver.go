@@ -175,6 +175,18 @@ func (d *Driver) ensureConnected(ctx context.Context) error {
 		return fmt.Errorf("list array ports: %w", err)
 	}
 	d.ports = ports
+	err = d.tr.Connect(ctx, ports)
+	if err == nil {
+		return nil
+	}
+	// The array refuses logins from an initiator no host object lists, which is
+	// how the Pure plugin's cleanup leaves the node, so recreate it and retry.
+	if _, herr := d.array.HostLUNs(ctx, d.hostName()); !flasharray.IsNotFound(herr) {
+		return err
+	}
+	if herr := d.reensureHost(ctx); herr != nil {
+		return errors.Join(err, herr)
+	}
 	return d.tr.Connect(ctx, ports)
 }
 
@@ -192,12 +204,13 @@ func (d *Driver) recoverMounts(ctx context.Context) {
 			continue
 		}
 		mp := filepath.Join(d.cfg.MountRoot, e.Name())
-		ok, err := d.mnt.IsMounted(mp)
+		ok, err := d.mnt.FilesystemMounted(mp)
 		if err != nil {
 			d.log.Error("cannot check mount; not recovered", "mountpoint", mp, "err", err)
 			continue
 		}
 		if !ok {
+			// At most a guard whose filesystem went away; the next Mount mounts over it.
 			continue
 		}
 		// Through the tag, so an adopted volume is keyed by its real array name.
@@ -684,6 +697,10 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	d.mu.Lock()
 	st, ok := d.mounts[an]
 	d.mu.Unlock()
+	if ok && d.lostMount(st) {
+		d.forgetMount(an, st)
+		ok = false
+	}
 	if ok {
 		d.cancelKeep(an)
 		d.cancelTeardown(st)
@@ -764,6 +781,31 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	d.cancelKeep(an)
 	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "formatted", formatted)
 	return &plugin.MountResponse{Mountpoint: mp}, nil
+}
+
+// lostMount reports whether st's filesystem was unmounted behind this plugin's
+// back; the Pure plugin's attach does that to volumes it doesn't know about.
+func (d *Driver) lostMount(st *mountState) bool {
+	live, err := d.mnt.FilesystemMounted(st.mountpoint)
+	if err != nil {
+		d.log.Warn("cannot check whether the volume is still mounted; assuming it is", "volume", st.dockerName, "err", err)
+		return false
+	}
+	if !live {
+		d.log.Error("volume's filesystem was unmounted outside this plugin; containers still holding it see an empty read-only directory", "volume", st.dockerName, "mountpoint", st.mountpoint, "refs", len(st.refs))
+	}
+	return !live
+}
+
+// forgetMount drops the state of a mount that is gone, so the next Mount
+// attaches afresh. The caller holds an's lock.
+func (d *Driver) forgetMount(an string, st *mountState) {
+	d.cancelTeardown(st)
+	d.mu.Lock()
+	if d.mounts[an] == st {
+		delete(d.mounts, an)
+	}
+	d.mu.Unlock()
 }
 
 // connectSwept connects an to this host, then deletes this array's host paths
@@ -851,6 +893,11 @@ func (d *Driver) checkPaths(ctx context.Context) {
 	defer cancel()
 	err := d.tr.Exclusive(ctx, func() error {
 		want, err := d.array.HostLUNs(ctx, d.hostName())
+		if flasharray.IsNotFound(err) {
+			// No host object means nothing is connected here; the next mount recreates it.
+			d.log.Debug("path check: host object is gone from the array", "host", d.hostName())
+			return nil
+		}
 		if err != nil {
 			d.log.Warn("path check: cannot read this host's LUN map", "err", err)
 			return nil
@@ -1290,7 +1337,11 @@ func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
 	}
 	// Left mounted with no refs and no timer, the volume would sit until
 	// another node preempts it; so a refused or failed teardown tries again.
-	if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
+	// A lost filesystem has nothing a container could hold, and the bare
+	// directory would match every container on the root filesystem.
+	if lost := d.lostMount(st); lost {
+		d.log.Info("tearing down a volume whose filesystem was unmounted outside this plugin", "volume", st.dockerName)
+	} else if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
 		d.log.Warn("not tearing down yet: a container may still have the volume mounted", "volume", st.dockerName, "err", err)
 		d.scheduleTeardown(an, st)
 		return
