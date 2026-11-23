@@ -212,3 +212,44 @@ func TestNotFoundOnlyFromArrayJSON400(t *testing.T) {
 		})
 	}
 }
+
+// A node that has served volumes starts while the array is down; the version
+// is then settled by the first request that gets through.
+func TestLazyVersionIsNegotiatedOnFirstUse(t *testing.T) {
+	var up atomic.Bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case !up.Load():
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case r.URL.Path == "/api/api_version":
+			_, _ = w.Write([]byte(`{"version":["2.4","2.26"]}`))
+		case r.URL.Path == "/api/2.26/login":
+			w.Header().Set("x-auth-token", "tok")
+		case r.URL.Path == "/api/2.26/volumes":
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	opts := Options{Endpoint: srv.URL, APIToken: "t", InsecureSkipVerify: true}
+	if _, err := New(context.Background(), opts); err == nil {
+		t.Fatal("New must fail on an unreachable array unless told it may start without it")
+	}
+	opts.LazyVersion = true
+	c, err := New(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.retryBase = 0
+	if err := c.do(context.Background(), http.MethodGet, "/volumes", nil, nil, nil); err == nil {
+		t.Fatal("request succeeded against an array that is down")
+	}
+	up.Store(true)
+	if err := c.do(context.Background(), http.MethodGet, "/volumes", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if c.Version() != "2.26" {
+		t.Fatalf("version = %q", c.Version())
+	}
+}

@@ -386,6 +386,13 @@ things prevent it:
   it never bypasses this fallback. A volume this node has never seen is still
   an error.
 
+- **A node that has served volumes starts without the array.** Once that file
+  has entries, a plugin restart or node reboot during an outage still brings
+  the driver up: `Get` and `List` answer from the file, every other call
+  fails until the array is back, and the host object is looked up then. A
+  first start has nothing to answer from and still fails, so a wrong endpoint
+  or token shows at once.
+
 ## Settings
 
 Set at install time or with `docker plugin set flasharray KEY=value` (plugin

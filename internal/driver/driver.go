@@ -37,7 +37,8 @@ type Driver struct {
 	log   *slog.Logger
 
 	// host is this node's FlashArray host object name (string); see hostName.
-	host atomic.Value
+	host   atomic.Value
+	hostMu sync.Mutex // serializes requireHost
 
 	mu sync.Mutex // guards locks, mounts, names and known maps
 	// closing stops deferred teardowns once Shutdown has taken them over.
@@ -119,24 +120,33 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 		heldSince: map[string]holdState{},
 		pending:   map[string]*pendingAttach{},
 	}
-	iqns, nqns, err := drv.tr.InitiatorIDs()
-	if err != nil {
+	if _, _, err := drv.tr.InitiatorIDs(); err != nil {
 		return nil, err
 	}
-	host, err := drv.array.EnsureHost(ctx, cfg.HostName, iqns, nqns)
-	if err != nil {
-		return nil, fmt.Errorf("ensure host object: %w", err)
-	}
-	drv.host.Store(host)
-	drv.log.Info("host object ready", "host", host, "iqns", iqns, "nqns", nqns)
-
 	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
 		return nil, err
 	}
 	drv.loadKnown()
-	drv.recoverMounts(ctx)
 
-	if cfg.ConnectOnStart {
+	// A node that has served volumes must come up without the array: with no
+	// driver to answer Get, Docker substitutes local volumes for every one of
+	// them. A first start still fails here, where a wrong endpoint or token
+	// is most likely.
+	hctx, hcancel := ctx, context.CancelFunc(func() {})
+	if drv.hasKnown() {
+		hctx, hcancel = context.WithTimeout(ctx, startArrayWait)
+	}
+	err := drv.requireHost(hctx)
+	hcancel()
+	if err != nil {
+		if !drv.hasKnown() {
+			return nil, err
+		}
+		drv.log.Error("array unreachable at start; answering Get and List from known volumes, everything else fails until it is back", "err", err)
+	}
+	drv.recoverMounts(ctx, err != nil)
+
+	if cfg.ConnectOnStart && err == nil {
 		if err := drv.ensureConnected(ctx); err != nil {
 			// Not fatal: the array may be unreachable at boot; we retry on first mount.
 			drv.log.Warn("initial transport connect failed; will retry on first mount", "err", err)
@@ -145,9 +155,44 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	return drv, nil
 }
 
+// startArrayWait bounds the wait for the array at start when the plugin can
+// come up without it. A variable so tests needn't wait.
+var startArrayWait = 20 * time.Second
+
 func (d *Driver) hostName() string {
 	s, _ := d.host.Load().(string)
 	return s
+}
+
+func (d *Driver) hasKnown() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.known) > 0
+}
+
+// requireHost finds or creates this node's host object unless that is done.
+// It is done at start, except when the array could not be reached then; every
+// path that names the host to the array comes through here first.
+func (d *Driver) requireHost(ctx context.Context) error {
+	if d.hostName() != "" {
+		return nil
+	}
+	d.hostMu.Lock()
+	defer d.hostMu.Unlock()
+	if d.hostName() != "" {
+		return nil
+	}
+	iqns, nqns, err := d.tr.InitiatorIDs()
+	if err != nil {
+		return err
+	}
+	host, err := d.array.EnsureHost(ctx, d.cfg.HostName, iqns, nqns)
+	if err != nil {
+		return fmt.Errorf("ensure host object: %w", err)
+	}
+	d.host.Store(host)
+	d.log.Info("host object ready", "host", host, "iqns", iqns, "nqns", nqns)
+	return nil
 }
 
 // reensureHost finds or recreates this node's host object after the array
@@ -169,6 +214,9 @@ func (d *Driver) reensureHost(ctx context.Context) error {
 
 // ensureConnected refreshes the port list and logs in to every eligible portal.
 func (d *Driver) ensureConnected(ctx context.Context) error {
+	if err := d.requireHost(ctx); err != nil {
+		return err
+	}
 	ports, err := d.array.Ports(ctx)
 	if err != nil {
 		return fmt.Errorf("list array ports: %w", err)
@@ -190,7 +238,8 @@ func (d *Driver) ensureConnected(ctx context.Context) error {
 
 // recoverMounts rebuilds in-memory state for volumes still mounted from a
 // previous plugin process (plugin upgrade/restart with running containers).
-func (d *Driver) recoverMounts(ctx context.Context) {
+// offline skips the array, which start just found unreachable.
+func (d *Driver) recoverMounts(ctx context.Context, offline bool) {
 	entries, err := os.ReadDir(d.cfg.MountRoot)
 	if err != nil {
 		d.log.Error("cannot scan mount root; existing mounts will not be recovered", "mount_root", d.cfg.MountRoot, "err", err)
@@ -212,10 +261,18 @@ func (d *Driver) recoverMounts(ctx context.Context) {
 			continue
 		}
 		// Through the tag, so an adopted volume is keyed by its real array name.
-		an, _, err := d.resolve(ctx, e.Name())
+		an, err := "", errors.New("array unreachable at start")
+		if !offline {
+			an, _, err = d.resolve(ctx, e.Name())
+		}
 		if err != nil {
-			an = d.arrayName(e.Name())
-			d.log.Warn("tag lookup failed; recovering mount under its computed array name", "volume", e.Name(), "array_name", an, "err", err)
+			d.mu.Lock()
+			an = d.known[e.Name()]
+			d.mu.Unlock()
+			if an == "" {
+				an = d.arrayName(e.Name())
+			}
+			d.log.Warn("tag lookup failed; recovering mount under its last known or computed array name", "volume", e.Name(), "array_name", an, "err", err)
 		}
 		st := &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]time.Time{}}
 		d.mu.Lock()
@@ -710,6 +767,9 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 	if mounted {
 		return fmt.Errorf("volume %s is mounted on this node", req.Name)
 	}
+	if err := d.requireHost(ctx); err != nil {
+		return err
+	}
 	conns, err := d.array.ListConnections(ctx, an)
 	if err != nil && !flasharray.IsNotFound(err) {
 		return err
@@ -974,6 +1034,12 @@ func (d *Driver) RunPathCheck(ctx context.Context) {
 func (d *Driver) checkPaths(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, pathCheckInterval)
 	defer cancel()
+	// Also what brings the host object back once an array that was
+	// unreachable at start answers again.
+	if err := d.requireHost(ctx); err != nil {
+		d.log.Warn("path check skipped: no host object yet", "err", err)
+		return
+	}
 	err := d.tr.Exclusive(ctx, func() error {
 		want, err := d.array.HostLUNs(ctx, d.hostName())
 		if flasharray.IsNotFound(err) {
@@ -1030,6 +1096,9 @@ func (d *Driver) detachLocked(ctx context.Context, serial, dev string) error {
 func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detachErr, disconnectErr error) {
 	ctx, cancel := cleanupCtx(ctx)
 	defer cancel()
+	if err := d.requireHost(ctx); err != nil {
+		return err, nil
+	}
 	if err := d.tr.Exclusive(ctx, func() error {
 		if detachErr = d.detachLocked(ctx, serial, dev); detachErr != nil {
 			return nil

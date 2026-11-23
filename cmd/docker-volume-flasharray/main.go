@@ -66,6 +66,8 @@ func run() error {
 		APIVersion:         cfg.Array.APIVersion,
 		InsecureSkipVerify: cfg.Array.InsecureSkipVerify,
 		Logger:             log,
+		// See driver.New: a node that has served volumes starts without the array.
+		LazyVersion: driver.HasKnownVolumes(cfg.MountRoot),
 	})
 	if err != nil {
 		return fmt.Errorf("flasharray client: %w", err)

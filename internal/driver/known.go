@@ -23,6 +23,17 @@ const knownFile = ".dvfa-known.json"
 
 func (d *Driver) knownPath() string { return filepath.Join(d.cfg.MountRoot, knownFile) }
 
+// HasKnownVolumes reports whether a plugin has served volumes from mountRoot
+// before, which is when it must be able to start without the array.
+func HasKnownVolumes(mountRoot string) bool {
+	b, err := os.ReadFile(filepath.Join(mountRoot, knownFile))
+	if err != nil {
+		return false
+	}
+	var m map[string]string
+	return json.Unmarshal(b, &m) == nil && len(m) > 0
+}
+
 func (d *Driver) loadKnown() {
 	b, err := os.ReadFile(d.knownPath())
 	if err != nil {

@@ -30,6 +30,7 @@ type fakeArray struct {
 	down      error                        // array unreachable: returned by every read
 	hang      bool                         // reads answer only once the caller gives up
 	tagErr    error                        // returned by SetNameTag
+	hostErr   error                        // returned by EnsureHost
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
 	// connectHook runs, with mu held, right after a new connection is made.
@@ -237,6 +238,9 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 func (f *fakeArray) EnsureHost(_ context.Context, name string, iqns, nqns []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hostErr != nil {
+		return "", f.hostErr
+	}
 	f.hosts[name] = append(iqns, nqns...)
 	return name, nil
 }
@@ -2281,4 +2285,55 @@ func TestFailedUnmountIsRetried(t *testing.T) {
 	fm.umountErr = nil
 	fm.mu.Unlock()
 	eventually(t, "failed umount never retried", func() bool { return !fa.connected(an, "node1") })
+}
+
+// With no driver to answer Get, Docker substitutes local volumes; so a node
+// that has served volumes starts even when the array cannot be reached.
+func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(r.Mountpoint, 0o755); err != nil { // the fake mounter doesn't create it
+		t.Fatal(err)
+	}
+
+	outage := errors.New("dial tcp: i/o timeout")
+	fa.mu.Lock()
+	fa.hostErr, fa.down = outage, outage
+	fa.mu.Unlock()
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatalf("restart during an outage: %v", err)
+	}
+	if g, err := d2.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Mountpoint == "" {
+		t.Fatalf("Get after an offline start = %+v, %v", g, err)
+	}
+	if _, err := d2.Mount(&plugin.MountRequest{Name: "w", ID: "c"}); err == nil {
+		t.Fatal("mounted without the array")
+	}
+
+	// The array is back: the host object is found on first need.
+	fa.mu.Lock()
+	fa.hostErr, fa.down = nil, nil
+	fa.mu.Unlock()
+	if err := d2.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.connected(an, "node1") {
+		t.Fatal("volume recovered at an offline start was not released")
+	}
+
+	// A first start has nothing to answer from, and fails where a wrong
+	// endpoint or token is most likely.
+	fresh := *d.cfg
+	fresh.MountRoot = t.TempDir()
+	fa.hostErr = outage
+	if _, err := New(context.Background(), &fresh, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()}); err == nil {
+		t.Fatal("first start without the array must fail")
+	}
 }
