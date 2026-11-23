@@ -235,7 +235,8 @@ another host object) whose LUN and cached WWID disagree,
 without flushing it: its buffers belong to a volume it no longer reaches. A
 map whose every path is stale has queueing switched off first, so whatever
 holds it gets I/O errors instead of hanging, and is then removed. Connects,
-detach-then-disconnect and every rescan hold one host-wide lock, so no rescan
+detach-then-disconnect, iSCSI logins (which scan the new session's LUNs) and
+every rescan hold one host-wide lock, so no rescan
 can rebuild a volume's paths between its detach and its disconnect. Detach
 itself deletes, unflushed, any path whose LUN no longer carries the volume.
 A mount checks every path of its device sits on the LUN the array assigned,

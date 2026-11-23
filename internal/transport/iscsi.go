@@ -120,7 +120,11 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.session.timeo.replacement_timeout", "-v", "120"); err != nil {
 			t.log.Warn("set replacement_timeout failed", "portal", p.Portal, "err", err)
 		}
-		_, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
+		// A login scans the new session's LUNs, so it waits its turn like any rescan.
+		err := t.Exclusive(ctx, func() error {
+			_, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
+			return err
+		})
 		if err != nil && exitCode(err) != iscsiadmExitSessionExists && !strings.Contains(err.Error(), "already present") {
 			errs = append(errs, err)
 			continue
