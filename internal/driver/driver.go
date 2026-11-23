@@ -543,6 +543,19 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer func() { unlock() }() // unlock is swapped when a destroyed volume forces a new array name
 
+	if errors.Is(err, errClaimed) {
+		// A destroyed volume keeps its tags, and the array still answers for
+		// them: one under the computed name that is tagged for another Docker
+		// volume (a clone destroyed before it got its own tag, or an import
+		// removed since) is in the way like any destroyed volume, not a claim.
+		cn := d.arrayName(req.Name)
+		if dv, gerr := d.array.GetVolume(ctx, cn); gerr == nil && dv.Destroyed {
+			if unlock, err = d.lockCtx(ctx, cn); err != nil {
+				return err
+			}
+			an, v = cn, dv
+		}
+	}
 	if err == nil && !v.Destroyed {
 		// Found by its computed name, it may be one an earlier Create could
 		// not tag; untagged it is missing from List on every node.
@@ -586,14 +599,22 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
 		v = ev
 	}
-	if err := d.claim(ctx, an, req.Name); err != nil {
+	if created {
+		// The array copies tags with a volume, so a clone arrives tagged as its
+		// source and claim would refuse it; a volume this call made is ours.
+		err = d.array.SetNameTag(ctx, an, d.tagValue(req.Name))
+	} else {
+		err = d.claim(ctx, an, req.Name)
+	}
+	if err != nil {
 		// Untagged, the volume is missing from List, and under a fresh array
-		// name no node can find it at all: each would create its own.
+		// name no node can find it at all: each would create its own. A clone
+		// left with its source's tag makes lookups of the source ambiguous.
 		if created {
 			cctx, cancel := cleanupCtx(ctx)
 			defer cancel()
 			if derr := d.array.DestroyVolume(cctx, an, d.cfg.EradicateOnRemove); derr != nil {
-				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array untagged", "volume", req.Name, "array_name", an, "err", derr)
+				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array without its own name tag", "volume", req.Name, "array_name", an, "source", source, "err", derr)
 			}
 		}
 		return fmt.Errorf("create volume %s: tag %s: %w", req.Name, an, err)

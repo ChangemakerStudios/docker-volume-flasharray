@@ -95,6 +95,16 @@ func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flashar
 	}
 	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now()}
 	f.vols[name] = v
+	// The array copies a volume's tags with it, dvfa:name included.
+	if t, ok := f.tags[source]; ok {
+		f.tags[name] = t
+	}
+	for k, t := range f.extra[source] {
+		if f.extra[name] == nil {
+			f.extra[name] = map[string]string{}
+		}
+		f.extra[name][k] = t
+	}
 	return v, nil
 }
 
@@ -1398,8 +1408,12 @@ func TestCloneFromSource(t *testing.T) {
 	if c == nil || c.Provisioned != 10<<30 {
 		t.Fatalf("clone = %+v", c)
 	}
+	// The array hands the clone its source's tag; it must end up with its own.
 	if fa.tags[an] != "node1/pg_copy" {
 		t.Fatalf("name tag = %q", fa.tags[an])
+	}
+	if src := fa.tags[d.arrayName("pg")]; src != "node1/pg" {
+		t.Fatalf("source's name tag = %q", src)
 	}
 	// The clone carries its source's filesystem UUID; nouuid mounts both side by side.
 	for _, name := range []string{"pg", "pg_copy"} {
@@ -1410,6 +1424,37 @@ func TestCloneFromSource(t *testing.T) {
 		if fm.opts[r.Mountpoint] != "nouuid" {
 			t.Fatalf("%s opts = %q, want nouuid", name, fm.opts[r.Mountpoint])
 		}
+	}
+}
+
+// A clone destroyed before it got its own tag stays under the computed name,
+// tagged as its source, until the array eradicates it. Seen on hardware: every
+// retry of the clone was refused as another volume's.
+func TestCloneRetryPastADestroyedCopy(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "pg", Options: map[string]string{"size": "10GiB"}}); err != nil {
+		t.Fatal(err)
+	}
+	clone := &plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}
+	fa.tagErr = errors.New("HTTP 503")
+	if err := d.Create(clone); err == nil {
+		t.Fatal("create reported a clone it could not tag")
+	}
+	left := d.arrayName("pg_copy")
+	if v := fa.vols[left]; v == nil || !v.Destroyed || fa.tags[left] != "node1/pg" {
+		t.Fatalf("want the failed clone destroyed and still tagged as its source: %+v, tag %q", v, fa.tags[left])
+	}
+	fa.tagErr = nil
+	if err := d.Create(clone); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	an, err := fa.LookupNameTag(context.Background(), "node1/pg_copy")
+	if err != nil || an == left || fa.vols[an] == nil || fa.vols[an].Destroyed {
+		t.Fatalf("retry left no live clone beside the destroyed one: %q, %v", an, err)
+	}
+	if src, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || src != d.arrayName("pg") {
+		t.Fatalf("source no longer resolves to itself: %q, %v", src, err)
 	}
 }
 
