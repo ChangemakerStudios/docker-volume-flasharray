@@ -1649,24 +1649,20 @@ func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
 func (d *Driver) Shutdown(ctx context.Context) {
 	d.mu.Lock()
 	d.closing = true
-	var idle []string
-	for an, st := range d.mounts {
-		if len(st.refs) == 0 {
-			idle = append(idle, an)
-		}
-	}
+	// Which are idle is only known under each volume's lock, which guards refs.
+	mounted := slices.Collect(maps.Keys(d.mounts))
 	kept := len(d.pending)
 	d.mu.Unlock()
 	if kept > 0 {
 		// Releasing waits on multipathd, which can take longer than shutdown has.
 		d.log.Warn("shutdown: attachments kept for a retry stay connected; the next mount here reuses them, another node preempts them", "count", kept)
 	}
-	for _, an := range idle {
-		if ctx.Err() != nil {
-			d.log.Warn("shutdown: out of time; lingering volumes left mounted", "err", ctx.Err())
+	for _, an := range mounted {
+		unlock, err := d.lockCtx(ctx, an) // waits for a teardown already running
+		if err != nil {
+			d.log.Warn("shutdown: out of time; lingering volumes left mounted", "err", err)
 			return
 		}
-		unlock := d.lock(an) // waits for a teardown already running
 		d.mu.Lock()
 		st, ok := d.mounts[an]
 		d.mu.Unlock()
