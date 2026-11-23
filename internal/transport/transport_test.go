@@ -702,3 +702,77 @@ func TestConnectLogsInAgainWhenSessionsAreGone(t *testing.T) {
 		t.Fatalf("logins after the session went away = %d, want 2", logins)
 	}
 }
+
+// fakeNVMe builds sys/<node> with the identity files a namespace node has.
+func fakeNVMe(t *testing.T, root, node string, files map[string]string) {
+	t.Helper()
+	dir := filepath.Join(root, "sys", node)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range files {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The serial is split around Pure's OUI inside the NGUID, and the per-path
+// nodes of native multipath carry the same identity without a /dev node.
+func TestNVMeDeviceMatching(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const serial = "6FEF9AB1157343EC000000AA"
+	const nguid = "006fef9ab1157343" + "24a937" + "ec000000aa"
+	if got := nvmeNGUID(serial); got != nguid {
+		t.Fatalf("nguid = %s, want %s", got, nguid)
+	}
+	fakeNVMe(t, root, "nvme0c0n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0c1n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0n1p1", nil)
+	fakeNVMe(t, root, "nvme0n2", map[string]string{"wwid": "eui.006fef9ab115734324a937ec000000bb"})
+
+	tr := &nvmeTCP{log: slog.Default()}
+	if got := tr.FindDevice(context.Background(), serial); got != "/dev/nvme0n1" {
+		t.Fatalf("device = %q, want the head node /dev/nvme0n1", got)
+	}
+	if got := tr.FindDevice(context.Background(), "6fef9ab1157343ec000000cc"); got != "" {
+		t.Fatalf("matched %q for a volume that is not attached", got)
+	}
+
+	// A namespace that also reports a UUID puts that in wwid; nguid still has it.
+	fakeNVMe(t, root, "nvme1n1", map[string]string{
+		"wwid":  "uuid.4a1b2c3d-0000-4000-8000-000000000001",
+		"nguid": "006fef9a-b115-7343-24a9-37ec000000dd",
+	})
+	if got := tr.FindDevice(context.Background(), "6fef9ab1157343ec000000dd"); got != "/dev/nvme1n1" {
+		t.Fatalf("device by nguid file = %q", got)
+	}
+}
+
+func TestLiveControllers(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassNVMe
+	sysClassNVMe = root
+	t.Cleanup(func() { sysClassNVMe = old })
+	dir := filepath.Join(root, "nvme3")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range map[string]string{
+		"subsysnqn": "nqn.2010-06.com.purestorage:flasharray.test\n",
+		"address":   "traddr=198.51.100.10,trsvcid=4420,src_addr=198.51.100.20\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := liveControllers()
+	if !live["nqn.2010-06.com.purestorage:flasharray.test|198.51.100.10:4420"] || len(live) != 1 {
+		t.Fatalf("live = %v", live)
+	}
+}

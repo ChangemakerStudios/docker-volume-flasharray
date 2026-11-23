@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,13 +30,16 @@ type nvmeTCP struct {
 	log     *slog.Logger
 
 	mu        sync.Mutex
-	connected map[string]bool // "nqn|portal"
+	connected map[string]bool // "nqn|host:port"
 	nqns      map[string]bool // subsystem NQNs we connected to
 
 	excl ctxlock.Mutex // see Exclusive
 }
 
 const hostNQNFile = "/etc/nvme/hostnqn"
+
+// sysClassNVMe is a variable so tests can point it at a fake sysfs.
+var sysClassNVMe = "/sys/class/nvme"
 
 func (t *nvmeTCP) Name() string { return "nvme-tcp" }
 
@@ -58,20 +62,22 @@ func (t *nvmeTCP) Connect(ctx context.Context, ports []flasharray.Port) error {
 		t.connected = map[string]bool{}
 		t.nqns = map[string]bool{}
 	}
+	// A controller removed behind the plugin (nvme disconnect) is connected again.
+	live := liveControllers()
 	var errs []error
 	n := 0
 	for _, p := range ports {
 		if p.NQN == "" || !portalAllowed(p.Portal, t.allowed) {
 			continue
 		}
-		key := p.NQN + "|" + p.Portal
-		if t.connected[key] {
-			n++
-			continue
-		}
 		host, port, err := net.SplitHostPort(p.Portal)
 		if err != nil {
 			host, port = p.Portal, "4420"
+		}
+		key := p.NQN + "|" + net.JoinHostPort(host, port)
+		if t.connected[key] && live[key] {
+			n++
+			continue
 		}
 		if err := probePortal(ctx, net.JoinHostPort(host, port)); err != nil {
 			errs = append(errs, err)
@@ -107,7 +113,7 @@ func (t *nvmeTCP) controllers() []string {
 		nqns[k] = v
 	}
 	t.mu.Unlock()
-	matches, _ := filepath.Glob("/sys/class/nvme/nvme*")
+	matches, _ := filepath.Glob(filepath.Join(sysClassNVMe, "nvme*"))
 	var out []string
 	for _, m := range matches {
 		b, err := os.ReadFile(filepath.Join(m, "subsysnqn"))
@@ -129,26 +135,95 @@ func (t *nvmeTCP) rescan(ctx context.Context) {
 	}
 }
 
+// liveControllers returns the kernel's NVMe controllers as "nqn|host:port" keys.
+func liveControllers() map[string]bool {
+	out := map[string]bool{}
+	matches, _ := filepath.Glob(filepath.Join(sysClassNVMe, "nvme*"))
+	for _, m := range matches {
+		nqn, err := os.ReadFile(filepath.Join(m, "subsysnqn"))
+		if err != nil {
+			continue
+		}
+		addr, err := os.ReadFile(filepath.Join(m, "address"))
+		if err != nil {
+			continue
+		}
+		// traddr=198.51.100.10,trsvcid=4420,src_addr=198.51.100.20
+		var host, port string
+		for _, kv := range strings.Split(strings.TrimSpace(string(addr)), ",") {
+			switch k, v, _ := strings.Cut(kv, "="); k {
+			case "traddr":
+				host = v
+			case "trsvcid":
+				port = v
+			}
+		}
+		if host != "" && port != "" {
+			out[strings.TrimSpace(string(nqn))+"|"+net.JoinHostPort(host, port)] = true
+		}
+	}
+	return out
+}
+
+// nvmeNGUID is the namespace ID FlashArray gives a volume: a zero octet, the
+// first 7 octets of the serial, Pure's OUI, then the last 5. The serial is
+// therefore never one run of digits in the kernel's wwid. Taken from the
+// OpenStack Cinder Pure driver; not yet verified on an array.
+func nvmeNGUID(serial string) string {
+	s := strings.ToLower(serial)
+	if len(s) != 24 {
+		return ""
+	}
+	return "00" + s[:14] + "24a937" + s[14:]
+}
+
+// nvmeHead matches a namespace's head node. A glob for it also takes
+// partitions and, under native multipath, the per-path nodes nvmeXcYnZ, which
+// carry the same identity and have no /dev node.
+var nvmeHead = regexp.MustCompile(`^nvme\d+n\d+$`)
+
+// nvmeDevices returns the head nodes of the namespace carrying serial.
+func nvmeDevices(serial string) []string {
+	nguid := nvmeNGUID(serial)
+	if nguid == "" {
+		return nil
+	}
+	matches, _ := filepath.Glob(filepath.Join(sysClassBlock, "nvme*n*"))
+	var out []string
+	for _, m := range matches {
+		if !nvmeHead.MatchString(filepath.Base(m)) {
+			continue
+		}
+		// wwid is "eui.<nguid>" unless the namespace also reports a UUID; the
+		// nguid file always has it, printed like a UUID.
+		for _, f := range []string{"wwid", "nguid"} {
+			b, err := readFileTimeout(filepath.Join(m, f), 3*time.Second)
+			if err != nil {
+				continue
+			}
+			id := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(string(b))), "-", "")
+			if strings.TrimPrefix(id, "eui.") == nguid {
+				out = append(out, filepath.Base(m))
+				break
+			}
+		}
+	}
+	return out
+}
+
 func (t *nvmeTCP) FindDevice(_ context.Context, serial string) string {
-	if devs := sysBlockMatching("nvme*n*", serial); len(devs) > 0 {
+	if devs := nvmeDevices(serial); len(devs) > 0 {
 		return "/dev/" + devs[0]
 	}
 	return ""
 }
 
-// WaitForDevice matches the namespace by the volume serial embedded in its
-// NGUID/EUI-64 (FlashArray derives both from the volume serial). The match is
-// a case-insensitive substring test against the kernel wwid, which is robust
-// to the exact encoding the array uses.
 func (t *nvmeTCP) WaitForDevice(ctx context.Context, serial string) (string, error) {
 	t.rescan(ctx)
 	start := time.Now()
 	lastRescan := start
 	return waitFor(ctx, t.opts.Timeout, 250*time.Millisecond, func() (string, bool) {
-		if devs := sysBlockMatching("nvme*n*", serial); len(devs) > 0 {
-			// With native multipath the head node (nvmeXnY under the subsystem)
-			// is what /sys/class/block lists; per-path nodes are nvmeXcYnZ and
-			// are excluded by the glob.
+		if devs := nvmeDevices(serial); len(devs) > 0 {
 			return "/dev/" + devs[0], true
 		}
 		if time.Since(lastRescan) > 5*time.Second {

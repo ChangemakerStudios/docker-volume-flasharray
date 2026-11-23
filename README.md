@@ -543,8 +543,8 @@ Early. The array client (including retries), name mapping, adoption,
 cloning, mount reference counting and failure rollback are unit-tested
 against fakes; the transports are exercised only on real hardware. The iSCSI
 attach/detach sequence follows jt-pve-storage-purestorage, which has been
-through many field releases; NVMe/TCP device matching has not yet been
-verified on an array.
+through many field releases; NVMe/TCP device matching (by the NGUID the
+array derives from the volume serial) has not yet been verified on an array.
 
 The array client retries 429 for any request and 5xx or transport errors
 for everything but POST (a create whose response was lost may already have
