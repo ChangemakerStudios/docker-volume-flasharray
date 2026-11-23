@@ -703,6 +703,36 @@ func TestConnectLogsInAgainWhenSessionsAreGone(t *testing.T) {
 	}
 }
 
+// A detach refused because the map is open must leave it as it was: with
+// queueing already off, whatever holds it fails I/O on the next path loss.
+func TestDetachLeavesAnOpenMapQueueing(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+	const serial = "6fef9ab1157343ec000000aa"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+serial)
+	cmds := fakeMultipath(t, WWID(serial), nil)
+	inner := runner
+	runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+		if name == "dmsetup" && len(args) > 0 && args[0] == "info" {
+			return "1\n", nil
+		}
+		return inner(ctx, log, name, args...)
+	}
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Detach(context.Background(), serial, "", map[int]string{3: serial}); err == nil {
+		t.Fatal("detached a map something still has open")
+	}
+	if ran(*cmds, "multipathd disablequeueing map mpathq") || ran(*cmds, "dmsetup message mpathq 0 fail_if_no_path") {
+		t.Fatalf("switched queueing off on a map left in place: %v", *cmds)
+	}
+	if deleted(t, root, "34:0:0:3") {
+		t.Fatal("deleted a path under a map left in place")
+	}
+}
+
 // fakeNVMe builds sys/<node> with the identity files a namespace node has.
 func fakeNVMe(t *testing.T, root, node string, files map[string]string) {
 	t.Helper()

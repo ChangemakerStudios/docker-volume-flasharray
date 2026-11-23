@@ -208,7 +208,8 @@ mounts out from under them ([moby#32515](https://github.com/moby/moby/issues/325
 Before `-f`, check the node has no running container on a flasharray volume,
 nothing under the plugin's `propagated-mount`, and no open Pure device.
 
-On unmount the plugin refuses to touch a map that still has holders, turns
+On unmount the plugin refuses to touch a map that still has holders or is
+still open, turns
 queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
 fail_if_no_path`) before flushing it, removes it with `multipathd remove
 map`, falling back to `multipath -f` then, only if the map is not open,

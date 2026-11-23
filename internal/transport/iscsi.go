@@ -671,8 +671,24 @@ func (t *iscsi) removeMap(ctx context.Context, name string, flush bool) error {
 			return fmt.Errorf("detach: %s is still in use (%d holder(s) in sysfs, e.g. %s); not removing it", dev, len(holders), holders[0].Name())
 		}
 	}
+	// Before queueing goes off: a map left in place for whatever has it open
+	// would otherwise fail its I/O on the next path loss instead of riding it out.
+	if n := t.openCount(ctx, name); n > 0 {
+		return fmt.Errorf("detach: multipath map %s is still open (%d); not removing it", name, n)
+	}
 	t.stopQueueing(ctx, name)
 	return t.dropMap(ctx, name, flush)
+}
+
+// openCount is how many openers device-mapper counts on map name, or 0 if it
+// cannot say.
+func (t *iscsi) openCount(ctx context.Context, name string) int {
+	out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n
 }
 
 // stopQueueing makes I/O on map name fail once no path is usable, instead of
@@ -704,10 +720,8 @@ func (t *iscsi) dropMap(ctx context.Context, name string, flush bool) error {
 	}
 	// A forced remove swaps an open map's table for an error target, which is
 	// the same as pulling the disk from under a filesystem still flushing.
-	if out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && n > 0 {
-			return fmt.Errorf("detach: multipath map %s is still open (%d); not forcing its removal", name, n)
-		}
+	if n := t.openCount(ctx, name); n > 0 {
+		return fmt.Errorf("detach: multipath map %s is still open (%d); not forcing its removal", name, n)
 	}
 	t.log.Warn("multipath -f failed; forcing removal with dmsetup", "map", name)
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "dmsetup", "remove", "--force", "--retry", name); err != nil {
