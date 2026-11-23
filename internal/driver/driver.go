@@ -647,10 +647,11 @@ func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharra
 // Rewriting the UUID instead (xfs_admin -U) is a write to the volume the
 // driver must never make on its own; the Pure plugin also always used nouuid.
 // XFS's own duplicate-mount guard is then off, so Mount refuses a device that
-// is already mounted on this node itself.
-func (d *Driver) mountOptions() string {
+// is already mounted on this node itself. fstype is what the device carries,
+// which an adopted volume need not share with FA_FS_TYPE.
+func (d *Driver) mountOptions(fstype string) string {
 	opts := d.cfg.MountOptions
-	if d.cfg.FSType != "xfs" || slices.Contains(strings.Split(opts, ","), "nouuid") {
+	if fstype != "xfs" || slices.Contains(strings.Split(opts, ","), "nouuid") {
 		return opts
 	}
 	if opts == "" {
@@ -891,7 +892,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 
 	// Only a volume nothing has ever written to may be formatted: blkid also
 	// finds "no filesystem" on a damaged one.
-	formatted, err := d.mnt.EnsureFilesystem(ctx, dev, d.cfg.FSType, d.cfg.MkfsOptions, vol.Written == 0)
+	fstype, formatted, err := d.mnt.EnsureFilesystem(ctx, dev, d.cfg.FSType, d.cfg.MkfsOptions, vol.Written == 0)
 	if err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		if errors.Is(err, mounter.ErrNoFilesystem) {
@@ -900,7 +901,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		return nil, err
 	}
 	mp := filepath.Join(d.cfg.MountRoot, req.Name)
-	if err := d.mnt.Mount(ctx, dev, mp, d.cfg.FSType, d.mountOptions()); err != nil {
+	if err := d.mnt.Mount(ctx, dev, mp, fstype, d.mountOptions(fstype)); err != nil {
 		d.rollbackAttach(ctx, an, vol.Serial, dev)
 		return nil, err
 	}
@@ -916,7 +917,7 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 	// Only now: a retry that fails before this leaves a kept attachment's
 	// release scheduled, and one firing meanwhile waited on an's lock.
 	d.cancelKeep(an)
-	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "formatted", formatted)
+	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "fs", fstype, "formatted", formatted)
 	return &plugin.MountResponse{Mountpoint: mp}, nil
 }
 

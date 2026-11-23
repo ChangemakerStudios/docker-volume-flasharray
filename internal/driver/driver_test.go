@@ -425,6 +425,8 @@ func (t *fakeTransport) CheckLUN(context.Context, string, int) error {
 type fakeMounter struct {
 	mu        sync.Mutex
 	formatted map[string]bool
+	existing  map[string]string // dev -> filesystem it already carries
+	fstypes   map[string]string // target -> filesystem type it was mounted as
 	mounted   map[string]string // target -> dev
 	opts      map[string]string // target -> mount options
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
@@ -444,7 +446,7 @@ func (m *fakeMounter) Shutdown(target string) error {
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, inUse: map[string]bool{}}
+	return &fakeMounter{formatted: map[string]bool{}, existing: map[string]string{}, fstypes: map[string]string{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, inUse: map[string]bool{}}
 }
 func (m *fakeMounter) Busy(dev string) (bool, error) {
 	m.mu.Lock()
@@ -455,17 +457,20 @@ func (m *fakeMounter) Busy(dev string) (bool, error) {
 	}
 	return n != 0, nil
 }
-func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string, allowFormat bool) (bool, error) {
+func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, fstype string, _ []string, allowFormat bool) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if have := m.existing[dev]; have != "" {
+		return have, false, nil
+	}
 	if m.formatted[dev] {
-		return false, nil
+		return fstype, false, nil
 	}
 	if !allowFormat {
-		return false, fmt.Errorf("%s: %w", dev, mounter.ErrNoFilesystem)
+		return "", false, fmt.Errorf("%s: %w", dev, mounter.ErrNoFilesystem)
 	}
 	m.formatted[dev] = true
-	return true, nil
+	return fstype, true, nil
 }
 func (m *fakeMounter) MountedAt(dev string) (string, error) {
 	m.mu.Lock()
@@ -489,9 +494,10 @@ func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
 	m.inUseChecks++
 	return m.inUse[mountpoint], nil
 }
-func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
+func (m *fakeMounter) Mount(_ context.Context, dev, target, fstype, opts string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.fstypes[target] = fstype
 	m.mounted[target] = dev
 	m.opts[target] = opts
 	return nil
@@ -2128,6 +2134,22 @@ func TestLingerTearsDownALostFilesystem(t *testing.T) {
 	eventually(t, "lost filesystem not torn down", func() bool {
 		return tr.detachCount() == 1 && !fa.connected(an, "node1")
 	})
+}
+
+// An adopted volume keeps the filesystem it came with, whatever FA_FS_TYPE says.
+func TestMountUsesTheFilesystemOnTheDevice(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.MountOptions = "discard"
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	fm.existing[tr.dev(fa.vols[d.arrayName("v")].Serial)] = "ext4"
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm.fstypes[r.Mountpoint] != "ext4" || fm.opts[r.Mountpoint] != "discard" {
+		t.Fatalf("mounted as %q with %q, want ext4 without nouuid", fm.fstypes[r.Mountpoint], fm.opts[r.Mountpoint])
+	}
 }
 
 // An untagged volume is missing from List, and under a fresh array name no

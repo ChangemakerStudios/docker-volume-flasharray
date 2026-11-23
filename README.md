@@ -281,7 +281,8 @@ given to another LUN, so the device is used only after its sysfs `dm/uuid`
 the node is refused, and a volume whose filesystem blkid can't find is
 formatted only if the array's `space.virtual` is 0; otherwise the mount fails
 with the bytes written, since a damaged superblock also reads as "no
-filesystem".
+filesystem". A volume that already carries a filesystem is mounted as that
+type; `FA_FS_TYPE` only decides what a blank volume is formatted with.
 
 XFS volumes are always mounted with `nouuid`, as the Pure plugin did: copies
 of a volume carry its filesystem UUID, and XFS would otherwise refuse to mount
