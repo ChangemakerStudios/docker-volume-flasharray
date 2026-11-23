@@ -29,10 +29,13 @@ type fakeArray struct {
 	lookupErr error                        // returned by LookupNameTag
 	down      error                        // array unreachable: returned by every read
 	hang      bool                         // reads answer only once the caller gives up
-	hosts     map[string][]string
-	conns     map[string]map[string]int // volume -> host -> lun
-	nextLUN   int
-	calls     []string
+	tagErr    error                        // returned by SetNameTag
+	// createHook, when set, runs in place of CreateVolume's own work.
+	createHook func(name string) error
+	hosts      map[string][]string
+	conns      map[string]map[string]int // volume -> host -> lun
+	nextLUN    int
+	calls      []string
 }
 
 func newFakeArray() *fakeArray {
@@ -71,6 +74,9 @@ func (f *fakeArray) CreateVolume(_ context.Context, name string, size int64) (*f
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rec("create:" + name)
+	if f.createHook != nil {
+		return nil, f.createHook(name)
+	}
 	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: size, Created: time.Now()}
 	f.vols[name] = v
 	return v, nil
@@ -163,6 +169,9 @@ func (f *fakeArray) DestroyVolume(_ context.Context, name string, eradicate bool
 func (f *fakeArray) SetNameTag(_ context.Context, volume, value string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tagErr != nil {
+		return f.tagErr
+	}
 	f.tags[volume] = value
 	return nil
 }
@@ -2106,4 +2115,80 @@ func TestLingerTearsDownALostFilesystem(t *testing.T) {
 	eventually(t, "lost filesystem not torn down", func() bool {
 		return tr.detachCount() == 1 && !fa.connected(an, "node1")
 	})
+}
+
+// An untagged volume is missing from List, and under a fresh array name no
+// node can find it at all.
+func TestCreateFailsWhenTheNewVolumeCannotBeTagged(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	fa.tagErr = errors.New("HTTP 503")
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err == nil {
+		t.Fatal("create reported an untagged volume as made")
+	}
+	if v, ok := fa.vols["node1-v"]; ok && !v.Destroyed {
+		t.Fatal("left the untagged volume in place")
+	}
+	fa.tagErr = nil
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	an, err := fa.LookupNameTag(context.Background(), "node1/v")
+	if err != nil || fa.vols[an] == nil || fa.vols[an].Destroyed {
+		t.Fatalf("retry left no tagged volume: %q, %v", an, err)
+	}
+}
+
+// One an earlier Create could not tag, nor destroy again, is tagged by the retry.
+func TestCreateTagsAnExistingUntaggedVolume(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if _, err := fa.CreateVolume(context.Background(), "node1-v", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.tags["node1-v"] != "node1/v" {
+		t.Fatalf("tags = %v", fa.tags)
+	}
+}
+
+// The computed array name of one Docker volume can be a volume adopted under
+// another name; the two must not share it.
+func TestComputedNameClaimedByAnotherDockerVolumeIsRefused(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if _, err := fa.CreateVolume(context.Background(), "node1-data", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "other", Options: map[string]string{"import": "node1-data"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "data"}); !errors.Is(err, errClaimed) {
+		t.Fatalf("create of a name whose array volume is another's = %v", err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "data", ID: "c"}); !errors.Is(err, errClaimed) {
+		t.Fatalf("mount = %v", err)
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "data"}); !errors.Is(err, errClaimed) || fa.vols["node1-data"].Destroyed {
+		t.Fatalf("remove = %v, destroyed = %v", err, fa.vols["node1-data"].Destroyed)
+	}
+}
+
+// Scope is global, so two nodes can create one name at the same moment.
+func TestCreateUsesAVolumeAnotherNodeCreatedAtTheSameMoment(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	fa.createHook = func(name string) error {
+		fa.vols[name] = &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", 77), Provisioned: 1 << 30, Created: time.Now()}
+		fa.tags[name] = "node1/v"
+		return errors.New("POST /volumes: HTTP 400: volume already exists")
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatalf("create lost the race and failed: %v", err)
+	}
+	if g, err := d.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Status["array_name"] != "node1-v" {
+		t.Fatalf("get = %+v, %v", g, err)
+	}
 }

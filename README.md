@@ -318,7 +318,12 @@ New volumes are named `<namespace>-<name>` on the array, as the Pure plugin
 named them (with a short hash suffix when the Docker name contains
 characters the array rejects, i.e. `.`, or would exceed 63 characters),
 and tagged `dvfa:name=<namespace>/<docker name>` so `docker volume ls` shows
-the original names from any node.
+the original names from any node. A volume counts as created only once its
+tag is written: if tagging fails, the new volume is destroyed again and the
+create fails. A Docker name whose computed array name already belongs to
+another Docker volume (one imported under a different name, or a name the
+array does not tell apart from it) is refused instead of being given the same
+disk.
 
 The tag, not the array name, is what the driver goes by: every operation
 looks the Docker name up through `dvfa:name` and only falls back to the

@@ -275,13 +275,55 @@ func (d *Driver) resolve(ctx context.Context, dockerName string) (an string, cac
 	}
 	an, err = d.array.LookupNameTag(ctx, d.tagValue(dockerName))
 	if flasharray.IsNotFound(err) {
-		return d.arrayName(dockerName), false, nil
+		// The computed name can be a volume adopted under another Docker name,
+		// or one whose name differs only in case, which the array does not
+		// tell apart. Handing it out would give two Docker volumes one disk.
+		an = d.arrayName(dockerName)
+		cur, err := d.nameTag(ctx, an)
+		if err != nil {
+			// Best effort: the array may refuse tag queries the volume lookup
+			// that follows still answers (a destroyed volume).
+			d.log.Debug("cannot read the computed name's tags", "volume", dockerName, "array_name", an, "err", err)
+		}
+		if cur != "" && cur != d.tagValue(dockerName) {
+			return "", false, fmt.Errorf("%w: %s, the array name for %s, is tagged %q", errClaimed, an, dockerName, cur)
+		}
+		return an, false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("look up array volume for %s: %w", dockerName, err)
 	}
 	d.remember(dockerName, an)
 	return an, false, nil
+}
+
+var errClaimed = errors.New("array volume belongs to another Docker volume")
+
+// nameTag is the dvfa:name tag on array volume an, or "" when it has none or
+// does not exist.
+func (d *Driver) nameTag(ctx context.Context, an string) (string, error) {
+	tags, err := d.array.GetTags(ctx, an)
+	if err != nil && !flasharray.IsNotFound(err) {
+		return "", err
+	}
+	return tags[flasharray.TagKeyName], nil
+}
+
+// claim tags an as dockerName's unless it already is, and fails with
+// errClaimed when it is tagged for another Docker volume.
+func (d *Driver) claim(ctx context.Context, an, dockerName string) error {
+	cur, err := d.nameTag(ctx, an)
+	if err != nil {
+		return err
+	}
+	switch want := d.tagValue(dockerName); cur {
+	case want:
+		return nil
+	case "":
+		return d.array.SetNameTag(ctx, an, want)
+	default:
+		return fmt.Errorf("%w: %s is tagged %q", errClaimed, an, cur)
+	}
 }
 
 // resolveLocked resolves dockerName, takes its per-volume lock and fetches the
@@ -444,6 +486,15 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	defer func() { unlock() }() // unlock is swapped when a destroyed volume forces a new array name
 
 	if err == nil && !v.Destroyed {
+		// Found by its computed name, it may be one an earlier Create could
+		// not tag; untagged it is missing from List on every node.
+		if an == d.arrayName(req.Name) {
+			if err := d.claim(ctx, an, req.Name); errors.Is(err, errClaimed) {
+				return err
+			} else if err != nil {
+				d.log.Warn("could not check or set the existing volume's name tag; it may be missing from list", "volume", req.Name, "array_name", an, "err", err)
+			}
+		}
 		d.log.Info("volume already exists", "volume", req.Name, "array_name", an)
 		return nil
 	} else if err != nil && !flasharray.IsNotFound(err) {
@@ -466,11 +517,28 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	} else if v, err = d.array.CreateVolume(ctx, an, size); err != nil {
 		err = fmt.Errorf("create volume %s: %w", an, err)
 	}
+	created := err == nil
 	if err != nil {
-		return err
+		// Scope is global: another node can create the same name at the same
+		// moment, and the array then refuses the second create.
+		ev, gerr := d.array.GetVolume(ctx, an)
+		if gerr != nil || ev.Destroyed {
+			return err
+		}
+		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
+		v = ev
 	}
-	if err := d.array.SetNameTag(ctx, an, d.tagValue(req.Name)); err != nil {
-		d.log.Error("tagging failed; volume will not appear in list until tagged", "array_name", an, "err", err)
+	if err := d.claim(ctx, an, req.Name); err != nil {
+		// Untagged, the volume is missing from List, and under a fresh array
+		// name no node can find it at all: each would create its own.
+		if created {
+			cctx, cancel := cleanupCtx(ctx)
+			defer cancel()
+			if derr := d.array.DestroyVolume(cctx, an, d.cfg.EradicateOnRemove); derr != nil {
+				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array untagged", "volume", req.Name, "array_name", an, "err", derr)
+			}
+		}
+		return fmt.Errorf("create volume %s: tag %s: %w", req.Name, an, err)
 	}
 	d.remember(req.Name, an)
 	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", v.Provisioned, "source", source)
