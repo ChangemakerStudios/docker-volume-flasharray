@@ -245,9 +245,12 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 	return out, nil
 }
 
-func (f *fakeArray) EnsureHost(_ context.Context, name string, iqns, nqns []string) (string, error) {
+func (f *fakeArray) EnsureHost(ctx context.Context, name string, iqns, nqns []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if f.hostErr != nil {
 		return "", f.hostErr
 	}
@@ -2563,5 +2566,31 @@ func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
 	fa.hostErr = outage
 	if _, err := New(context.Background(), &fresh, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()}); err == nil {
 		t.Fatal("first start without the array must fail")
+	}
+}
+
+// The client's own ask went unanswered a moment before: waiting for the array
+// again holds up the requests Docker has already queued on the socket.
+func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, ArrayUnanswered: true})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if d2.hostName() != "" {
+		t.Fatal("asked the array for the host object at start")
+	}
+	if g, err := d2.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume == nil {
+		t.Fatalf("Get after the start = %+v, %v", g, err)
+	}
+	// The host object is settled when first needed.
+	if _, err := d2.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if d2.hostName() == "" {
+		t.Fatal("host object not settled by the first mount")
 	}
 }

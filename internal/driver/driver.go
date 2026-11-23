@@ -102,6 +102,9 @@ type Deps struct {
 	Transport transport.Transport
 	Mounter   mounter.Mounter
 	Logger    *slog.Logger
+	// ArrayUnanswered says the array did not answer when its client was made,
+	// a moment ago: a start that can do without it does not wait a second time.
+	ArrayUnanswered bool
 }
 
 // New builds a driver and prepares the host object / sessions.
@@ -137,7 +140,13 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	// is most likely.
 	hctx, hcancel := ctx, context.CancelFunc(func() {})
 	if drv.hasKnown() {
-		hctx, hcancel = context.WithTimeout(ctx, startArrayWait)
+		wait := startArrayWait
+		if d.ArrayUnanswered {
+			// Requests are queueing on the socket and Docker gives a Get one
+			// minute: on hardware the second wait brought the first to 59 s.
+			wait = 0
+		}
+		hctx, hcancel = context.WithTimeout(ctx, wait)
 	}
 	err := drv.requireHost(hctx)
 	hcancel()
