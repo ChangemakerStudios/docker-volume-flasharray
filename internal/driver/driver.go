@@ -1,0 +1,1884 @@
+// Package driver implements the Docker volume plugin API on top of a
+// FlashArray and a block transport.
+package driver
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/ctxlock"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/transport"
+)
+
+// Driver is the plugin.Driver implementation.
+type Driver struct {
+	cfg   *config.Config
+	array flasharray.Array
+	tr    transport.Transport
+	mnt   mounter.Mounter
+	log   *slog.Logger
+
+	// host is this node's FlashArray host object name (string); see hostName.
+	host   atomic.Value
+	hostMu sync.Mutex // serializes requireHost
+
+	mu sync.Mutex // guards locks, mounts, names and known maps
+	// closing stops deferred teardowns once Shutdown has taken them over.
+	closing bool
+	// prefix is this array's serial prefix (string) once known; see arrayPrefix.
+	prefix atomic.Value
+	locks  map[string]*ctxlock.Mutex
+	// mounts is keyed by array volume name.
+	mounts map[string]*mountState
+	// names caches dockerName -> array volume name once resolved.
+	names map[string]string
+	// known is the persisted dockerName -> array volume map behind the
+	// outage fallback in Get and List; see known.go.
+	known  map[string]string
+	saveMu sync.Mutex
+	// heldSince records when this node first found an array volume attached
+	// to its current other holders, so the preempt grace spans Docker's mount
+	// retries but restarts when the holder changes.
+	heldSince map[string]holdState
+	// pending holds, by array volume name, attachments kept after their device
+	// was too slow to appear; see keepAttached.
+	pending map[string]*pendingAttach
+}
+
+type pendingAttach struct {
+	serial string
+	timer  *time.Timer
+	gen    int
+}
+
+type holdState struct {
+	hosts string
+	since time.Time
+	seen  time.Time // last time a Mount here found it held
+}
+
+// staleHold drops a hold record no Mount has refreshed for this long: Docker
+// retries a waiting Mount within seconds, so an older record is left from an
+// attempt that gave up, and reusing its start time would preempt at once.
+const staleHold = 2 * time.Minute
+
+type mountState struct {
+	dockerName string
+	serial     string
+	dev        string
+	mountpoint string
+	refs       map[string]time.Time // Docker mount ID -> when it was added
+	// linger is the pending teardown after the last ref went (UnmountLinger);
+	// lingerGen tells a timer that was cancelled or replaced to stand down.
+	// Both are guarded by Driver.mu.
+	linger    *time.Timer
+	lingerGen int
+	// heldLogged is set once a deferred teardown has said a container still
+	// holds the mount, which it finds again every interval the container runs.
+	heldLogged bool
+}
+
+// Deps lets tests inject fakes.
+type Deps struct {
+	Array     flasharray.Array
+	Transport transport.Transport
+	Mounter   mounter.Mounter
+	Logger    *slog.Logger
+}
+
+// New builds a driver and prepares the host object / sessions.
+func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
+	if d.Logger == nil {
+		d.Logger = slog.Default()
+	}
+	drv := &Driver{
+		cfg:    cfg,
+		array:  d.Array,
+		tr:     d.Transport,
+		mnt:    d.Mounter,
+		log:    d.Logger.With("component", "driver"),
+		locks:  map[string]*ctxlock.Mutex{},
+		mounts: map[string]*mountState{},
+		names:  map[string]string{},
+		known:  map[string]string{},
+
+		heldSince: map[string]holdState{},
+		pending:   map[string]*pendingAttach{},
+	}
+	if _, _, err := drv.tr.InitiatorIDs(); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
+		return nil, err
+	}
+	drv.loadKnown()
+
+	// A node that has served volumes must come up without the array: with no
+	// driver to answer Get, Docker substitutes local volumes for every one of
+	// them. A first start still fails here, where a wrong endpoint or token
+	// is most likely.
+	hctx, hcancel := ctx, context.CancelFunc(func() {})
+	if drv.hasKnown() {
+		hctx, hcancel = context.WithTimeout(ctx, startArrayWait)
+	}
+	err := drv.requireHost(hctx)
+	hcancel()
+	if err != nil {
+		if !drv.hasKnown() {
+			return nil, err
+		}
+		drv.log.Error("array unreachable at start; answering Get and List from known volumes, everything else fails until it is back", "err", err)
+	}
+	drv.recoverMounts(ctx, err != nil)
+
+	if cfg.ConnectOnStart && err == nil {
+		if err := drv.ensureConnected(ctx); err != nil {
+			// Not fatal: the array may be unreachable at boot; we retry on first mount.
+			drv.log.Warn("initial transport connect failed; will retry on first mount", "err", err)
+		}
+	}
+	return drv, nil
+}
+
+// startArrayWait bounds the wait for the array at start when the plugin can
+// come up without it. A variable so tests needn't wait.
+var startArrayWait = 20 * time.Second
+
+func (d *Driver) hostName() string {
+	s, _ := d.host.Load().(string)
+	return s
+}
+
+func (d *Driver) hasKnown() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.known) > 0
+}
+
+// requireHost finds or creates this node's host object unless that is done.
+// It is done at start, except when the array could not be reached then; every
+// path that names the host to the array comes through here first.
+func (d *Driver) requireHost(ctx context.Context) error {
+	if d.hostName() != "" {
+		return nil
+	}
+	d.hostMu.Lock()
+	defer d.hostMu.Unlock()
+	if d.hostName() != "" {
+		return nil
+	}
+	iqns, nqns, err := d.tr.InitiatorIDs()
+	if err != nil {
+		return err
+	}
+	host, err := d.array.EnsureHost(ctx, d.cfg.HostName, iqns, nqns)
+	if err != nil {
+		return fmt.Errorf("ensure host object: %w", err)
+	}
+	d.host.Store(host)
+	d.log.Info("host object ready", "host", host, "iqns", iqns, "nqns", nqns)
+	return nil
+}
+
+// reensureHost finds or recreates this node's host object after the array
+// stopped knowing it. The Pure plugin deletes its host object once its last
+// volume detaches, and when both plugins run on a node that object is ours too.
+func (d *Driver) reensureHost(ctx context.Context) error {
+	iqns, nqns, err := d.tr.InitiatorIDs()
+	if err != nil {
+		return err
+	}
+	host, err := d.array.EnsureHost(ctx, d.cfg.HostName, iqns, nqns)
+	if err != nil {
+		return fmt.Errorf("recreate host object: %w", err)
+	}
+	d.log.Warn("host object was gone from the array; found or recreated it", "host", host, "was", d.hostName())
+	d.host.Store(host)
+	return nil
+}
+
+// ensureConnected refreshes the port list and logs in to every eligible portal.
+func (d *Driver) ensureConnected(ctx context.Context) error {
+	if err := d.requireHost(ctx); err != nil {
+		return err
+	}
+	ports, err := d.array.Ports(ctx)
+	if err != nil {
+		return fmt.Errorf("list array ports: %w", err)
+	}
+	err = d.tr.Connect(ctx, ports)
+	if err == nil {
+		return nil
+	}
+	// The array refuses logins from an initiator no host object lists, which is
+	// how the Pure plugin's cleanup leaves the node, so recreate it and retry.
+	if _, herr := d.array.HostLUNs(ctx, d.hostName()); !flasharray.IsNotFound(herr) {
+		return err
+	}
+	if herr := d.reensureHost(ctx); herr != nil {
+		return errors.Join(err, herr)
+	}
+	return d.tr.Connect(ctx, ports)
+}
+
+// recoverMounts rebuilds in-memory state for volumes still mounted from a
+// previous plugin process (plugin upgrade/restart with running containers).
+// offline skips the array, which start just found unreachable.
+func (d *Driver) recoverMounts(ctx context.Context, offline bool) {
+	entries, err := os.ReadDir(d.cfg.MountRoot)
+	if err != nil {
+		d.log.Error("cannot scan mount root; existing mounts will not be recovered", "mount_root", d.cfg.MountRoot, "err", err)
+		return
+	}
+	recovered := map[string]*mountState{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		mp := filepath.Join(d.cfg.MountRoot, e.Name())
+		ok, err := d.mnt.FilesystemMounted(mp)
+		if err != nil {
+			d.log.Error("cannot check mount; not recovered", "mountpoint", mp, "err", err)
+			continue
+		}
+		if !ok {
+			// At most a guard whose filesystem went away; the next Mount mounts over it.
+			continue
+		}
+		// Through the tag, so an adopted volume is keyed by its real array name.
+		an, err := "", errors.New("array unreachable at start")
+		if !offline {
+			an, _, err = d.resolve(ctx, e.Name())
+		}
+		if err != nil {
+			d.mu.Lock()
+			an = d.known[e.Name()]
+			d.mu.Unlock()
+			if an == "" {
+				an = d.arrayName(e.Name())
+			}
+			d.log.Warn("tag lookup failed; recovering mount under its last known or computed array name", "volume", e.Name(), "array_name", an, "err", err)
+		}
+		st := &mountState{dockerName: e.Name(), mountpoint: mp, refs: map[string]time.Time{}}
+		d.mu.Lock()
+		d.mounts[an] = st
+		d.mu.Unlock()
+		recovered[an] = st
+		d.log.Info("recovered existing mount", "volume", e.Name(), "mountpoint", mp)
+	}
+	// Left behind when the plugin stopped during a linger, or kept by a
+	// container that is still running; the check at expiry tells them apart.
+	// Armed only now: each lookup above may wait on the array.
+	if d.cfg.UnmountLinger > 0 {
+		for an, st := range recovered {
+			d.scheduleTeardown(an, st)
+		}
+	}
+}
+
+// FlashArray object names are 1-63 of [A-Za-z0-9_-]; Docker also allows '.'.
+var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+
+// arrayName maps a Docker volume name onto the FlashArray object-name charset
+// under this node's namespace. Names that survive sanitisation unchanged map
+// 1:1, as the Pure plugin's did; anything else gets a short hash suffix so
+// distinct Docker names can't collide (e.g. "a.b" vs "a-b").
+func (d *Driver) arrayName(dockerName string) string {
+	san := strings.Trim(unsafeChars.ReplaceAllString(dockerName, "-"), "-")
+	name := d.cfg.Namespace + "-" + san
+	if san != dockerName || len(name) > 63 {
+		sum := sha1.Sum([]byte(dockerName))
+		suffix := "-" + hex.EncodeToString(sum[:])[:8]
+		limit := 63 - len(suffix)
+		if len(name) > limit {
+			name = strings.TrimRight(name[:limit], "-")
+		}
+		name += suffix
+	}
+	return name
+}
+
+func (d *Driver) tagValue(dockerName string) string { return d.cfg.Namespace + "/" + dockerName }
+
+// resolve maps a Docker volume name to its array volume name. The dvfa:name
+// tag is authoritative — that is what lets an imported volume keep whatever
+// name it already has on the array — and the computed name is the fallback
+// for volumes nothing is tagged for yet. cached reports a hit in d.names. A
+// failed lookup is an error rather than a guess: the computed name may be a
+// different volume from the one the tag points at.
+func (d *Driver) resolve(ctx context.Context, dockerName string) (an string, cached bool, err error) {
+	d.mu.Lock()
+	an, ok := d.names[dockerName]
+	d.mu.Unlock()
+	if ok {
+		return an, true, nil
+	}
+	an, err = d.array.LookupNameTag(ctx, d.tagValue(dockerName))
+	if flasharray.IsNotFound(err) {
+		// The computed name can be a volume adopted under another Docker name,
+		// or one whose name differs only in case, which the array does not
+		// tell apart. Handing it out would give two Docker volumes one disk.
+		an = d.arrayName(dockerName)
+		cur, err := d.nameTag(ctx, an)
+		if err != nil {
+			// Best effort: the array may refuse tag queries the volume lookup
+			// that follows still answers (a destroyed volume).
+			d.log.Debug("cannot read the computed name's tags", "volume", dockerName, "array_name", an, "err", err)
+		}
+		if cur != "" && cur != d.tagValue(dockerName) {
+			return "", false, fmt.Errorf("%w: %s, the array name for %s, is tagged %q", errClaimed, an, dockerName, cur)
+		}
+		return an, false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("look up array volume for %s: %w", dockerName, err)
+	}
+	d.remember(dockerName, an)
+	return an, false, nil
+}
+
+var errClaimed = errors.New("array volume belongs to another Docker volume")
+
+// nameTag is the dvfa:name tag on array volume an, or "" when it has none or
+// does not exist.
+func (d *Driver) nameTag(ctx context.Context, an string) (string, error) {
+	tags, err := d.array.GetTags(ctx, an)
+	if err != nil && !flasharray.IsNotFound(err) {
+		return "", err
+	}
+	return tags[flasharray.TagKeyName], nil
+}
+
+// claim tags an as dockerName's unless it already is, and fails with
+// errClaimed when it is tagged for another Docker volume.
+func (d *Driver) claim(ctx context.Context, an, dockerName string) error {
+	cur, err := d.nameTag(ctx, an)
+	if err != nil {
+		return err
+	}
+	switch want := d.tagValue(dockerName); cur {
+	case want:
+		return nil
+	case "":
+		return d.array.SetNameTag(ctx, an, want)
+	default:
+		return fmt.Errorf("%w: %s is tagged %q", errClaimed, an, cur)
+	}
+}
+
+// resolveLocked resolves dockerName, takes its per-volume lock and fetches the
+// volume. Scope is global, so another node may have removed and recreated the
+// volume since we cached its name; a cached name whose volume is gone or
+// destroyed is dropped and resolved again. unlock is always non-nil.
+func (d *Driver) resolveLocked(ctx context.Context, dockerName string) (an string, v *flasharray.Volume, unlock func(), err error) {
+	an, cached, err := d.resolve(ctx, dockerName)
+	if err != nil {
+		return "", nil, func() {}, err
+	}
+	if unlock, err = d.lockCtx(ctx, an); err != nil {
+		return "", nil, unlock, err
+	}
+	v, err = d.array.GetVolume(ctx, an)
+	if cached && stale(v, err) {
+		unlock()
+		if an, err = d.reresolve(ctx, dockerName, an); err != nil {
+			return "", nil, func() {}, err
+		}
+		if unlock, err = d.lockCtx(ctx, an); err != nil {
+			return "", nil, unlock, err
+		}
+		v, err = d.array.GetVolume(ctx, an)
+	}
+	return an, v, unlock, err
+}
+
+// lookup is resolveLocked without the lock, for Get: Mount can hold the lock
+// for the whole attach timeout.
+func (d *Driver) lookup(ctx context.Context, dockerName string) (string, *flasharray.Volume, error) {
+	an, cached, err := d.resolve(ctx, dockerName)
+	if err != nil {
+		return "", nil, err
+	}
+	v, err := d.array.GetVolume(ctx, an)
+	if cached && stale(v, err) {
+		if an, err = d.reresolve(ctx, dockerName, an); err != nil {
+			return "", nil, err
+		}
+		v, err = d.array.GetVolume(ctx, an)
+	}
+	return an, v, err
+}
+
+func stale(v *flasharray.Volume, err error) bool {
+	return flasharray.IsNotFound(err) || err == nil && v.Destroyed
+}
+
+func (d *Driver) reresolve(ctx context.Context, dockerName, old string) (string, error) {
+	d.forget(dockerName)
+	d.log.Info("cached array name is stale; resolving again", "volume", dockerName, "array_name", old)
+	an, _, err := d.resolve(ctx, dockerName)
+	return an, err
+}
+
+func (d *Driver) remember(dockerName, arrayName string) {
+	d.mu.Lock()
+	d.names[dockerName] = arrayName
+	d.mu.Unlock()
+	d.setKnown(dockerName, arrayName)
+}
+
+// forget drops the resolved name. The known entry is only dropped when the
+// volume is really gone (Remove), not on a stale re-resolve.
+func (d *Driver) forget(dockerName string) {
+	d.mu.Lock()
+	delete(d.names, dockerName)
+	d.mu.Unlock()
+}
+
+// cachedName is resolve() without the array round-trip, for Path().
+func (d *Driver) cachedName(dockerName string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if an, ok := d.names[dockerName]; ok {
+		return an
+	}
+	return d.arrayName(dockerName)
+}
+
+func (d *Driver) lock(name string) func() {
+	unlock, _ := d.lockCtx(context.Background(), name)
+	return unlock
+}
+
+// lockCtx is lock that gives up when ctx ends. Mount, Create and Remove wait
+// with it: Docker abandons a Mount after 2 minutes and counts it failed, and a
+// Mount queued behind a long one on the same volume used to start its work
+// only after that, unseen. Unmount and the deferred teardowns wait as long as
+// it takes, since giving up there would leave a mount nothing cleans up.
+func (d *Driver) lockCtx(ctx context.Context, name string) (func(), error) {
+	d.mu.Lock()
+	l, ok := d.locks[name]
+	if !ok {
+		l = &ctxlock.Mutex{}
+		d.locks[name] = l
+	}
+	d.mu.Unlock()
+	if err := l.Lock(ctx); err != nil {
+		return func() {}, fmt.Errorf("another operation on this volume is still running: %w", err)
+	}
+	return l.Unlock, nil
+}
+
+func (d *Driver) ctx() (context.Context, context.CancelFunc) {
+	return d.ctxWithin(time.Hour)
+}
+
+// Docker gives up on a Mount after 2 minutes and an Unmount after 1
+// (volume/drivers/proxy.go) and treats it as failed, while the driver would
+// finish it unseen. Mount and Unmount stay inside those limits. Get and List
+// have 1 minute too, and one that outlasts it never delivers the known-volume
+// answer an outage needs: a management endpoint that hangs costs the client
+// 30s an attempt. Variables so tests needn't wait.
+var (
+	mountBudget   = 110 * time.Second
+	unmountBudget = 55 * time.Second
+	queryBudget   = 45 * time.Second
+)
+
+func (d *Driver) ctxWithin(limit time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), min(d.cfg.AttachTimeout+maxReleaseWait+30*time.Second, limit))
+}
+
+// Create implements plugin.Driver.
+func (d *Driver) Create(req *plugin.CreateRequest) error {
+	ctx, cancel := d.ctx()
+	defer cancel()
+
+	size := d.cfg.DefaultSize
+	sizeSet := false
+	importName, source := "", ""
+	for k, v := range req.Options {
+		switch strings.ToLower(k) {
+		case "size":
+			s, err := config.ParseSize(v)
+			if err != nil {
+				return fmt.Errorf("option size: %w", err)
+			}
+			size, sizeSet = s, true
+		case "import", "import_from_src": // import_from_src is the Pure plugin's spelling
+			importName = v
+		case "source":
+			source = v
+		default:
+			return fmt.Errorf("unknown option %q (supported: size, import, import_from_src, source)", k)
+		}
+	}
+	switch {
+	case importName != "" && (source != "" || sizeSet):
+		return errors.New("option import cannot be combined with source or size")
+	case source != "" && sizeSet:
+		return errors.New("option size cannot be combined with source; a clone is the size of its source")
+	case importName != "":
+		return d.importVolume(ctx, req.Name, importName)
+	}
+
+	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
+	defer func() { unlock() }() // unlock is swapped when a destroyed volume forces a new array name
+
+	if err == nil && !v.Destroyed {
+		// Found by its computed name, it may be one an earlier Create could
+		// not tag; untagged it is missing from List on every node.
+		if an == d.arrayName(req.Name) {
+			if err := d.claim(ctx, an, req.Name); errors.Is(err, errClaimed) {
+				return err
+			} else if err != nil {
+				d.log.Warn("could not check or set the existing volume's name tag; it may be missing from list", "volume", req.Name, "array_name", an, "err", err)
+			}
+		}
+		d.log.Info("volume already exists", "volume", req.Name, "array_name", an)
+		return nil
+	} else if err != nil && !flasharray.IsNotFound(err) {
+		return err
+	}
+	if err == nil { // destroyed, awaiting eradication: leave it recoverable and make a new one
+		old := an
+		if an, err = d.freshArrayName(ctx, old); err != nil {
+			return err
+		}
+		unlock()
+		if unlock, err = d.lockCtx(ctx, an); err != nil {
+			return err
+		}
+		d.log.Info("array volume under this name is destroyed; creating a new one beside it", "volume", req.Name, "destroyed", old, "array_name", an)
+	}
+
+	if source != "" {
+		v, err = d.cloneVolume(ctx, source, an)
+	} else if v, err = d.array.CreateVolume(ctx, an, size); err != nil {
+		err = fmt.Errorf("create volume %s: %w", an, err)
+	}
+	created := err == nil
+	if err != nil {
+		// Scope is global: another node can create the same name at the same
+		// moment, and the array then refuses the second create.
+		ev, gerr := d.array.GetVolume(ctx, an)
+		if gerr != nil || ev.Destroyed {
+			return err
+		}
+		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
+		v = ev
+	}
+	if err := d.claim(ctx, an, req.Name); err != nil {
+		// Untagged, the volume is missing from List, and under a fresh array
+		// name no node can find it at all: each would create its own.
+		if created {
+			cctx, cancel := cleanupCtx(ctx)
+			defer cancel()
+			if derr := d.array.DestroyVolume(cctx, an, d.cfg.EradicateOnRemove); derr != nil {
+				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array untagged", "volume", req.Name, "array_name", an, "err", derr)
+			}
+		}
+		return fmt.Errorf("create volume %s: tag %s: %w", req.Name, an, err)
+	}
+	d.remember(req.Name, an)
+	d.log.Info("created volume", "volume", req.Name, "array_name", an, "serial", v.Serial, "bytes", v.Provisioned, "source", source)
+	return nil
+}
+
+// freshArrayName derives an unused array name from base for a volume whose
+// usual name is taken by a destroyed one. The dvfa:name tag, not the array
+// name, maps it back to the Docker name.
+func (d *Driver) freshArrayName(ctx context.Context, base string) (string, error) {
+	for i := 0; i < 5; i++ {
+		suffix := "-" + strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond)+int64(i), 36)
+		name := base
+		if len(name)+len(suffix) > 63 {
+			name = strings.TrimRight(name[:63-len(suffix)], "-")
+		}
+		name += suffix
+		if _, err := d.array.GetVolume(ctx, name); flasharray.IsNotFound(err) {
+			return name, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no free array name derived from %s", base)
+}
+
+// cloneVolume copies source to an. source is a Docker volume in this
+// namespace or, failing that, an array volume name (the Pure plugin's
+// `source=` took array names).
+func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharray.Volume, error) {
+	src, sv, err := d.lookup(ctx, source)
+	if flasharray.IsNotFound(err) && src != source {
+		src = source
+		sv, err = d.array.GetVolume(ctx, source)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("clone source %s: %w", source, err)
+	}
+	if sv.Destroyed {
+		return nil, fmt.Errorf("clone source %s (%s) is destroyed on the array", source, src)
+	}
+	v, err := d.array.CopyVolume(ctx, src, an)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s to %s: %w", src, an, err)
+	}
+	return v, nil
+}
+
+// mountOptions adds nouuid for XFS. A copy of a volume carries its source's
+// filesystem UUID, and XFS refuses to mount a UUID already mounted on the host.
+// Rewriting the UUID instead (xfs_admin -U) is a write to the volume the
+// driver must never make on its own; the Pure plugin also always used nouuid.
+// XFS's own duplicate-mount guard is then off, so Mount refuses a device that
+// is already mounted on this node itself. fstype is what the device carries,
+// which an adopted volume need not share with FA_FS_TYPE.
+func (d *Driver) mountOptions(fstype string) string {
+	opts := d.cfg.MountOptions
+	if fstype != "xfs" || slices.Contains(strings.Split(opts, ","), "nouuid") {
+		return opts
+	}
+	if opts == "" {
+		return "nouuid"
+	}
+	return opts + ",nouuid"
+}
+
+// importVolume adopts an existing array volume under a Docker name without
+// renaming or touching its data: it only writes the dvfa:name tag.
+func (d *Driver) importVolume(ctx context.Context, dockerName, arrayName string) error {
+	unlock, err := d.lockCtx(ctx, arrayName)
+	defer unlock()
+	if err != nil {
+		return err
+	}
+	if err := Adopt(ctx, d.array, d.cfg.Namespace, dockerName, arrayName, d.log); err != nil {
+		return err
+	}
+	d.remember(dockerName, arrayName)
+	return nil
+}
+
+// Adopt tags array volume arrayName as <namespace>/<dockerName>. It refuses
+// to steal a volume already claimed by a different Docker name and is a
+// no-op if the tag is already correct. Shared by Create(import=) and the
+// `adopt` CLI subcommand.
+func Adopt(ctx context.Context, array flasharray.Array, namespace, dockerName, arrayName string, log *slog.Logger) error {
+	if dockerName == "" || arrayName == "" {
+		return errors.New("adopt: docker name and array name are required")
+	}
+	value := namespace + "/" + dockerName
+	v, err := array.GetVolume(ctx, arrayName)
+	if err != nil {
+		return fmt.Errorf("adopt %s: %w", arrayName, err)
+	}
+	if v.Destroyed {
+		return fmt.Errorf("adopt %s: volume is destroyed on the array", arrayName)
+	}
+	// Is this Docker name already pointing somewhere?
+	if existing, err := array.LookupNameTag(ctx, value); err == nil && existing != arrayName {
+		return fmt.Errorf("adopt: docker volume %q already maps to array volume %s", dockerName, existing)
+	} else if err != nil && !flasharray.IsNotFound(err) {
+		return err
+	}
+	// Is this array volume already claimed by another Docker name in this namespace?
+	tags, err := array.ListNameTags(ctx, namespace+"/")
+	if err != nil {
+		return err
+	}
+	if cur, ok := tags[arrayName]; ok {
+		if cur == value {
+			return nil
+		}
+		return fmt.Errorf("adopt: array volume %s is already tagged %q", arrayName, cur)
+	}
+	if err := array.SetNameTag(ctx, arrayName, value); err != nil {
+		return fmt.Errorf("adopt %s: %w", arrayName, err)
+	}
+	if log != nil {
+		log.Info("adopted volume", "volume", dockerName, "array_name", arrayName, "serial", v.Serial, "bytes", v.Provisioned)
+	}
+	return nil
+}
+
+// Remove implements plugin.Driver.
+func (d *Driver) Remove(req *plugin.RemoveRequest) error {
+	ctx, cancel := d.ctx()
+	defer cancel()
+	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
+	defer unlock()
+	if err != nil {
+		if flasharray.IsNotFound(err) {
+			d.cancelKeep(an)
+			d.forget(req.Name)
+			d.setKnown(req.Name, "")
+			return nil
+		}
+		return err
+	}
+	// Another node's `docker volume rm` got there first; the array keeps the
+	// destroyed volume (and its tag) for 24h and rejects connection queries on
+	// it, so this node's own record must still be removable.
+	if v.Destroyed {
+		if d.cfg.EradicateOnRemove {
+			if err := d.array.DestroyVolume(ctx, an, true); err != nil && !flasharray.IsNotFound(err) {
+				return err
+			}
+		}
+		d.cancelKeep(an)
+		d.forget(req.Name)
+		d.setKnown(req.Name, "")
+		d.log.Info("volume already destroyed on the array; dropped this node's record", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
+		return nil
+	}
+
+	d.mu.Lock()
+	st, mounted := d.mounts[an]
+	d.mu.Unlock()
+	if mounted && len(st.refs) == 0 {
+		// A mount recovered at plugin start has no refs even while a running
+		// container owns it.
+		if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
+			return fmt.Errorf("volume %s is mounted on this node and a container may still use it", req.Name)
+		}
+		// Only lingering after its last container: release it now.
+		d.cancelTeardown(st)
+		if err := d.teardown(ctx, an, st, req.Name); err != nil {
+			d.retryTeardown(an, st)
+			return err
+		}
+		mounted = false
+	}
+	if mounted {
+		return fmt.Errorf("volume %s is mounted on this node", req.Name)
+	}
+	if err := d.requireHost(ctx); err != nil {
+		return err
+	}
+	conns, err := d.array.ListConnections(ctx, an)
+	if err != nil && !flasharray.IsNotFound(err) {
+		return err
+	}
+	for _, c := range conns {
+		if c.Host != d.hostName() {
+			return fmt.Errorf("volume %s is connected to host %s; unmount it there first", req.Name, c.Host)
+		}
+	}
+	if len(conns) > 0 {
+		v, err := d.array.GetVolume(ctx, an)
+		if err != nil {
+			return fmt.Errorf("volume %s: look up serial before detach: %w", req.Name, err)
+		}
+		detachErr, disconnectErr := d.releaseHost(ctx, an, v.Serial, "")
+		if detachErr != nil {
+			return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", req.Name, detachErr)
+		}
+		if disconnectErr != nil {
+			return disconnectErr
+		}
+	}
+	d.cancelKeep(an) // released above; a later release would hit a destroyed volume
+	// A destroyed volume keeps its name for 24h, and Get still answers for it
+	// so Docker never swaps in an empty local volume for one destroyed by
+	// accident. That also blocked recreating a name just removed on purpose,
+	// so move the volume out of its computed name first. Its dvfa:name tag
+	// still maps it back if it is recovered.
+	if !d.cfg.EradicateOnRemove && an == d.arrayName(req.Name) {
+		if parked, err := d.freshArrayName(ctx, an); err != nil {
+			d.log.Warn("no free name to move the removed volume to; the name stays taken until eradication", "array_name", an, "err", err)
+		} else if err := d.array.RenameVolume(ctx, an, parked); err != nil {
+			d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+		} else {
+			an = parked
+		}
+	}
+	if err := d.array.DestroyVolume(ctx, an, d.cfg.EradicateOnRemove); err != nil && !flasharray.IsNotFound(err) {
+		return err
+	}
+	d.forget(req.Name)
+	d.setKnown(req.Name, "")
+	d.log.Info("removed volume", "volume", req.Name, "array_name", an, "eradicated", d.cfg.EradicateOnRemove)
+	return nil
+}
+
+// Mount implements plugin.Driver.
+func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) {
+	ctx, cancel := d.ctxWithin(mountBudget)
+	defer cancel()
+	an, vol, unlock, err := d.resolveLocked(ctx, req.Name)
+	defer unlock()
+
+	// Already mounted here: serve it even if the array lookup failed.
+	d.mu.Lock()
+	st, ok := d.mounts[an]
+	d.mu.Unlock()
+	if ok && d.lostMount(st) {
+		d.forgetMount(an, st)
+		ok = false
+	}
+	if ok {
+		// Preempted by another node, the device under this mount is dead and a
+		// container given it would only get I/O errors.
+		if err == nil && !vol.Destroyed && d.requireHost(ctx) == nil {
+			if conns, cerr := d.array.ListConnections(ctx, an); cerr == nil && !slices.ContainsFunc(conns, func(c flasharray.Connection) bool { return c.Host == d.hostName() }) {
+				return nil, fmt.Errorf("volume %s is mounted on this node but the array no longer connects it here (%d other connection(s)); the mount is stale until the containers that hold it stop", req.Name, len(conns))
+			}
+		}
+		d.cancelKeep(an)
+		d.cancelTeardown(st)
+		st.refs[req.ID] = time.Now()
+		return &plugin.MountResponse{Mountpoint: st.mountpoint}, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
+	}
+	if vol.Destroyed {
+		return nil, fmt.Errorf("volume %s is destroyed on the array", req.Name)
+	}
+	if err := d.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := d.takeOver(ctx, an, req.Name); err != nil {
+		return nil, err
+	}
+	if err := d.clearLeftover(ctx, an, req.Name, vol.Serial); err != nil {
+		return nil, err
+	}
+
+	lun, err := d.connectSwept(ctx, an, req.Name, vol.Serial)
+	if err != nil {
+		return nil, err
+	}
+
+	dev, err := d.tr.WaitForDevice(ctx, vol.Serial)
+	if err != nil {
+		if d.keepAttached(an, vol.Serial) {
+			return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host in time; it stays attached for %s so a retry can use it: %w", req.Name, vol.Serial, d.keepFor(), err)
+		}
+		d.rollbackAttach(ctx, an, vol.Serial, "")
+		return nil, fmt.Errorf("volume %s (serial %s) did not appear on the host: %w", req.Name, vol.Serial, err)
+	}
+	if err := d.tr.CheckLUN(ctx, dev, lun); err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
+	}
+
+	// The device is ours, so a mount of it elsewhere on this node is a leftover
+	// of this same volume; detaching would pull it from under that mount.
+	if other, err := d.mnt.MountedAt(dev); err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		return nil, fmt.Errorf("volume %s: check whether %s is already mounted: %w", req.Name, dev, err)
+	} else if other != "" {
+		return nil, fmt.Errorf("volume %s: %s is already mounted at %s on this node; unmount it there first", req.Name, dev, other)
+	}
+
+	// Only a volume nothing has ever written to may be formatted: blkid also
+	// finds "no filesystem" on a damaged one.
+	fstype, formatted, err := d.mnt.EnsureFilesystem(ctx, dev, d.cfg.FSType, d.cfg.MkfsOptions, vol.Written == 0)
+	if err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		if errors.Is(err, mounter.ErrNoFilesystem) {
+			return nil, fmt.Errorf("volume %s: no %s filesystem found on %s, but the array reports %d bytes written to it; refusing to format (damaged filesystem?): %w", req.Name, d.cfg.FSType, dev, vol.Written, err)
+		}
+		return nil, err
+	}
+	mp := filepath.Join(d.cfg.MountRoot, req.Name)
+	if err := d.mnt.Mount(ctx, dev, mp, fstype, d.mountOptions(fstype)); err != nil {
+		d.rollbackAttach(ctx, an, vol.Serial, dev)
+		return nil, err
+	}
+	// multipathd can change the map between the check above and the mount.
+	if err := d.tr.CheckLUN(ctx, dev, lun); err != nil {
+		return nil, d.abandonMount(ctx, an, vol.Serial, dev, mp, req.Name, err)
+	}
+
+	st = &mountState{dockerName: req.Name, serial: vol.Serial, dev: dev, mountpoint: mp, refs: map[string]time.Time{req.ID: time.Now()}}
+	d.mu.Lock()
+	d.mounts[an] = st
+	d.mu.Unlock()
+	// Only now: a retry that fails before this leaves a kept attachment's
+	// release scheduled, and one firing meanwhile waited on an's lock.
+	d.cancelKeep(an)
+	d.log.Info("mounted", "volume", req.Name, "dev", dev, "mountpoint", mp, "fs", fstype, "formatted", formatted)
+	return &plugin.MountResponse{Mountpoint: mp}, nil
+}
+
+// lostMount reports whether st's filesystem was unmounted behind this plugin's
+// back; the Pure plugin's attach does that to volumes it doesn't know about.
+func (d *Driver) lostMount(st *mountState) bool {
+	live, err := d.mnt.FilesystemMounted(st.mountpoint)
+	if err != nil {
+		d.log.Warn("cannot check whether the volume is still mounted; assuming it is", "volume", st.dockerName, "err", err)
+		return false
+	}
+	if !live {
+		d.log.Error("volume's filesystem was unmounted outside this plugin; containers still holding it see an empty read-only directory", "volume", st.dockerName, "mountpoint", st.mountpoint, "refs", len(st.refs))
+	}
+	return !live
+}
+
+// forgetMount drops the state of a mount that is gone, so the next Mount
+// attaches afresh. The caller holds an's lock.
+func (d *Driver) forgetMount(an string, st *mountState) {
+	d.cancelTeardown(st)
+	d.mu.Lock()
+	if d.mounts[an] == st {
+		delete(d.mounts, an)
+	}
+	d.mu.Unlock()
+}
+
+// connectSwept connects an to this host, then deletes this array's host paths
+// whose LUN number the array now gives to another volume (transport Sweep).
+// Every change to what this host's LUNs carry (connects here, and the
+// detach-then-disconnect of releaseHost) and every rescan runs under the
+// transport's Exclusive lock, so the LUN map the sweep reads covers every path
+// a rescan can have created.
+func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string) (int, error) {
+	var lun int
+	prefix := arrayPrefix(serial)
+	d.prefix.Store(prefix)
+	err := d.tr.Exclusive(ctx, func() error {
+		// First clear paths on LUN numbers the array does not map here: the
+		// connect may hand one of them out, and until the sweep after it a
+		// leftover path there would reach the newly connected volume.
+		want, err := d.array.HostLUNs(ctx, d.hostName())
+		if flasharray.IsNotFound(err) {
+			if err := d.reensureHost(ctx); err != nil {
+				return fmt.Errorf("volume %s: %w", dockerName, err)
+			}
+			want, err = d.array.HostLUNs(ctx, d.hostName())
+		}
+		if err != nil {
+			return fmt.Errorf("volume %s: read this host's LUN map before attaching: %w", dockerName, err)
+		}
+		if err := d.tr.Sweep(ctx, want, prefix, -1, false); err != nil {
+			if errors.Is(err, transport.ErrPathsHeld) {
+				return fmt.Errorf("volume %s: not attaching: %w", dockerName, err)
+			}
+			d.log.Warn("pre-attach sweep left stale paths", "volume", dockerName, "err", err)
+		}
+		had := slices.Contains(slices.Collect(maps.Values(want)), strings.ToLower(serial))
+		lun, err = d.array.Connect(ctx, d.hostName(), an)
+		if err != nil {
+			return fmt.Errorf("connect %s to %s: %w", dockerName, d.hostName(), err)
+		}
+		d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
+		// Two nodes mounting at the same moment each find the volume free in
+		// takeOver and then both connect. Whichever looks afterwards and sees
+		// the other gives up, so at most one goes on to mount.
+		if others, err := d.otherHosts(ctx, an); err != nil || len(others) > 0 {
+			if !had { // a connection from before this mount may carry a running container
+				d.rollbackLocked(ctx, an, serial, "")
+			}
+			if err != nil {
+				return fmt.Errorf("volume %s: check for other hosts after attaching: %w", dockerName, err)
+			}
+			return fmt.Errorf("volume %s: host %s attached it at the same moment; not mounting it on two nodes, a retry waits for that host to release it", dockerName, strings.Join(others, ","))
+		}
+		want, err = d.array.HostLUNs(ctx, d.hostName())
+		if err == nil {
+			err = d.tr.Sweep(ctx, want, prefix, lun, false)
+		}
+		if err != nil {
+			d.rollbackLocked(ctx, an, serial, "")
+			return fmt.Errorf("volume %s: clear stale paths before attaching: %w", dockerName, err)
+		}
+		return nil
+	})
+	return lun, err
+}
+
+// cleanupBudget bounds teardown under the Exclusive lock. Teardown gets its
+// own deadline because the request's may have run out while it waited for the
+// lock, and a teardown cut short leaves paths or connections behind.
+const cleanupBudget = 60 * time.Second
+
+func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+}
+
+// pathCheckInterval and orphanCheckInterval are variables so tests needn't wait.
+var (
+	pathCheckInterval   = 30 * time.Second
+	orphanCheckInterval = 10 * time.Minute
+)
+
+// RunPathCheck re-checks this host's paths against the array until ctx ends.
+// The sweeps around each attach close every window the driver itself opens,
+// but a path the kernel scans late, or a LUN reassigned by someone else, can
+// still put a path into a live map that reaches another volume. It also
+// looks, less often, for mounts only orphaned refs keep (reapOrphans).
+func (d *Driver) RunPathCheck(ctx context.Context) {
+	t := time.NewTicker(pathCheckInterval)
+	defer t.Stop()
+	o := time.NewTicker(orphanCheckInterval)
+	defer o.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.checkPaths(ctx)
+		case <-o.C:
+			d.reapOrphans(ctx)
+		}
+	}
+}
+
+// reapLockWait is how long reapOrphans waits for a volume another operation
+// holds before leaving it to the next round.
+const reapLockWait = 5 * time.Second
+
+// reapOrphans lets go of mounts held only by refs Docker never released.
+// Unmount drops such refs, but only when another Unmount for the volume
+// comes; a Mount Docker never paired with one kept its volume mounted and
+// connected for good.
+func (d *Driver) reapOrphans(ctx context.Context) {
+	d.mu.Lock()
+	mounted := slices.Collect(maps.Keys(d.mounts))
+	d.mu.Unlock()
+	for _, an := range mounted {
+		lctx, cancel := context.WithTimeout(ctx, reapLockWait)
+		unlock, err := d.lockCtx(lctx, an)
+		cancel()
+		if err != nil {
+			continue
+		}
+		d.mu.Lock()
+		st, ok := d.mounts[an]
+		ok = ok && !d.closing
+		d.mu.Unlock()
+		if ok && len(st.refs) > 0 && d.dropStaleRefs(st, st.dockerName) {
+			tctx, cancel := d.ctxWithin(unmountBudget)
+			if err := d.lastRefGone(tctx, an, st); err != nil {
+				d.log.Error("releasing a volume only orphaned mount refs kept failed", "volume", st.dockerName, "err", err)
+			}
+			cancel()
+		}
+		unlock()
+	}
+}
+
+// checkPaths deletes only paths on a LUN the array gives to a different
+// volume (crossedOnly), so an incomplete answer from the array can never cut
+// a live volume's path.
+func (d *Driver) checkPaths(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, pathCheckInterval)
+	defer cancel()
+	// Also what brings the host object back once an array that was
+	// unreachable at start answers again.
+	if err := d.requireHost(ctx); err != nil {
+		d.log.Warn("path check skipped: no host object yet", "err", err)
+		return
+	}
+	err := d.tr.Exclusive(ctx, func() error {
+		want, err := d.array.HostLUNs(ctx, d.hostName())
+		if flasharray.IsNotFound(err) {
+			// No host object means nothing is connected here; the next mount recreates it.
+			d.log.Debug("path check: host object is gone from the array", "host", d.hostName())
+			return nil
+		}
+		if err != nil {
+			d.log.Warn("path check: cannot read this host's LUN map", "err", err)
+			return nil
+		}
+		prefix, _ := d.prefix.Load().(string)
+		for _, serial := range want {
+			prefix = arrayPrefix(serial)
+			d.prefix.Store(prefix)
+			break
+		}
+		if prefix == "" {
+			return nil // nothing connected or mounted yet
+		}
+		if err := d.tr.Sweep(ctx, want, prefix, -1, true); err != nil {
+			d.log.Error("path check left a path that reaches another volume", "err", err)
+		}
+		return nil
+	})
+	if err != nil {
+		d.log.Warn("path check skipped: attaches held the host's lock all round", "err", err)
+	}
+}
+
+// arrayPrefix is the part of a FlashArray volume serial all volumes of one
+// array share (24 hex digits: 16 identify the array, 8 the volume).
+func arrayPrefix(serial string) string {
+	return strings.ToLower(serial[:min(16, len(serial))])
+}
+
+// detachLocked removes this host's devices for serial, giving the transport
+// the array's LUN map so paths whose LUN no longer carries the volume go
+// unflushed. The caller holds the transport's Exclusive lock.
+func (d *Driver) detachLocked(ctx context.Context, serial, dev string) error {
+	want, err := d.array.HostLUNs(ctx, d.hostName())
+	if err != nil {
+		d.log.Warn("cannot read this host's LUN map; detaching without checking paths against it", "serial", serial, "err", err)
+		want = nil
+	}
+	return d.tr.Detach(ctx, serial, dev, want)
+}
+
+// releaseHost detaches serial's devices and, only if that worked, disconnects
+// an from this host, as one step under the transport's Exclusive lock: a
+// rescan in between would rebuild the paths onto a LUN the disconnect frees,
+// and disconnecting under paths the host keeps hands their LUN number to the
+// next volume, which they then silently reach.
+func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detachErr, disconnectErr error) {
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.requireHost(ctx); err != nil {
+		return err, nil
+	}
+	if err := d.tr.Exclusive(ctx, func() error {
+		if detachErr = d.detachLocked(ctx, serial, dev); detachErr != nil {
+			return nil
+		}
+		disconnectErr = d.array.Disconnect(ctx, d.hostName(), an)
+		return nil
+	}); err != nil {
+		detachErr = err
+	}
+	return detachErr, disconnectErr
+}
+
+// releasePoll and maxReleaseWait are variables so tests needn't wait.
+var (
+	releasePoll    = 2 * time.Second
+	maxReleaseWait = 30 * time.Second
+)
+
+// takeOver makes sure no other host holds an. A block volume is single-writer.
+// On a drain swarm starts the new task while the old one is still stopping,
+// and disconnecting the old host then cuts writes it is still flushing, which
+// corrupted XFS on staging. So first wait for the other host to release it;
+// only one that keeps it past PreemptGrace is presumed dead and preempted.
+func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
+	others, err := d.otherHosts(ctx, an)
+	if err != nil || len(others) == 0 {
+		d.clearHeld(an)
+		return err
+	}
+	if !d.cfg.PreemptRWO {
+		return fmt.Errorf("volume %s is attached to host %s (FA_PREEMPT_RWO=false)", dockerName, others[0])
+	}
+	held := d.markHeld(an, others)
+	wait := min(d.cfg.PreemptGrace-time.Since(held), maxReleaseWait)
+	deadline := time.Now().Add(wait)
+	for len(others) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(releasePoll):
+		}
+		if others, err = d.otherHosts(ctx, an); err != nil {
+			return err
+		}
+		if len(others) > 0 {
+			held = d.markHeld(an, others)
+		}
+	}
+	if len(others) == 0 {
+		d.clearHeld(an)
+		d.log.Info("other host released the volume", "volume", dockerName, "waited", time.Since(held).Round(time.Second))
+		return nil
+	}
+	if since := time.Since(held); since < d.cfg.PreemptGrace {
+		return fmt.Errorf("volume %s is still attached to host %s; waiting up to %s for it to release before preempting (%s left)",
+			dockerName, strings.Join(others, ","), d.cfg.PreemptGrace, (d.cfg.PreemptGrace - since).Round(time.Second))
+	}
+	for _, h := range others {
+		d.log.Warn("preempting attachment: the other host kept it past the grace period", "volume", dockerName, "from_host", h, "grace", d.cfg.PreemptGrace)
+		if err := d.array.Disconnect(ctx, h, an); err != nil {
+			return fmt.Errorf("preempt %s from %s: %w", dockerName, h, err)
+		}
+	}
+	d.clearHeld(an)
+	return nil
+}
+
+func (d *Driver) otherHosts(ctx context.Context, an string) ([]string, error) {
+	conns, err := d.array.ListConnections(ctx, an)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, c := range conns {
+		if c.Host != d.hostName() {
+			out = append(out, c.Host)
+		}
+	}
+	return out, nil
+}
+
+// markHeld returns when an was first seen held by exactly these hosts. A new
+// holder restarts the grace: it is live, not the host that went quiet.
+func (d *Driver) markHeld(an string, others []string) time.Time {
+	hosts := strings.Join(slices.Sorted(slices.Values(others)), ",")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	h, ok := d.heldSince[an]
+	if !ok || h.hosts != hosts || now.Sub(h.seen) > staleHold {
+		h = holdState{hosts: hosts, since: now}
+	}
+	h.seen = now
+	d.heldSince[an] = h
+	return h.since
+}
+
+func (d *Driver) clearHeld(an string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.heldSince, an)
+}
+
+// clearLeftover runs before this host connects an. A device for the volume
+// that this host has no array connection for was left behind when the volume
+// was taken away. If something still holds it, it is a stale mount: on
+// reconnect multipathd would revive its paths and the stale filesystem would
+// write old metadata over the volume, as happened on staging. An idle one is
+// removed so the attach builds a fresh device.
+func (d *Driver) clearLeftover(ctx context.Context, an, dockerName, serial string) error {
+	conns, err := d.array.ListConnections(ctx, an)
+	if err != nil {
+		return err
+	}
+	for _, c := range conns {
+		if c.Host == d.hostName() {
+			return nil // still connected here: a running container may be using it
+		}
+	}
+	dev := d.tr.FindDevice(ctx, serial)
+	if dev == "" {
+		return nil
+	}
+	busy, err := d.mnt.Busy(dev)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("volume %s: check leftover device %s: %w", dockerName, dev, err)
+	}
+	if busy {
+		return fmt.Errorf("volume %s: %s is still held on this node by a mount from before the volume was disconnected from it; reconnecting would let that stale mount write over the volume (stop what holds it, or reboot the node)", dockerName, dev)
+	}
+	d.log.Warn("removing a leftover device from an earlier attachment before reconnecting", "volume", dockerName, "dev", dev)
+	if err := d.tr.Exclusive(ctx, func() error { return d.detachLocked(ctx, serial, dev) }); err != nil {
+		return fmt.Errorf("volume %s: remove leftover device %s: %w", dockerName, dev, err)
+	}
+	return nil
+}
+
+// rollbackAttach is best effort and logs its failures. It disconnects on the
+// array only once the host side is gone: disconnecting under paths the host
+// keeps frees their LUN number for the next volume, which those paths then
+// silently reach.
+func (d *Driver) rollbackAttach(ctx context.Context, an, serial, dev string) {
+	// Its own budget: the request's may be spent, and a skipped rollback
+	// leaves the attachment for the next mount or a preempting node.
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.tr.Exclusive(ctx, func() error {
+		d.rollbackLocked(ctx, an, serial, dev)
+		return nil
+	}); err != nil {
+		d.log.Error("rollback skipped; the attachment stays in place", "array_name", an, "serial", serial, "err", err)
+	}
+}
+
+// rollbackLocked is rollbackAttach for a caller holding the Exclusive lock.
+func (d *Driver) rollbackLocked(ctx context.Context, an, serial, dev string) {
+	ctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := d.detachLocked(ctx, serial, dev); err != nil {
+		d.log.Error("rollback: host detach failed; array connection left in place so its LUN is not reused under this host's paths", "array_name", an, "serial", serial, "err", err)
+		return
+	}
+	if err := d.array.Disconnect(ctx, d.hostName(), an); err != nil {
+		d.log.Error("rollback: array disconnect failed; volume is still connected to this host", "array_name", an, "host", d.hostName(), "err", err)
+	}
+	if err := d.tr.PostDisconnect(ctx); err != nil {
+		d.log.Warn("rollback: post-disconnect failed", "array_name", an, "err", err)
+	}
+}
+
+// abandonMount backs out of a mount whose device turned out to reach another
+// volume. The filesystem is shut down first, without flushing its log, so not
+// even the unmount writes through the foreign path.
+func (d *Driver) abandonMount(ctx context.Context, an, serial, dev, mp, dockerName string, cause error) error {
+	d.log.Error("device reached another volume right after mounting; shutting the filesystem down and backing out", "volume", dockerName, "dev", dev, "err", cause)
+	if err := d.mnt.Shutdown(mp); err != nil {
+		d.log.Error("filesystem shutdown failed; unmounting anyway", "volume", dockerName, "err", err)
+	}
+	if err := d.mnt.Unmount(ctx, mp); err != nil {
+		return fmt.Errorf("volume %s: %w; unmounting it failed too, so it stays mounted at %s: %w", dockerName, cause, mp, err)
+	}
+	d.rollbackAttach(ctx, an, serial, dev)
+	return fmt.Errorf("volume %s: %w", dockerName, cause)
+}
+
+// keepFor is how long an attachment whose device was too slow to appear stays
+// for a retry: half the preempt grace, so a node waiting to take the volume
+// over sees it released before it would preempt.
+func (d *Driver) keepFor() time.Duration { return d.cfg.PreemptGrace / 2 }
+
+// keepAttached keeps an connected after its device did not appear in time,
+// instead of rolling the attach back. Such a device is usually only late: on
+// staging, udev and multipathd fell tens of seconds behind while a node started
+// dozens of containers, and the rollbacks deleted paths multipathd was still
+// building maps from and freed their LUNs for the next attaches, which mixed
+// two volumes in one map. Docker retries the mount within seconds and then
+// finds the device; one nothing mounts within keepFor is released then, once
+// the host has caught up. It reports false when keeping is off (no grace).
+// The caller holds an's lock.
+func (d *Driver) keepAttached(an, serial string) bool {
+	wait := d.keepFor()
+	if wait <= 0 {
+		return false
+	}
+	d.releaseAfter(an, serial, wait)
+	return true
+}
+
+// teardownRetry paces retries of a failed teardown or release when no linger
+// or preempt grace is configured to. A variable so tests needn't wait.
+var teardownRetry = 30 * time.Second
+
+// releaseLater retries the release of an attachment whose filesystem is
+// already unmounted. Dropped instead, it stayed connected until another node
+// waited out the grace and preempted it. serial is "" when the teardown could
+// not look it up. The caller holds an's lock.
+func (d *Driver) releaseLater(an, serial string) {
+	wait := d.keepFor()
+	if wait <= 0 {
+		wait = teardownRetry
+	}
+	d.releaseAfter(an, serial, wait)
+}
+
+func (d *Driver) releaseAfter(an, serial string, wait time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.pending[an]
+	if p == nil {
+		p = &pendingAttach{}
+		d.pending[an] = p
+	} else {
+		p.timer.Stop()
+	}
+	p.serial = serial
+	p.gen++
+	gen := p.gen
+	p.timer = time.AfterFunc(wait, func() { d.keepExpired(an, gen) })
+}
+
+// cancelKeep hands a kept attachment to the caller, which holds an's lock.
+func (d *Driver) cancelKeep(an string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if p := d.pending[an]; p != nil {
+		p.timer.Stop()
+		delete(d.pending, an)
+	}
+}
+
+func (d *Driver) keepExpired(an string, gen int) {
+	unlock := d.lock(an)
+	defer unlock()
+	d.mu.Lock()
+	p, ok := d.pending[an]
+	current := ok && p.gen == gen && !d.closing
+	if current {
+		delete(d.pending, an)
+	}
+	_, mounted := d.mounts[an]
+	d.mu.Unlock()
+	if !current || mounted {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
+	defer cancel()
+	serial, err := p.serial, error(nil)
+	if serial == "" {
+		v, verr := d.array.GetVolume(ctx, an)
+		if flasharray.IsNotFound(verr) {
+			return // gone from the array, and its connection with it
+		}
+		if err = verr; err == nil {
+			serial = v.Serial
+		}
+	}
+	if err == nil {
+		err = d.releaseIdle(ctx, an, serial)
+	}
+	if err == nil {
+		d.log.Info("released an attachment no mount came back for", "array_name", an)
+		return
+	}
+	d.log.Error("releasing a kept attachment failed; trying again later", "array_name", an, "err", err)
+	d.releaseLater(an, p.serial)
+}
+
+// releaseIdle is releaseHost for an attachment nothing here has mounted. A
+// device something still holds is left alone: a filesystem unmounted moments
+// ago can still be flushing in a container's mount namespace.
+func (d *Driver) releaseIdle(ctx context.Context, an, serial string) error {
+	if dev := d.tr.FindDevice(ctx, serial); dev != "" {
+		busy, err := d.mnt.Busy(dev)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check whether %s is in use: %w", dev, err)
+		}
+		if busy {
+			return fmt.Errorf("%s is still in use", dev)
+		}
+	}
+	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, "")
+	if detachErr != nil || disconnectErr != nil {
+		return errors.Join(detachErr, disconnectErr)
+	}
+	if err := d.tr.PostDisconnect(ctx); err != nil {
+		d.log.Warn("post-disconnect failed", "array_name", an, "err", err)
+	}
+	return nil
+}
+
+// Unmount implements plugin.Driver.
+func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
+	ctx, cancel := d.ctxWithin(unmountBudget)
+	defer cancel()
+	an, _, err := d.resolve(ctx, req.Name)
+	if err != nil {
+		return err
+	}
+	unlock := d.lock(an)
+	defer unlock()
+
+	d.mu.Lock()
+	st, ok := d.mounts[an]
+	d.mu.Unlock()
+	if !ok {
+		return d.detachUntracked(ctx, an, req.Name)
+	}
+	delete(st.refs, req.ID)
+	if len(st.refs) > 0 && !d.dropStaleRefs(st, req.Name) {
+		d.log.Info("volume still in use here; kept mounted", "volume", req.Name, "refs", len(st.refs))
+		return nil
+	}
+	return d.lastRefGone(ctx, an, st)
+}
+
+// lastRefGone lets go of a mount nothing refers to any more: at once, or after
+// the linger. The caller holds an's lock.
+func (d *Driver) lastRefGone(ctx context.Context, an string, st *mountState) error {
+	if d.cfg.UnmountLinger > 0 {
+		// The umount that used to follow at once flushed the filesystem; a
+		// lingering one must not hold unwritten data while it waits.
+		err := d.mnt.Sync(ctx, st.mountpoint)
+		if err == nil {
+			d.scheduleTeardown(an, st)
+			d.log.Info("last container let go; keeping the volume attached briefly in case it is mounted again", "volume", st.dockerName, "linger", d.cfg.UnmountLinger)
+			return nil
+		}
+		d.log.Warn("flushing the lingering volume failed; tearing down now", "volume", st.dockerName, "err", err)
+	}
+	err := d.teardown(ctx, an, st, st.dockerName)
+	if err != nil {
+		d.retryTeardown(an, st)
+	}
+	return err
+}
+
+// teardown unmounts an's filesystem, detaches it from this host and
+// disconnects it on the array. The caller holds an's lock.
+func (d *Driver) teardown(ctx context.Context, an string, st *mountState, dockerName string) error {
+	if err := d.mnt.Unmount(ctx, st.mountpoint); err != nil {
+		return err
+	}
+	if err := os.Remove(st.mountpoint); err != nil && !os.IsNotExist(err) {
+		d.log.Warn("remove mountpoint dir", "mountpoint", st.mountpoint, "err", err)
+	}
+	serial := st.serial
+	if serial == "" { // recovered mount: look it up
+		v, err := d.array.GetVolume(ctx, an)
+		if err != nil {
+			// Filesystem is already unmounted, so drop the state; a later Mount re-attaches cleanly.
+			d.dropMount(an)
+			d.releaseLater(an, "")
+			return fmt.Errorf("volume %s unmounted but serial lookup failed; host devices and array connection left in place until a retry: %w", dockerName, err)
+		}
+		serial = v.Serial
+	}
+	dev := st.dev
+	if dev == "" {
+		dev = d.tr.FindDevice(ctx, serial)
+	}
+	if err := d.waitIdle(ctx, dev); err != nil {
+		d.dropMount(an)
+		d.releaseLater(an, serial)
+		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place until a retry", dockerName, err)
+	}
+	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, st.dev)
+	if detachErr != nil {
+		// Disconnecting on the array under a device the host still holds turns
+		// a cleanup failure into I/O errors for whatever holds it.
+		d.dropMount(an)
+		d.releaseLater(an, serial)
+		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place until a retry: %w", dockerName, detachErr)
+	}
+	var errs []error
+	if disconnectErr != nil {
+		errs = append(errs, disconnectErr)
+		d.releaseLater(an, serial)
+	}
+	if err := d.tr.PostDisconnect(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	d.dropMount(an)
+	d.log.Info("unmounted", "volume", dockerName)
+	return errors.Join(errs...)
+}
+
+func (d *Driver) dropMount(an string) {
+	d.mu.Lock()
+	delete(d.mounts, an)
+	d.mu.Unlock()
+}
+
+// Docker mounts a volume, unmounts it and mounts it again within a second or
+// two when it populates a new container from its image. Tearing down and
+// re-attaching in between churned LUN numbers, and the paths left behind by
+// those quick cycles are what the LUN checks kept catching on staging (and,
+// once, a moment of I/O errors on a freshly mounted volume). So the last
+// Unmount only schedules the teardown.
+func (d *Driver) scheduleTeardown(an string, st *mountState) {
+	d.scheduleTeardownIn(an, st, d.cfg.UnmountLinger)
+}
+
+func (d *Driver) scheduleTeardownIn(an string, st *mountState, wait time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st.linger != nil {
+		st.linger.Stop()
+	}
+	st.lingerGen++
+	gen := st.lingerGen
+	st.linger = time.AfterFunc(wait, func() { d.lingerExpired(an, st, gen) })
+}
+
+// retryTeardown re-arms the deferred teardown after one failed with st still
+// mounted. Left with no refs and no timer, the volume would sit mounted and
+// connected until another node preempts it. The caller holds an's lock.
+func (d *Driver) retryTeardown(an string, st *mountState) {
+	d.mu.Lock()
+	still := d.mounts[an] == st && !d.closing
+	d.mu.Unlock()
+	if !still || len(st.refs) > 0 {
+		return
+	}
+	wait := d.cfg.UnmountLinger
+	if wait <= 0 {
+		wait = teardownRetry
+	}
+	d.scheduleTeardownIn(an, st, wait)
+}
+
+func (d *Driver) cancelTeardown(st *mountState) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st.linger != nil {
+		st.linger.Stop()
+		st.linger = nil
+	}
+	st.lingerGen++
+}
+
+// lingerExpired tears an down if nothing mounted it again meanwhile, and only
+// if no container still has its filesystem (a mount recovered at plugin start
+// can belong to a running container; Docker's Unmount for it comes later).
+func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
+	unlock := d.lock(an)
+	defer unlock()
+	d.mu.Lock()
+	cur, ok := d.mounts[an]
+	current := !d.closing && ok && cur == st && st.lingerGen == gen && len(st.refs) == 0
+	if current {
+		st.linger = nil
+	}
+	d.mu.Unlock()
+	if !current {
+		return
+	}
+	// A refused or failed teardown tries again (retryTeardown). A lost
+	// filesystem has nothing a container could hold, and the bare directory
+	// would match every container on the root filesystem.
+	if lost := d.lostMount(st); lost {
+		d.log.Info("tearing down a volume whose filesystem was unmounted outside this plugin", "volume", st.dockerName)
+	} else if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
+		if err != nil || !st.heldLogged {
+			d.log.Warn("not tearing down yet: a container may still have the volume mounted; checking again every interval", "volume", st.dockerName, "err", err)
+			st.heldLogged = err == nil
+		}
+		d.retryTeardown(an, st)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
+	defer cancel()
+	if err := d.teardown(ctx, an, st, st.dockerName); err != nil {
+		d.log.Error("teardown after linger failed", "volume", st.dockerName, "err", err)
+		d.retryTeardown(an, st)
+	}
+}
+
+// Shutdown tears down volumes that are only lingering, waiting for any
+// teardown already running, so a plugin stopped right after a drain does not
+// leave them mounted and connected for another node to preempt. Mounts a
+// container may still use are left alone.
+func (d *Driver) Shutdown(ctx context.Context) {
+	d.mu.Lock()
+	d.closing = true
+	// Which are idle is only known under each volume's lock, which guards refs.
+	mounted := slices.Collect(maps.Keys(d.mounts))
+	kept := len(d.pending)
+	d.mu.Unlock()
+	if kept > 0 {
+		// Releasing waits on multipathd, which can take longer than shutdown has.
+		d.log.Warn("shutdown: attachments kept for a retry stay connected; the next mount here reuses them, another node preempts them", "count", kept)
+	}
+	for _, an := range mounted {
+		unlock, err := d.lockCtx(ctx, an) // waits for a teardown already running
+		if err != nil {
+			d.log.Warn("shutdown: out of time; lingering volumes left mounted", "err", err)
+			return
+		}
+		d.mu.Lock()
+		st, ok := d.mounts[an]
+		d.mu.Unlock()
+		if ok && len(st.refs) == 0 {
+			d.cancelTeardown(st)
+			if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err == nil && !inUse {
+				if err := d.teardown(ctx, an, st, st.dockerName); err != nil {
+					d.log.Error("shutdown: teardown failed", "volume", st.dockerName, "err", err)
+				}
+			}
+		}
+		unlock()
+	}
+}
+
+// refPending is a variable so tests needn't wait.
+var refPending = 2 * time.Minute
+
+// dropStaleRefs clears st's remaining refs if no container uses the volume.
+// Docker has sent Mounts it never paired with an Unmount; trusting those refs
+// left filesystems mounted after their last container stopped, and the next
+// node to mount the volume preempted them mid-write. A ref younger than
+// refPending may belong to a container still starting, so it always counts.
+func (d *Driver) dropStaleRefs(st *mountState, dockerName string) bool {
+	for _, added := range st.refs {
+		if time.Since(added) < refPending {
+			return false
+		}
+	}
+	inUse, err := d.mnt.InUseByContainer(st.mountpoint)
+	if err != nil {
+		d.log.Warn("cannot tell whether a container still uses the volume; keeping it mounted", "volume", dockerName, "err", err)
+		return false
+	}
+	if inUse {
+		return false
+	}
+	d.log.Warn("dropping mount refs Docker never released: no container uses the volume", "volume", dockerName, "refs", len(st.refs))
+	clear(st.refs)
+	return true
+}
+
+// detachUntracked handles Unmount for a volume this process never mounted: the
+// plugin was disabled or upgraded under running containers, which keep the
+// filesystem mounted in their own namespaces. Disconnecting on the array as
+// soon as Docker asked lost writes still being flushed and corrupted XFS.
+func (d *Driver) detachUntracked(ctx context.Context, an, dockerName string) error {
+	v, err := d.array.GetVolume(ctx, an)
+	if flasharray.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("volume %s: look up serial before detach: %w", dockerName, err)
+	}
+	dev := d.tr.FindDevice(ctx, v.Serial)
+	if dev != "" {
+		if err := d.waitIdle(ctx, dev); err != nil {
+			return fmt.Errorf("volume %s: %w; host device and array connection left in place", dockerName, err)
+		}
+	}
+	detachErr, disconnectErr := d.releaseHost(ctx, an, v.Serial, dev)
+	if detachErr != nil {
+		return fmt.Errorf("volume %s: host detach failed; array connection left in place: %w", dockerName, detachErr)
+	}
+	var errs []error
+	if disconnectErr != nil {
+		errs = append(errs, disconnectErr)
+	}
+	if dev != "" {
+		if err := d.tr.PostDisconnect(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		d.log.Info("detached volume mounted before this plugin start", "volume", dockerName, "dev", dev)
+	}
+	return errors.Join(errs...)
+}
+
+// idlePoll is a variable so tests needn't wait.
+var idlePoll = 500 * time.Millisecond
+
+const detachReserve = 15 * time.Second
+
+// waitIdle waits up to the attach timeout for the kernel to release dev. A
+// stopped container's mount namespace is torn down asynchronously, so its
+// filesystem can still be flushing when Docker calls Unmount.
+func (d *Driver) waitIdle(ctx context.Context, dev string) error {
+	if dev == "" {
+		return nil
+	}
+	start := time.Now()
+	deadline := start.Add(d.cfg.AttachTimeout)
+	// Leave the detach and disconnect that follow time to run.
+	if dl, ok := ctx.Deadline(); ok && dl.Add(-detachReserve).Before(deadline) {
+		deadline = dl.Add(-detachReserve)
+	}
+	for {
+		busy, err := d.mnt.Busy(dev)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("check whether %s is in use: %w", dev, err)
+		}
+		if !busy {
+			return nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("%s is still in use after %s (a filesystem mounted elsewhere?)", dev, time.Since(start).Round(time.Second))
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(idlePoll):
+		}
+	}
+}
+
+// Path implements plugin.Driver.
+func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
+	an := d.cachedName(req.Name)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st, ok := d.mounts[an]; ok {
+		return &plugin.PathResponse{Mountpoint: st.mountpoint}, nil
+	}
+	return &plugin.PathResponse{}, nil
+}
+
+// Get implements plugin.Driver.
+func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
+	ctx, cancel := d.ctxWithin(queryBudget)
+	defer cancel()
+	an, v, err := d.lookup(ctx, req.Name)
+	if err != nil {
+		if !flasharray.IsNotFound(err) {
+			if kv, ok := d.knownVolume(req.Name, err); ok {
+				d.log.Warn("array unreachable; answering from known volumes so Docker does not substitute a local volume", "volume", req.Name, "array_name", kv.Status["array_name"], "err", err)
+				return &plugin.GetResponse{Volume: kv}, nil
+			}
+		}
+		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
+	}
+	d.setKnown(req.Name, an)
+	return &plugin.GetResponse{Volume: d.toVolume(req.Name, an, v)}, nil
+}
+
+func (d *Driver) toVolume(dockerName, an string, v *flasharray.Volume) *plugin.Volume {
+	out := &plugin.Volume{
+		Name:      dockerName,
+		CreatedAt: v.Created.Format(time.RFC3339),
+		Status: map[string]any{
+			"array_name":  an,
+			"serial":      v.Serial,
+			"provisioned": v.Provisioned,
+			"destroyed":   v.Destroyed,
+			"transport":   d.tr.Name(),
+		},
+	}
+	d.mu.Lock()
+	if st, ok := d.mounts[an]; ok {
+		out.Mountpoint = st.mountpoint
+		out.Status["device"] = st.dev
+	}
+	d.mu.Unlock()
+	return out
+}
+
+// List implements plugin.Driver. Scope is global, so this lists every volume
+// in the namespace regardless of which node created it.
+func (d *Driver) List() (*plugin.ListResponse, error) {
+	ctx, cancel := d.ctxWithin(queryBudget)
+	defer cancel()
+	prefix := d.cfg.Namespace + "/"
+	tags, err := d.array.ListNameTags(ctx, prefix)
+	if err != nil {
+		d.mu.Lock()
+		byName := maps.Clone(d.known)
+		d.mu.Unlock()
+		if len(byName) == 0 {
+			return nil, err
+		}
+		d.log.Warn("array unreachable; listing known volumes", "volumes", len(byName), "err", err)
+		return d.listResponse(byName), nil
+	}
+	byName := make(map[string]string, len(tags))
+	d.mu.Lock()
+	for an, val := range tags {
+		name := strings.TrimPrefix(val, prefix)
+		d.names[name] = an
+		byName[name] = an
+	}
+	d.mu.Unlock()
+	d.replaceKnown(byName)
+	return d.listResponse(byName), nil
+}
+
+func (d *Driver) listResponse(byName map[string]string) *plugin.ListResponse {
+	resp := &plugin.ListResponse{}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name, an := range byName {
+		v := &plugin.Volume{Name: name}
+		if st, ok := d.mounts[an]; ok {
+			v.Mountpoint = st.mountpoint
+		}
+		resp.Volumes = append(resp.Volumes, v)
+	}
+	return resp
+}
+
+// Capabilities implements plugin.Driver.
+func (d *Driver) Capabilities() *plugin.CapabilitiesResponse {
+	return &plugin.CapabilitiesResponse{Capabilities: plugin.Capability{Scope: "global"}}
+}
