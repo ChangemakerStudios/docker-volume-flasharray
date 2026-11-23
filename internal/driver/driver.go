@@ -1052,6 +1052,20 @@ var (
 // still put a path into a live map that reaches another volume. It also
 // looks, less often, for mounts only orphaned refs keep (reapOrphans).
 func (d *Driver) RunPathCheck(ctx context.Context) {
+	// On its own goroutine: a path check can wait a long time for the host's
+	// lock, and a hold record is only worth watching between Docker's retries.
+	go func() {
+		h := time.NewTicker(holdWatchInterval)
+		defer h.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.C:
+				d.watchHolds(ctx)
+			}
+		}
+	}()
 	t := time.NewTicker(pathCheckInterval)
 	defer t.Stop()
 	o := time.NewTicker(orphanCheckInterval)
@@ -1273,6 +1287,45 @@ func (d *Driver) clearHeld(an string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.heldSince, an)
+}
+
+const (
+	holdWatchInterval = 5 * time.Second
+	holdWatchTimeout  = 10 * time.Second
+)
+
+// watchHolds drops the hold record of a volume that was released, or changed
+// hands, while no Mount here was waiting for it. Between Docker's retries
+// nothing looked, so a holder that let go and attached again kept the first
+// sighting's start time: on hardware a node was preempted 31 s into a new
+// attachment. A record a waiting Mount is refreshing is left to that Mount,
+// and an array that cannot be asked proves nothing.
+func (d *Driver) watchHolds(ctx context.Context) {
+	now := time.Now()
+	idle := map[string]holdState{}
+	d.mu.Lock()
+	for an, h := range d.heldSince {
+		switch quiet := now.Sub(h.seen); {
+		case quiet > staleHold:
+			delete(d.heldSince, an)
+		case quiet > 2*releasePoll:
+			idle[an] = h
+		}
+	}
+	d.mu.Unlock()
+	for an, h := range idle {
+		cctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
+		others, err := d.otherHosts(cctx, an)
+		cancel()
+		if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
+			continue
+		}
+		d.mu.Lock()
+		if d.heldSince[an] == h {
+			delete(d.heldSince, an)
+		}
+		d.mu.Unlock()
+	}
 }
 
 // clearLeftover runs before this host connects an. A device for the volume

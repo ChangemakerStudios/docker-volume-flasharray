@@ -1977,6 +1977,53 @@ func TestStaleHoldRecordRestartsGrace(t *testing.T) {
 	}
 }
 
+// A holder that lets go and attaches again between Docker's retries is live:
+// its grace starts over. Seen on hardware, where the first sighting's start
+// time stood and the node was preempted 31 s into its new attachment.
+func TestHoldRecordDroppedWhenHolderLetGoBetweenRetries(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 5*time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	// A Mount here gave up waiting ten seconds ago, with the grace long spent.
+	old := holdState{hosts: "other", since: time.Now().Add(-2 * time.Hour), seen: time.Now().Add(-10 * time.Second)}
+	d.heldSince[an] = old
+
+	fa.conns[an] = map[string]int{"other": 7}
+	d.watchHolds(context.Background())
+	if d.heldSince[an] != old {
+		t.Fatal("dropped the record of a host that still holds the volume")
+	}
+
+	fa.mu.Lock()
+	fa.vols[an].Destroyed = true // the fake then fails ListConnections
+	fa.mu.Unlock()
+	d.watchHolds(context.Background())
+	if d.heldSince[an] != old {
+		t.Fatal("dropped the record on an array error")
+	}
+	fa.mu.Lock()
+	fa.vols[an].Destroyed = false
+	delete(fa.conns, an) // the holder lets go
+	fa.mu.Unlock()
+	d.watchHolds(context.Background())
+	if _, held := d.heldSince[an]; held {
+		t.Fatal("kept the record of a volume its holder released")
+	}
+
+	fa.mu.Lock()
+	fa.conns[an] = map[string]int{"other": 7} // and attaches again
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait out a fresh grace, got %v", err)
+	}
+	if !fa.connected(an, "other") {
+		t.Fatal("preempted a holder that had let go and attached again")
+	}
+}
+
 // --- slow devices and maps that change under a mount -----------------------
 
 func (f *fakeArray) disconnectCalls() int {
