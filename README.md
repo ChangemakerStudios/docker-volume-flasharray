@@ -364,7 +364,9 @@ things prevent it:
   restarts; every successful `docker volume ls` replaces it with the array's
   view). When a `Get` or `List` can't reach the array, a volume in that file
   is still reported as existing, with `array_unreachable` in its status and
-  a warning in the log. Only lookups fall back; creating, mounting and
+  a warning in the log. A `Get` or `List` gives up on the array after 45
+  seconds, so that answer still arrives inside the minute Docker waits when
+  the array hangs instead of refusing. Only lookups fall back; creating, mounting and
   removing still need the array. Only the array's own answer that an object
   does not exist (HTTP 400 with its JSON error) counts as "not found": a 404
   or an HTML page from a controller mid-failover is treated as an outage, so

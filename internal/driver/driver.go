@@ -393,11 +393,14 @@ func (d *Driver) ctx() (context.Context, context.CancelFunc) {
 
 // Docker gives up on a Mount after 2 minutes and an Unmount after 1
 // (volume/drivers/proxy.go) and treats it as failed, while the driver would
-// finish it unseen. Mount and Unmount stay inside those limits. Variables so
-// tests needn't wait.
+// finish it unseen. Mount and Unmount stay inside those limits. Get and List
+// have 1 minute too, and one that outlasts it never delivers the known-volume
+// answer an outage needs: a management endpoint that hangs costs the client
+// 30s an attempt. Variables so tests needn't wait.
 var (
 	mountBudget   = 110 * time.Second
 	unmountBudget = 55 * time.Second
+	queryBudget   = 45 * time.Second
 )
 
 func (d *Driver) ctxWithin(limit time.Duration) (context.Context, context.CancelFunc) {
@@ -1513,7 +1516,7 @@ func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
 
 // Get implements plugin.Driver.
 func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
-	ctx, cancel := d.ctx()
+	ctx, cancel := d.ctxWithin(queryBudget)
 	defer cancel()
 	an, v, err := d.lookup(ctx, req.Name)
 	if err != nil {
@@ -1553,7 +1556,7 @@ func (d *Driver) toVolume(dockerName, an string, v *flasharray.Volume) *plugin.V
 // List implements plugin.Driver. Scope is global, so this lists every volume
 // in the namespace regardless of which node created it.
 func (d *Driver) List() (*plugin.ListResponse, error) {
-	ctx, cancel := d.ctx()
+	ctx, cancel := d.ctxWithin(queryBudget)
 	defer cancel()
 	prefix := d.cfg.Namespace + "/"
 	tags, err := d.array.ListNameTags(ctx, prefix)

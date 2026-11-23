@@ -28,6 +28,7 @@ type fakeArray struct {
 	extra     map[string]map[string]string // other dvfa tags: volume -> key -> value
 	lookupErr error                        // returned by LookupNameTag
 	down      error                        // array unreachable: returned by every read
+	hang      bool                         // reads answer only once the caller gives up
 	hosts     map[string][]string
 	conns     map[string]map[string]int // volume -> host -> lun
 	nextLUN   int
@@ -40,7 +41,19 @@ func newFakeArray() *fakeArray {
 
 func (f *fakeArray) rec(s string) { f.calls = append(f.calls, s) }
 
-func (f *fakeArray) GetVolume(_ context.Context, name string) (*flasharray.Volume, error) {
+// blackholed is a management endpoint that accepts nothing and refuses nothing.
+func (f *fakeArray) blackholed(ctx context.Context) error {
+	if !f.hang {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeArray) GetVolume(ctx context.Context, name string) (*flasharray.Volume, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down != nil {
@@ -154,7 +167,10 @@ func (f *fakeArray) SetNameTag(_ context.Context, volume, value string) error {
 	return nil
 }
 
-func (f *fakeArray) ListNameTags(_ context.Context, prefix string) (map[string]string, error) {
+func (f *fakeArray) ListNameTags(ctx context.Context, prefix string) (map[string]string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down != nil {
@@ -174,7 +190,10 @@ func (f *fakeArray) destroyed(name string) bool {
 	return ok && v.Destroyed
 }
 
-func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, error) {
+func (f *fakeArray) LookupNameTag(ctx context.Context, value string) (string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.lookupErr != nil {
@@ -1460,6 +1479,33 @@ func TestGetAnswersFromKnownVolumesWhileArrayDown(t *testing.T) {
 	fa.down = errors.New("HTTP 503")
 	if _, err := d.Get(&plugin.GetRequest{Name: "v"}); err == nil {
 		t.Fatal("removed volume still answered from known volumes")
+	}
+}
+
+// A management endpoint that hangs instead of refusing must not hold Get or
+// List past Docker's 1 minute: the known-volume answer would reach nobody.
+func TestGetAndListFallBackWithinTheirBudget(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := queryBudget
+	queryBudget = 50 * time.Millisecond
+	t.Cleanup(func() { queryBudget = old })
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fa.hang = true
+
+	start := time.Now()
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_unreachable"] == nil {
+		t.Fatalf("Get against a hanging array = %+v, %v", g, err)
+	}
+	l, err := d.List()
+	if err != nil || len(l.Volumes) != 1 || l.Volumes[0].Name != "v" {
+		t.Fatalf("List against a hanging array = %+v, %v", l, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Get and List took %s, past their budget", took)
 	}
 }
 
