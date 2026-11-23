@@ -832,6 +832,13 @@ func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) 
 		ok = false
 	}
 	if ok {
+		// Preempted by another node, the device under this mount is dead and a
+		// container given it would only get I/O errors.
+		if err == nil && !vol.Destroyed && d.requireHost(ctx) == nil {
+			if conns, cerr := d.array.ListConnections(ctx, an); cerr == nil && !slices.ContainsFunc(conns, func(c flasharray.Connection) bool { return c.Host == d.hostName() }) {
+				return nil, fmt.Errorf("volume %s is mounted on this node but the array no longer connects it here (%d other connection(s)); the mount is stale until the containers that hold it stop", req.Name, len(conns))
+			}
+		}
 		d.cancelKeep(an)
 		d.cancelTeardown(st)
 		st.refs[req.ID] = time.Now()

@@ -2234,6 +2234,31 @@ func TestMountBacksOffWhenAnotherHostConnectsAtTheSameMoment(t *testing.T) {
 	}
 }
 
+// After another node preempts this one, the device under the mount is dead.
+func TestMountRefusesAMountTheArrayNoLongerConnectsHere(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c2"}); err != nil {
+		t.Fatalf("second mount of a live volume: %v", err)
+	}
+	fa.mu.Lock()
+	delete(fa.conns[an], "node1")
+	fa.conns[an]["node2"] = 5
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c3"}); err == nil {
+		t.Fatal("handed out a mount whose volume another host took")
+	}
+	fa.down = errors.New("HTTP 503")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c4"}); err != nil {
+		t.Fatalf("a mounted volume must still be served while the array is down: %v", err)
+	}
+}
+
 // A detach that fails after the filesystem is unmounted used to leave the
 // volume connected until another node preempted it.
 func TestFailedDetachIsRetried(t *testing.T) {

@@ -441,6 +441,10 @@ connect it; each then looks for the other, and one that sees it disconnects
 again and fails its mount, so at most one of them mounts and the retry waits
 as above.
 
+A node asked to mount a volume it still has mounted, but which the array has
+since connected elsewhere, refuses instead of handing a container the dead
+device.
+
 After the last container lets go, a volume stays mounted and attached for
 `FA_UNMOUNT_LINGER` before it is torn down. Docker mounts a volume, unmounts
 it and mounts it again within a second or two when it populates a new
