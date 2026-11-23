@@ -515,7 +515,9 @@ tag on the array, Docker's local record of which driver owns the name, and
    Each line of the plan is `would` (will be tagged), `skip` (already tagged
    correctly) or `CONFLICT`: the array volume is already tagged with another
    name, or the Docker name already maps to a different array volume
-   (including an earlier line of the same plan). `--dry-run` reports every
+   (including an earlier line of the same plan). `FAILED` marks a volume
+   whose name is the prefix alone, which leaves no Docker name. `--dry-run`
+   reports every
    conflict the real run would hit and exits non-zero if there are any, so
    fix those before running it for real. Destroyed volumes are left out.
 6. Change `driver: pure` to `driver: flasharray` in the stack files and
