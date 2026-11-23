@@ -32,10 +32,12 @@ type fakeArray struct {
 	tagErr    error                        // returned by SetNameTag
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
-	hosts      map[string][]string
-	conns      map[string]map[string]int // volume -> host -> lun
-	nextLUN    int
-	calls      []string
+	// connectHook runs, with mu held, right after a new connection is made.
+	connectHook func()
+	hosts       map[string][]string
+	conns       map[string]map[string]int // volume -> host -> lun
+	nextLUN     int
+	calls       []string
 }
 
 func newFakeArray() *fakeArray {
@@ -254,6 +256,9 @@ func (f *fakeArray) Connect(_ context.Context, host, volume string) (int, error)
 	}
 	f.conns[volume][host] = f.nextLUN
 	f.nextLUN++
+	if f.connectHook != nil {
+		f.connectHook()
+	}
 	return f.conns[volume][host], nil
 }
 
@@ -2194,6 +2199,34 @@ func TestCreateUsesAVolumeAnotherNodeCreatedAtTheSameMoment(t *testing.T) {
 	}
 	if g, err := d.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Status["array_name"] != "node1-v" {
 		t.Fatalf("get = %+v, %v", g, err)
+	}
+}
+
+// Two nodes mounting at the same moment both find the volume free and both
+// connect; the one that then sees the other must not go on to mount.
+func TestMountBacksOffWhenAnotherHostConnectsAtTheSameMoment(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.connectHook = func() { fa.conns[an]["node2"] = 99 }
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("mounted a volume another host had connected at the same moment")
+	}
+	if fa.connected(an, "node1") || len(fm.mounted) != 0 {
+		t.Fatal("did not back out of its own connection")
+	}
+	if !fa.connected(an, "node2") {
+		t.Fatal("disconnected the other host")
+	}
+
+	// The other host let go; the retry mounts.
+	fa.mu.Lock()
+	fa.connectHook = nil
+	delete(fa.conns[an], "node2")
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatalf("retry: %v", err)
 	}
 }
 

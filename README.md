@@ -426,7 +426,10 @@ is presumed dead and has its connection
 taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
 "waiting for … to release" error and swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and
-corrupted XFS.
+corrupted XFS. Two nodes that mount a free volume at the same moment both
+connect it; each then looks for the other, and one that sees it disconnects
+again and fails its mount, so at most one of them mounts and the retry waits
+as above.
 
 After the last container lets go, a volume stays mounted and attached for
 `FA_UNMOUNT_LINGER` before it is torn down. Docker mounts a volume, unmounts

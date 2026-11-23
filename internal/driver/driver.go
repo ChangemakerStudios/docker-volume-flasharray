@@ -910,11 +910,24 @@ func (d *Driver) connectSwept(ctx context.Context, an, dockerName, serial string
 			}
 			d.log.Warn("pre-attach sweep left stale paths", "volume", dockerName, "err", err)
 		}
+		had := slices.Contains(slices.Collect(maps.Values(want)), strings.ToLower(serial))
 		lun, err = d.array.Connect(ctx, d.hostName(), an)
 		if err != nil {
 			return fmt.Errorf("connect %s to %s: %w", dockerName, d.hostName(), err)
 		}
 		d.log.Info("attached on array", "volume", dockerName, "lun", lun, "serial", serial)
+		// Two nodes mounting at the same moment each find the volume free in
+		// takeOver and then both connect. Whichever looks afterwards and sees
+		// the other gives up, so at most one goes on to mount.
+		if others, err := d.otherHosts(ctx, an); err != nil || len(others) > 0 {
+			if !had { // a connection from before this mount may carry a running container
+				d.rollbackLocked(ctx, an, serial, "")
+			}
+			if err != nil {
+				return fmt.Errorf("volume %s: check for other hosts after attaching: %w", dockerName, err)
+			}
+			return fmt.Errorf("volume %s: host %s attached it at the same moment; not mounting it on two nodes, a retry waits for that host to release it", dockerName, strings.Join(others, ","))
+		}
 		want, err = d.array.HostLUNs(ctx, d.hostName())
 		if err == nil {
 			err = d.tr.Sweep(ctx, want, prefix, lun, false)
