@@ -178,7 +178,12 @@ exclusive open of the device succeeds. A stopped container's filesystem can
 still be flushing, and after a plugin disable or upgrade the mounts of running
 containers live only in their namespaces, so the plugin no longer tracks them.
 Disconnecting then loses writes and corrupts XFS. If the device stays busy,
-unmount fails and leaves the device and the array connection in place.
+unmount fails and leaves the device and the array connection in place. A
+teardown that fails is tried again on its own, so the volume does not sit
+until another node preempts it: every `FA_UNMOUNT_LINGER` while the
+filesystem is still mounted, and every half `FA_PREEMPT_GRACE` once only the
+device and the array connection are left (every 30 seconds where that setting
+is 0).
 
 Docker sometimes sends a Mount it never pairs with an Unmount, so the
 plugin does not trust its own count of mount IDs. When the last expected

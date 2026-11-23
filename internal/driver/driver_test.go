@@ -424,6 +424,7 @@ type fakeMounter struct {
 	shutdowns []string          // mountpoints Shutdown was called for
 	// inUseChecks counts InUseByContainer calls.
 	inUseChecks int
+	umountErr   error // returned by Unmount
 }
 
 func (m *fakeMounter) Shutdown(target string) error {
@@ -489,6 +490,9 @@ func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) erro
 func (m *fakeMounter) Unmount(_ context.Context, target string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.umountErr != nil {
+		return m.umountErr
+	}
 	delete(m.mounted, target)
 	return nil
 }
@@ -2191,4 +2195,57 @@ func TestCreateUsesAVolumeAnotherNodeCreatedAtTheSameMoment(t *testing.T) {
 	if g, err := d.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Status["array_name"] != "node1-v" {
 		t.Fatalf("get = %+v, %v", g, err)
 	}
+}
+
+// A detach that fails after the filesystem is unmounted used to leave the
+// volume connected until another node preempted it.
+func TestFailedDetachIsRetried(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := teardownRetry
+	teardownRetry = 10 * time.Millisecond
+	t.Cleanup(func() { teardownRetry = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	tr.mu.Lock()
+	tr.detachErr = errors.New("map is still open")
+	tr.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("unmount hid the failed detach")
+	}
+	if !fa.connected(an, "node1") {
+		t.Fatal("disconnected on the array under a device the host still holds")
+	}
+	tr.mu.Lock()
+	tr.detachErr = nil
+	tr.mu.Unlock()
+	eventually(t, "failed detach never retried", func() bool { return !fa.connected(an, "node1") })
+}
+
+// Likewise an umount that fails: the volume was left mounted with no refs and
+// nothing to try again.
+func TestFailedUnmountIsRetried(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := teardownRetry
+	teardownRetry = 10 * time.Millisecond
+	t.Cleanup(func() { teardownRetry = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	fm.umountErr = errors.New("target is busy")
+	fm.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("unmount hid the failed umount")
+	}
+	fm.mu.Lock()
+	fm.umountErr = nil
+	fm.mu.Unlock()
+	eventually(t, "failed umount never retried", func() bool { return !fa.connected(an, "node1") })
 }

@@ -704,6 +704,7 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		// Only lingering after its last container: release it now.
 		d.cancelTeardown(st)
 		if err := d.teardown(ctx, an, st, req.Name); err != nil {
+			d.retryTeardown(an, st)
 			return err
 		}
 		mounted = false
@@ -1221,6 +1222,27 @@ func (d *Driver) keepAttached(an, serial string) bool {
 	if wait <= 0 {
 		return false
 	}
+	d.releaseAfter(an, serial, wait)
+	return true
+}
+
+// teardownRetry paces retries of a failed teardown or release when no linger
+// or preempt grace is configured to. A variable so tests needn't wait.
+var teardownRetry = 30 * time.Second
+
+// releaseLater retries the release of an attachment whose filesystem is
+// already unmounted. Dropped instead, it stayed connected until another node
+// waited out the grace and preempted it. serial is "" when the teardown could
+// not look it up. The caller holds an's lock.
+func (d *Driver) releaseLater(an, serial string) {
+	wait := d.keepFor()
+	if wait <= 0 {
+		wait = teardownRetry
+	}
+	d.releaseAfter(an, serial, wait)
+}
+
+func (d *Driver) releaseAfter(an, serial string, wait time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.pending[an]
@@ -1234,7 +1256,6 @@ func (d *Driver) keepAttached(an, serial string) bool {
 	p.gen++
 	gen := p.gen
 	p.timer = time.AfterFunc(wait, func() { d.keepExpired(an, gen) })
-	return true
 }
 
 // cancelKeep hands a kept attachment to the caller, which holds an's lock.
@@ -1263,13 +1284,48 @@ func (d *Driver) keepExpired(an string, gen int) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
 	defer cancel()
-	detachErr, disconnectErr := d.releaseHost(ctx, an, p.serial, "")
-	if detachErr == nil && disconnectErr == nil {
+	serial, err := p.serial, error(nil)
+	if serial == "" {
+		v, verr := d.array.GetVolume(ctx, an)
+		if flasharray.IsNotFound(verr) {
+			return // gone from the array, and its connection with it
+		}
+		if err = verr; err == nil {
+			serial = v.Serial
+		}
+	}
+	if err == nil {
+		err = d.releaseIdle(ctx, an, serial)
+	}
+	if err == nil {
 		d.log.Info("released an attachment no mount came back for", "array_name", an)
 		return
 	}
-	d.log.Error("releasing a kept attachment failed; trying again later", "array_name", an, "detach_err", detachErr, "disconnect_err", disconnectErr)
-	d.keepAttached(an, p.serial)
+	d.log.Error("releasing a kept attachment failed; trying again later", "array_name", an, "err", err)
+	d.releaseLater(an, p.serial)
+}
+
+// releaseIdle is releaseHost for an attachment nothing here has mounted. A
+// device something still holds is left alone: a filesystem unmounted moments
+// ago can still be flushing in a container's mount namespace.
+func (d *Driver) releaseIdle(ctx context.Context, an, serial string) error {
+	if dev := d.tr.FindDevice(ctx, serial); dev != "" {
+		busy, err := d.mnt.Busy(dev)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check whether %s is in use: %w", dev, err)
+		}
+		if busy {
+			return fmt.Errorf("%s is still in use", dev)
+		}
+	}
+	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, "")
+	if detachErr != nil || disconnectErr != nil {
+		return errors.Join(detachErr, disconnectErr)
+	}
+	if err := d.tr.PostDisconnect(ctx); err != nil {
+		d.log.Warn("post-disconnect failed", "array_name", an, "err", err)
+	}
+	return nil
 }
 
 // Unmount implements plugin.Driver.
@@ -1294,19 +1350,28 @@ func (d *Driver) Unmount(req *plugin.UnmountRequest) error {
 		d.log.Info("volume still in use here; kept mounted", "volume", req.Name, "refs", len(st.refs))
 		return nil
 	}
+	return d.lastRefGone(ctx, an, st)
+}
 
+// lastRefGone lets go of a mount nothing refers to any more: at once, or after
+// the linger. The caller holds an's lock.
+func (d *Driver) lastRefGone(ctx context.Context, an string, st *mountState) error {
 	if d.cfg.UnmountLinger > 0 {
 		// The umount that used to follow at once flushed the filesystem; a
 		// lingering one must not hold unwritten data while it waits.
-		if err := d.mnt.Sync(ctx, st.mountpoint); err != nil {
-			d.log.Warn("flushing the lingering volume failed; tearing down now", "volume", req.Name, "err", err)
-			return d.teardown(ctx, an, st, req.Name)
+		err := d.mnt.Sync(ctx, st.mountpoint)
+		if err == nil {
+			d.scheduleTeardown(an, st)
+			d.log.Info("last container let go; keeping the volume attached briefly in case it is mounted again", "volume", st.dockerName, "linger", d.cfg.UnmountLinger)
+			return nil
 		}
-		d.scheduleTeardown(an, st)
-		d.log.Info("last container let go; keeping the volume attached briefly in case it is mounted again", "volume", req.Name, "linger", d.cfg.UnmountLinger)
-		return nil
+		d.log.Warn("flushing the lingering volume failed; tearing down now", "volume", st.dockerName, "err", err)
 	}
-	return d.teardown(ctx, an, st, req.Name)
+	err := d.teardown(ctx, an, st, st.dockerName)
+	if err != nil {
+		d.retryTeardown(an, st)
+	}
+	return err
 }
 
 // teardown unmounts an's filesystem, detaches it from this host and
@@ -1323,10 +1388,9 @@ func (d *Driver) teardown(ctx context.Context, an string, st *mountState, docker
 		v, err := d.array.GetVolume(ctx, an)
 		if err != nil {
 			// Filesystem is already unmounted, so drop the state; a later Mount re-attaches cleanly.
-			d.mu.Lock()
-			delete(d.mounts, an)
-			d.mu.Unlock()
-			return fmt.Errorf("volume %s unmounted but serial lookup failed, host devices and array connection left in place: %w", dockerName, err)
+			d.dropMount(an)
+			d.releaseLater(an, "")
+			return fmt.Errorf("volume %s unmounted but serial lookup failed; host devices and array connection left in place until a retry: %w", dockerName, err)
 		}
 		serial = v.Serial
 	}
@@ -1335,32 +1399,35 @@ func (d *Driver) teardown(ctx context.Context, an string, st *mountState, docker
 		dev = d.tr.FindDevice(ctx, serial)
 	}
 	if err := d.waitIdle(ctx, dev); err != nil {
-		d.mu.Lock()
-		delete(d.mounts, an)
-		d.mu.Unlock()
-		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place", dockerName, err)
+		d.dropMount(an)
+		d.releaseLater(an, serial)
+		return fmt.Errorf("volume %s unmounted here but %w; host device and array connection left in place until a retry", dockerName, err)
 	}
 	detachErr, disconnectErr := d.releaseHost(ctx, an, serial, st.dev)
 	if detachErr != nil {
 		// Disconnecting on the array under a device the host still holds turns
 		// a cleanup failure into I/O errors for whatever holds it.
-		d.mu.Lock()
-		delete(d.mounts, an)
-		d.mu.Unlock()
-		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place: %w", dockerName, detachErr)
+		d.dropMount(an)
+		d.releaseLater(an, serial)
+		return fmt.Errorf("volume %s unmounted but host detach failed; array connection left in place until a retry: %w", dockerName, detachErr)
 	}
 	var errs []error
 	if disconnectErr != nil {
 		errs = append(errs, disconnectErr)
+		d.releaseLater(an, serial)
 	}
 	if err := d.tr.PostDisconnect(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	d.dropMount(an)
+	d.log.Info("unmounted", "volume", dockerName)
+	return errors.Join(errs...)
+}
+
+func (d *Driver) dropMount(an string) {
 	d.mu.Lock()
 	delete(d.mounts, an)
 	d.mu.Unlock()
-	d.log.Info("unmounted", "volume", dockerName)
-	return errors.Join(errs...)
 }
 
 // Docker mounts a volume, unmounts it and mounts it again within a second or
@@ -1370,6 +1437,10 @@ func (d *Driver) teardown(ctx context.Context, an string, st *mountState, docker
 // once, a moment of I/O errors on a freshly mounted volume). So the last
 // Unmount only schedules the teardown.
 func (d *Driver) scheduleTeardown(an string, st *mountState) {
+	d.scheduleTeardownIn(an, st, d.cfg.UnmountLinger)
+}
+
+func (d *Driver) scheduleTeardownIn(an string, st *mountState, wait time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if st.linger != nil {
@@ -1377,7 +1448,24 @@ func (d *Driver) scheduleTeardown(an string, st *mountState) {
 	}
 	st.lingerGen++
 	gen := st.lingerGen
-	st.linger = time.AfterFunc(d.cfg.UnmountLinger, func() { d.lingerExpired(an, st, gen) })
+	st.linger = time.AfterFunc(wait, func() { d.lingerExpired(an, st, gen) })
+}
+
+// retryTeardown re-arms the deferred teardown after one failed with st still
+// mounted. Left with no refs and no timer, the volume would sit mounted and
+// connected until another node preempts it. The caller holds an's lock.
+func (d *Driver) retryTeardown(an string, st *mountState) {
+	d.mu.Lock()
+	still := d.mounts[an] == st && !d.closing
+	d.mu.Unlock()
+	if !still || len(st.refs) > 0 {
+		return
+	}
+	wait := d.cfg.UnmountLinger
+	if wait <= 0 {
+		wait = teardownRetry
+	}
+	d.scheduleTeardownIn(an, st, wait)
 }
 
 func (d *Driver) cancelTeardown(st *mountState) {
@@ -1406,27 +1494,21 @@ func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
 	if !current {
 		return
 	}
-	// Left mounted with no refs and no timer, the volume would sit until
-	// another node preempts it; so a refused or failed teardown tries again.
-	// A lost filesystem has nothing a container could hold, and the bare
-	// directory would match every container on the root filesystem.
+	// A refused or failed teardown tries again (retryTeardown). A lost
+	// filesystem has nothing a container could hold, and the bare directory
+	// would match every container on the root filesystem.
 	if lost := d.lostMount(st); lost {
 		d.log.Info("tearing down a volume whose filesystem was unmounted outside this plugin", "volume", st.dockerName)
 	} else if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
 		d.log.Warn("not tearing down yet: a container may still have the volume mounted", "volume", st.dockerName, "err", err)
-		d.scheduleTeardown(an, st)
+		d.retryTeardown(an, st)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.AttachTimeout+cleanupBudget)
 	defer cancel()
 	if err := d.teardown(ctx, an, st, st.dockerName); err != nil {
 		d.log.Error("teardown after linger failed", "volume", st.dockerName, "err", err)
-		d.mu.Lock()
-		still := d.mounts[an] == st
-		d.mu.Unlock()
-		if still {
-			d.scheduleTeardown(an, st)
-		}
+		d.retryTeardown(an, st)
 	}
 }
 
