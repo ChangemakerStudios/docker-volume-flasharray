@@ -726,7 +726,9 @@ const purePrefix = "naa.624a9370"
 // the new one. On staging that cross-wrote volumes.
 //
 // Only paths whose serial starts with arrayPrefix are judged: LUN numbers are
-// per array, and another array's paths are none of this map's business. A map
+// per array, and another array's paths are none of this map's business. Nor
+// are this array's paths off iSCSI (Fibre Channel, a VM's pass-through disk):
+// they sit under another host object, with LUN numbers of its own. A map
 // whose every path is stale has queueing switched off first, so whatever still
 // holds it gets I/O errors rather than hanging, and is removed unflushed
 // afterwards (its buffers belong to a volume it no longer reaches). Only a
@@ -749,6 +751,10 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 		id := strings.ToLower(strings.TrimSpace(string(b)))
 		serial, ok := strings.CutPrefix(id, purePrefix)
 		if !ok || !strings.HasPrefix(serial, arrayPrefix) {
+			continue
+		}
+		if !onISCSI(p) {
+			t.log.Debug("leaving path alone: not on an iSCSI session", "dev", filepath.Base(p), "path_serial", serial)
 			continue
 		}
 		lun, ok := pathLUN(p)
@@ -871,4 +877,21 @@ func pathLUN(sysBlock string) (int, bool) {
 	}
 	n, err := strconv.Atoi(f[3])
 	return n, err == nil
+}
+
+// onISCSI reports whether a SCSI disk hangs off an iSCSI session: the kernel
+// then puts its device at .../hostH/sessionN/targetH:C:T/H:C:T:L.
+func onISCSI(sysBlock string) bool {
+	target, err := filepath.EvalSymlinks(filepath.Join(sysBlock, "device"))
+	if err != nil {
+		return false
+	}
+	for _, dir := range strings.Split(filepath.ToSlash(target), "/") {
+		if n, ok := strings.CutPrefix(dir, "session"); ok {
+			if _, err := strconv.Atoi(n); err == nil {
+				return true
+			}
+		}
+	}
+	return false
 }

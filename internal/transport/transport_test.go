@@ -75,14 +75,26 @@ func TestDeviceIdentityChecks(t *testing.T) {
 	}
 }
 
-// fakePath builds sys/<sd>/device -> scsi/<hctl> holding the cached wwid and a
-// delete file, the sysfs shape of one SCSI path.
+// scsiDir is a fake iSCSI path's device directory: under a session, as the
+// kernel files one.
+func scsiDir(root, hctl string) string {
+	return filepath.Join(root, "scsi", "session1", hctl)
+}
+
+// fakePath builds sys/<sd>/device -> scsiDir(hctl) holding the cached wwid and
+// a delete file, the sysfs shape of one iSCSI path.
 func fakePath(t *testing.T, root, sd, hctl, wwid string) {
+	t.Helper()
+	fakePathIn(t, root, scsiDir(root, hctl), sd, wwid)
+}
+
+// fakePathIn is fakePath with the device directory, whose last element is the
+// H:C:T:L, anywhere.
+func fakePathIn(t *testing.T, root, dir, sd, wwid string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("H:C:T:L is not a valid file name on Windows")
 	}
-	dir := filepath.Join(root, "scsi", hctl)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +113,7 @@ func fakePath(t *testing.T, root, sd, hctl, wwid string) {
 
 func deleted(t *testing.T, root, hctl string) bool {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(root, "scsi", hctl, "delete"))
+	b, err := os.ReadFile(filepath.Join(scsiDir(root, hctl), "delete"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +182,35 @@ func TestSweepCrossedOnly(t *testing.T) {
 	}
 }
 
+// This array's LUNs can also reach the node outside the plugin's sessions,
+// under another host object whose LUN numbers this host's map knows nothing of.
+func TestSweepLeavesPathsOffISCSIAlone(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	fc := filepath.Join(root, "scsi", "rport-7:0-0", "target7:0:0", "7:0:0:4")
+	fakePathIn(t, root, fc, "sda", "naa.624a93706fef9ab1157343ec000000bb") // LUN 4 carries cc for this host
+	rdm := filepath.Join(root, "scsi", "target2:0:1", "2:0:1:9")
+	fakePathIn(t, root, rdm, "sdb", "naa.624a93706fef9ab1157343ec000000dd")      // LUN 9 not connected to this host
+	fakePath(t, root, "sdc", "34:0:0:4", "naa.624a93706fef9ab1157343ec000000bb") // the same stale identity over iSCSI
+
+	tr := &iscsi{log: slog.Default()}
+	want := map[int]string{4: "6fef9ab1157343ec000000cc"}
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", -1, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{fc, rdm} {
+		if b, err := os.ReadFile(filepath.Join(dir, "delete")); err != nil || string(b) == "1" {
+			t.Fatalf("deleted a path that is not on an iSCSI session: %s (%v)", dir, err)
+		}
+	}
+	if !deleted(t, root, "34:0:0:4") {
+		t.Fatal("kept a stale iSCSI path")
+	}
+}
+
 func TestCheckLUN(t *testing.T) {
 	root := t.TempDir()
 	old := sysClassBlock
@@ -210,7 +251,7 @@ func TestSweepFailsOnlyForItsOwnLUN(t *testing.T) {
 	t.Cleanup(func() { sysClassBlock = old })
 
 	fakePath(t, root, "sda", "34:0:0:5", "naa.624a93706fef9ab1157343ec000000aa")
-	stuck := filepath.Join(root, "scsi", "34:0:0:5", "delete")
+	stuck := filepath.Join(scsiDir(root, "34:0:0:5"), "delete")
 	if err := os.Remove(stuck); err != nil {
 		t.Fatal(err)
 	}

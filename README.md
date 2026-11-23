@@ -223,8 +223,10 @@ to the host may get its number. Linux reads a SCSI path's identity once, at
 scan time, so a path the host kept for the old volume still claims to be it
 while its I/O reaches the new one, which cross-wrote volumes on staging. Right
 after each connect the plugin asks the array which volume every LUN number on
-the host carries and deletes each path of this array (matched by serial
-prefix; another array's LUNs are its own) whose LUN and cached WWID disagree,
+the host carries and deletes each iSCSI path of this array (matched by serial
+prefix; another array's LUNs are its own, and so are LUNs of this array that
+reach the node over Fibre Channel or as a VM's pass-through disk, under
+another host object) whose LUN and cached WWID disagree,
 without flushing it: its buffers belong to a volume it no longer reaches. A
 map whose every path is stale has queueing switched off first, so whatever
 holds it gets I/O errors instead of hanging, and is then removed. Connects,
