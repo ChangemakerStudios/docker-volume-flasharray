@@ -32,6 +32,8 @@ type iscsi struct {
 
 	mu sync.Mutex // serializes Connect
 
+	singlePath sync.Once // the no-multipathd warning, said once
+
 	// scanMu makes rescans exclusive with Exclusive callers, which change
 	// what LUN numbers carry on this host.
 	scanMu ctxlock.Mutex
@@ -501,6 +503,11 @@ func (t *iscsi) FindDevice(ctx context.Context, serial string) string {
 func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error) {
 	wwid := WWID(serial)
 	useMultipath := multipathdRunning()
+	if !useMultipath {
+		t.singlePath.Do(func() {
+			t.log.Warn("multipathd is not running on this host (no " + multipathdAbstractSocket + " in /proc/net/unix); volumes attach over a single path, with no failover")
+		})
+	}
 	if dev := t.findDevice(ctx, wwid, useMultipath, true); dev != "" {
 		return dev, nil
 	}
