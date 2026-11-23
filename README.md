@@ -190,7 +190,9 @@ plugin does not trust its own count of mount IDs. When the last expected
 Unmount leaves IDs behind, it checks the mount namespaces of every process
 (the plugin runs with the host PID namespace) and unmounts if no container
 still has the filesystem; IDs younger than two minutes may belong to a
-container still starting and always keep it mounted. Mount and Unmount
+container still starting and always keep it mounted. The same check runs
+every 10 minutes for each mounted volume, so a Mount whose Unmount never
+comes at all does not pin its volume. Mount and Unmount
 finish inside Docker's own limits (2 and 1 minute), past which Docker counts
 the call as failed while the plugin would carry on unseen. That includes time
 a Mount spends queued behind another operation on the same volume or behind

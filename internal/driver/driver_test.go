@@ -2287,6 +2287,39 @@ func TestFailedUnmountIsRetried(t *testing.T) {
 	eventually(t, "failed umount never retried", func() bool { return !fa.connected(an, "node1") })
 }
 
+// A Mount Docker never pairs with an Unmount must not pin the volume for good.
+func TestOrphanedRefsAreReapedWithoutAnUnmount(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "never-unmounted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.reapOrphans(context.Background())
+	if !fa.connected(an, "node1") {
+		t.Fatal("reaped a ref young enough to belong to a starting container")
+	}
+	refPending = 0
+	t.Cleanup(func() { refPending = 2 * time.Minute })
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = true
+	fm.mu.Unlock()
+	d.reapOrphans(context.Background())
+	if !fa.connected(an, "node1") {
+		t.Fatal("reaped a volume a container still has mounted")
+	}
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = false
+	fm.mu.Unlock()
+	d.reapOrphans(context.Background())
+	if fa.connected(an, "node1") || fm.isMounted(r.Mountpoint) {
+		t.Fatal("orphaned mount left in place")
+	}
+}
+
 // With no driver to answer Get, Docker substitutes local volumes; so a node
 // that has served volumes starts even when the array cannot be reached.
 func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {

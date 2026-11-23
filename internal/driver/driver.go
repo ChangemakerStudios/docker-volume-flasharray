@@ -1008,23 +1008,65 @@ func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
 }
 
-// pathCheckInterval is a variable so tests needn't wait.
-var pathCheckInterval = 30 * time.Second
+// pathCheckInterval and orphanCheckInterval are variables so tests needn't wait.
+var (
+	pathCheckInterval   = 30 * time.Second
+	orphanCheckInterval = 10 * time.Minute
+)
 
 // RunPathCheck re-checks this host's paths against the array until ctx ends.
 // The sweeps around each attach close every window the driver itself opens,
 // but a path the kernel scans late, or a LUN reassigned by someone else, can
-// still put a path into a live map that reaches another volume.
+// still put a path into a live map that reaches another volume. It also
+// looks, less often, for mounts only orphaned refs keep (reapOrphans).
 func (d *Driver) RunPathCheck(ctx context.Context) {
 	t := time.NewTicker(pathCheckInterval)
 	defer t.Stop()
+	o := time.NewTicker(orphanCheckInterval)
+	defer o.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			d.checkPaths(ctx)
+		case <-o.C:
+			d.reapOrphans(ctx)
 		}
+	}
+}
+
+// reapLockWait is how long reapOrphans waits for a volume another operation
+// holds before leaving it to the next round.
+const reapLockWait = 5 * time.Second
+
+// reapOrphans lets go of mounts held only by refs Docker never released.
+// Unmount drops such refs, but only when another Unmount for the volume
+// comes; a Mount Docker never paired with one kept its volume mounted and
+// connected for good.
+func (d *Driver) reapOrphans(ctx context.Context) {
+	d.mu.Lock()
+	mounted := slices.Collect(maps.Keys(d.mounts))
+	d.mu.Unlock()
+	for _, an := range mounted {
+		lctx, cancel := context.WithTimeout(ctx, reapLockWait)
+		unlock, err := d.lockCtx(lctx, an)
+		cancel()
+		if err != nil {
+			continue
+		}
+		d.mu.Lock()
+		st, ok := d.mounts[an]
+		ok = ok && !d.closing
+		d.mu.Unlock()
+		if ok && len(st.refs) > 0 && d.dropStaleRefs(st, st.dockerName) {
+			tctx, cancel := d.ctxWithin(unmountBudget)
+			if err := d.lastRefGone(tctx, an, st); err != nil {
+				d.log.Error("releasing a volume only orphaned mount refs kept failed", "volume", st.dockerName, "err", err)
+			}
+			cancel()
+		}
+		unlock()
 	}
 }
 
