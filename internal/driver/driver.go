@@ -37,8 +37,7 @@ type Driver struct {
 	log   *slog.Logger
 
 	// host is this node's FlashArray host object name (string); see hostName.
-	host  atomic.Value
-	ports []flasharray.Port
+	host atomic.Value
 
 	mu sync.Mutex // guards locks, mounts, names and known maps
 	// closing stops deferred teardowns once Shutdown has taken them over.
@@ -174,7 +173,6 @@ func (d *Driver) ensureConnected(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list array ports: %w", err)
 	}
-	d.ports = ports
 	err = d.tr.Connect(ctx, ports)
 	if err == nil {
 		return nil
