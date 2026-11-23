@@ -178,14 +178,21 @@ exclusive open of the device succeeds. A stopped container's filesystem can
 still be flushing, and after a plugin disable or upgrade the mounts of running
 containers live only in their namespaces, so the plugin no longer tracks them.
 Disconnecting then loses writes and corrupts XFS. If the device stays busy,
-unmount fails and leaves the device and the array connection in place.
+unmount fails and leaves the device and the array connection in place. A
+teardown that fails is tried again on its own, so the volume does not sit
+until another node preempts it: every `FA_UNMOUNT_LINGER` while the
+filesystem is still mounted, and every half `FA_PREEMPT_GRACE` once only the
+device and the array connection are left (every 30 seconds where that setting
+is 0).
 
 Docker sometimes sends a Mount it never pairs with an Unmount, so the
 plugin does not trust its own count of mount IDs. When the last expected
 Unmount leaves IDs behind, it checks the mount namespaces of every process
 (the plugin runs with the host PID namespace) and unmounts if no container
 still has the filesystem; IDs younger than two minutes may belong to a
-container still starting and always keep it mounted. Mount and Unmount
+container still starting and always keep it mounted. The same check runs
+every 10 minutes for each mounted volume, so a Mount whose Unmount never
+comes at all does not pin its volume. Mount and Unmount
 finish inside Docker's own limits (2 and 1 minute), past which Docker counts
 the call as failed while the plugin would carry on unseen. That includes time
 a Mount spends queued behind another operation on the same volume or behind
@@ -201,7 +208,8 @@ mounts out from under them ([moby#32515](https://github.com/moby/moby/issues/325
 Before `-f`, check the node has no running container on a flasharray volume,
 nothing under the plugin's `propagated-mount`, and no open Pure device.
 
-On unmount the plugin refuses to touch a map that still has holders, turns
+On unmount the plugin refuses to touch a map that still has holders or is
+still open, turns
 queueing off for that map (`multipathd disablequeueing`, `dmsetup message …
 fail_if_no_path`) before flushing it, removes it with `multipathd remove
 map`, falling back to `multipath -f` then, only if the map is not open,
@@ -223,12 +231,15 @@ to the host may get its number. Linux reads a SCSI path's identity once, at
 scan time, so a path the host kept for the old volume still claims to be it
 while its I/O reaches the new one, which cross-wrote volumes on staging. Right
 after each connect the plugin asks the array which volume every LUN number on
-the host carries and deletes each path of this array (matched by serial
-prefix; another array's LUNs are its own) whose LUN and cached WWID disagree,
+the host carries and deletes each iSCSI path of this array (matched by serial
+prefix; another array's LUNs are its own, and so are LUNs of this array that
+reach the node over Fibre Channel or as a VM's pass-through disk, under
+another host object) whose LUN and cached WWID disagree,
 without flushing it: its buffers belong to a volume it no longer reaches. A
 map whose every path is stale has queueing switched off first, so whatever
 holds it gets I/O errors instead of hanging, and is then removed. Connects,
-detach-then-disconnect and every rescan hold one host-wide lock, so no rescan
+detach-then-disconnect, iSCSI logins (which scan the new session's LUNs) and
+every rescan hold one host-wide lock, so no rescan
 can rebuild a volume's paths between its detach and its disconnect. Detach
 itself deletes, unflushed, any path whose LUN no longer carries the volume.
 A mount checks every path of its device sits on the LUN the array assigned,
@@ -271,7 +282,8 @@ given to another LUN, so the device is used only after its sysfs `dm/uuid`
 the node is refused, and a volume whose filesystem blkid can't find is
 formatted only if the array's `space.virtual` is 0; otherwise the mount fails
 with the bytes written, since a damaged superblock also reads as "no
-filesystem".
+filesystem". A volume that already carries a filesystem is mounted as that
+type; `FA_FS_TYPE` only decides what a blank volume is formatted with.
 
 XFS volumes are always mounted with `nouuid`, as the Pure plugin did: copies
 of a volume carry its filesystem UUID, and XFS would otherwise refuse to mount
@@ -316,7 +328,12 @@ New volumes are named `<namespace>-<name>` on the array, as the Pure plugin
 named them (with a short hash suffix when the Docker name contains
 characters the array rejects, i.e. `.`, or would exceed 63 characters),
 and tagged `dvfa:name=<namespace>/<docker name>` so `docker volume ls` shows
-the original names from any node.
+the original names from any node. A volume counts as created only once its
+tag is written: if tagging fails, the new volume is destroyed again and the
+create fails. A Docker name whose computed array name already belongs to
+another Docker volume (one imported under a different name, or a name the
+array does not tell apart from it) is refused instead of being given the same
+disk.
 
 The tag, not the array name, is what the driver goes by: every operation
 looks the Docker name up through `dvfa:name` and only falls back to the
@@ -364,12 +381,21 @@ things prevent it:
   restarts; every successful `docker volume ls` replaces it with the array's
   view). When a `Get` or `List` can't reach the array, a volume in that file
   is still reported as existing, with `array_unreachable` in its status and
-  a warning in the log. Only lookups fall back; creating, mounting and
+  a warning in the log. A `Get` or `List` gives up on the array after 45
+  seconds, so that answer still arrives inside the minute Docker waits when
+  the array hangs instead of refusing. Only lookups fall back; creating, mounting and
   removing still need the array. Only the array's own answer that an object
   does not exist (HTTP 400 with its JSON error) counts as "not found": a 404
   or an HTML page from a controller mid-failover is treated as an outage, so
   it never bypasses this fallback. A volume this node has never seen is still
   an error.
+
+- **A node that has served volumes starts without the array.** Once that file
+  has entries, a plugin restart or node reboot during an outage still brings
+  the driver up: `Get` and `List` answer from the file, every other call
+  fails until the array is back, and the host object is looked up then. A
+  first start has nothing to answer from and still fails, so a wrong endpoint
+  or token shows at once.
 
 ## Settings
 
@@ -412,7 +438,14 @@ is presumed dead and has its connection
 taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
 "waiting for … to release" error and swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and
-corrupted XFS.
+corrupted XFS. Two nodes that mount a free volume at the same moment both
+connect it; each then looks for the other, and one that sees it disconnects
+again and fails its mount, so at most one of them mounts and the retry waits
+as above.
+
+A node asked to mount a volume it still has mounted, but which the array has
+since connected elsewhere, refuses instead of handing a container the dead
+device.
 
 After the last container lets go, a volume stays mounted and attached for
 `FA_UNMOUNT_LINGER` before it is torn down. Docker mounts a volume, unmounts
@@ -482,7 +515,9 @@ tag on the array, Docker's local record of which driver owns the name, and
    Each line of the plan is `would` (will be tagged), `skip` (already tagged
    correctly) or `CONFLICT`: the array volume is already tagged with another
    name, or the Docker name already maps to a different array volume
-   (including an earlier line of the same plan). `--dry-run` reports every
+   (including an earlier line of the same plan). `FAILED` marks a volume
+   whose name is the prefix alone, which leaves no Docker name. `--dry-run`
+   reports every
    conflict the real run would hit and exits non-zero if there are any, so
    fix those before running it for real. Destroyed volumes are left out.
 6. Change `driver: pure` to `driver: flasharray` in the stack files and
@@ -539,8 +574,8 @@ Early. The array client (including retries), name mapping, adoption,
 cloning, mount reference counting and failure rollback are unit-tested
 against fakes; the transports are exercised only on real hardware. The iSCSI
 attach/detach sequence follows jt-pve-storage-purestorage, which has been
-through many field releases; NVMe/TCP device matching has not yet been
-verified on an array.
+through many field releases; NVMe/TCP device matching (by the NGUID the
+array derives from the volume serial) has not yet been verified on an array.
 
 The array client retries 429 for any request and 5xx or transport errors
 for everything but POST (a create whose response was lost may already have

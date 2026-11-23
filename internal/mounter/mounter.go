@@ -25,9 +25,10 @@ var ErrNoFilesystem = errors.New("no filesystem found")
 // Mounter wraps blkid/mkfs/mount/umount.
 type Mounter interface {
 	// EnsureFilesystem creates fstype on dev if blkid finds no filesystem and
-	// allowFormat is set; otherwise it returns ErrNoFilesystem. Returns true
-	// if it formatted.
-	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error)
+	// allowFormat is set; otherwise it returns ErrNoFilesystem. It returns the
+	// filesystem dev carries, which is not fstype for a volume formatted
+	// elsewhere, and whether it formatted.
+	EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (have string, formatted bool, err error)
 	// Mount mounts dev on target over a read-only guard, so a container given
 	// target after the filesystem went away fails to write instead of writing
 	// to the host's root filesystem.
@@ -72,32 +73,32 @@ func New(log *slog.Logger) Mounter { return &execMounter{log: log} }
 
 type execMounter struct{ log *slog.Logger }
 
-func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (bool, error) {
+func (m *execMounter) EnsureFilesystem(ctx context.Context, dev, fstype string, mkfsOpts []string, allowFormat bool) (string, bool, error) {
 	out, err := hostexec.Command(ctx, "blkid", "-o", "value", "-s", "TYPE", dev).Output()
 	// blkid exits 2 when it finds no filesystem; any other failure (device not
 	// ready, I/O error) also prints nothing, and formatting then would wipe data.
 	var ee *exec.ExitError
 	noFilesystem := errors.As(err, &ee) && ee.ExitCode() == 2
 	if err != nil && !noFilesystem {
-		return false, fmt.Errorf("blkid %s: %w", dev, err)
+		return "", false, fmt.Errorf("blkid %s: %w", dev, err)
 	}
 	if existing := strings.TrimSpace(string(out)); existing != "" {
 		if existing != fstype {
 			m.log.Warn("device already has a different filesystem; mounting as-is", "dev", dev, "have", existing, "want", fstype)
 		}
-		return false, nil
+		return existing, false, nil
 	}
 	// A damaged superblock also makes blkid exit 2, so "no filesystem" alone
 	// is not proof the device is blank.
 	if !allowFormat {
-		return false, fmt.Errorf("%s: %w", dev, ErrNoFilesystem)
+		return "", false, fmt.Errorf("%s: %w", dev, ErrNoFilesystem)
 	}
 	args := append([]string{}, mkfsOpts...)
 	args = append(args, dev)
 	if b, err := hostexec.Command(ctx, "mkfs."+fstype, args...).CombinedOutput(); err != nil {
-		return false, fmt.Errorf("mkfs.%s %s: %w: %s", fstype, dev, err, strings.TrimSpace(string(b)))
+		return "", false, fmt.Errorf("mkfs.%s %s: %w: %s", fstype, dev, err, strings.TrimSpace(string(b)))
 	}
-	return true, nil
+	return fstype, true, nil
 }
 
 // guardSource names the read-only tmpfs under each mountpoint. Another

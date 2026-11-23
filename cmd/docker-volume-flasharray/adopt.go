@@ -115,6 +115,11 @@ func adopt(ctx context.Context, array flasharray.Array, namespace, prefix string
 	for _, p := range plan {
 		want := namespace + "/" + p.dockerName
 		switch {
+		case p.dockerName == "":
+			// The real run refuses it; a dry run must not promise otherwise.
+			fmt.Fprintf(out, "FAILED  %-40s no Docker name is left once the prefix is removed\n", p.arrayName)
+			failed++
+			continue
 		case already[p.arrayName] == want:
 			fmt.Fprintf(out, "skip    %-40s already %s\n", p.arrayName, want)
 			continue

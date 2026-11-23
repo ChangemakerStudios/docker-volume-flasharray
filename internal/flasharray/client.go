@@ -94,11 +94,11 @@ type Array interface {
 type Client struct {
 	endpoint string
 	token    string
-	version  string
 	http     *http.Client
 	log      *slog.Logger
 
 	mu        sync.Mutex
+	version   string // "" until negotiated; see apiVersion
 	authToken string
 
 	retryBase time.Duration // backoff unit between retries
@@ -112,7 +112,13 @@ type Options struct {
 	InsecureSkipVerify bool
 	Timeout            time.Duration
 	Logger             *slog.Logger
+	// LazyVersion lets New succeed while the array cannot be asked for its
+	// API versions; the first request negotiates instead.
+	LazyVersion bool
 }
+
+// lazyVersionWait bounds New's wait for an array it may start without.
+const lazyVersionWait = 10 * time.Second
 
 // New creates a client and negotiates the API version. It does not log in
 // until the first request.
@@ -134,19 +140,46 @@ func New(ctx context.Context, o Options) (*Client, error) {
 
 		retryBase: time.Second,
 	}
-	if c.version == "" {
-		v, err := c.negotiateVersion(ctx)
-		if err != nil {
+	nctx, cancel := ctx, context.CancelFunc(func() {})
+	if o.LazyVersion {
+		nctx, cancel = context.WithTimeout(ctx, lazyVersionWait)
+	}
+	_, err := c.apiVersion(nctx)
+	cancel()
+	if err != nil {
+		if !o.LazyVersion {
 			return nil, err
 		}
-		c.version = v
+		c.log.Warn("cannot ask the array for its API versions; will ask again on first use", "err", err)
 	}
-	c.log.Info("using FlashArray REST API", "version", c.version)
+	if o.APIVersion != "" {
+		c.log.Info("using FlashArray REST API", "version", o.APIVersion)
+	}
 	return c, nil
 }
 
-// Version returns the negotiated REST API version.
-func (c *Client) Version() string { return c.version }
+// Version returns the negotiated REST API version, or "" before that.
+func (c *Client) Version() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.version
+}
+
+// apiVersion returns the REST version to use, negotiating it if New could not.
+func (c *Client) apiVersion(ctx context.Context) (string, error) {
+	if v := c.Version(); v != "" {
+		return v, nil
+	}
+	v, err := c.negotiateVersion(ctx)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.version = v
+	c.mu.Unlock()
+	c.log.Info("using FlashArray REST API", "version", v)
+	return v, nil
+}
 
 func (c *Client) negotiateVersion(ctx context.Context) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/api/api_version", nil)
@@ -179,8 +212,8 @@ func minor(v string) int {
 	return n
 }
 
-func (c *Client) login(ctx context.Context) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/api/"+c.version+"/login", nil)
+func (c *Client) login(ctx context.Context, version string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/api/"+version+"/login", nil)
 	req.Header.Set("api-token", c.token)
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -253,7 +286,11 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 			return err
 		}
 	}
-	u := c.endpoint + "/api/" + c.version + path
+	version, err := c.apiVersion(ctx)
+	if err != nil {
+		return err
+	}
+	u := c.endpoint + "/api/" + version + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
@@ -263,7 +300,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 		tok := c.authToken
 		c.mu.Unlock()
 		if tok == "" {
-			if err := c.login(ctx); err != nil {
+			if err := c.login(ctx, version); err != nil {
 				return err
 			}
 			c.mu.Lock()

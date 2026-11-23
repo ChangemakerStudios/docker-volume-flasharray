@@ -190,7 +190,7 @@ func waitFor(ctx context.Context, timeout, interval time.Duration, fn func() (st
 }
 
 // sysBlockMatching returns /sys/class/block entries whose wwid file contains
-// needle (lowercase compare). pattern is a glob like "sd*" or "nvme*n*".
+// needle (lowercase compare). pattern is a glob like "sd*".
 func sysBlockMatching(pattern, needle string) []string {
 	needle = strings.ToLower(needle)
 	matches, _ := filepath.Glob(filepath.Join(sysClassBlock, pattern))

@@ -32,6 +32,8 @@ type iscsi struct {
 
 	mu sync.Mutex // serializes Connect
 
+	singlePath sync.Once // the no-multipathd warning, said once
+
 	// scanMu makes rescans exclusive with Exclusive callers, which change
 	// what LUN numbers carry on this host.
 	scanMu ctxlock.Mutex
@@ -120,7 +122,11 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.session.timeo.replacement_timeout", "-v", "120"); err != nil {
 			t.log.Warn("set replacement_timeout failed", "portal", p.Portal, "err", err)
 		}
-		_, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
+		// A login scans the new session's LUNs, so it waits its turn like any rescan.
+		err := t.Exclusive(ctx, func() error {
+			_, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "--login")
+			return err
+		})
 		if err != nil && exitCode(err) != iscsiadmExitSessionExists && !strings.Contains(err.Error(), "already present") {
 			errs = append(errs, err)
 			continue
@@ -497,6 +503,11 @@ func (t *iscsi) FindDevice(ctx context.Context, serial string) string {
 func (t *iscsi) WaitForDevice(ctx context.Context, serial string) (string, error) {
 	wwid := WWID(serial)
 	useMultipath := multipathdRunning()
+	if !useMultipath {
+		t.singlePath.Do(func() {
+			t.log.Warn("multipathd is not running on this host (no " + multipathdAbstractSocket + " in /proc/net/unix); volumes attach over a single path, with no failover")
+		})
+	}
 	if dev := t.findDevice(ctx, wwid, useMultipath, true); dev != "" {
 		return dev, nil
 	}
@@ -667,8 +678,24 @@ func (t *iscsi) removeMap(ctx context.Context, name string, flush bool) error {
 			return fmt.Errorf("detach: %s is still in use (%d holder(s) in sysfs, e.g. %s); not removing it", dev, len(holders), holders[0].Name())
 		}
 	}
+	// Before queueing goes off: a map left in place for whatever has it open
+	// would otherwise fail its I/O on the next path loss instead of riding it out.
+	if n := t.openCount(ctx, name); n > 0 {
+		return fmt.Errorf("detach: multipath map %s is still open (%d); not removing it", name, n)
+	}
 	t.stopQueueing(ctx, name)
 	return t.dropMap(ctx, name, flush)
+}
+
+// openCount is how many openers device-mapper counts on map name, or 0 if it
+// cannot say.
+func (t *iscsi) openCount(ctx context.Context, name string) int {
+	out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n
 }
 
 // stopQueueing makes I/O on map name fail once no path is usable, instead of
@@ -700,10 +727,8 @@ func (t *iscsi) dropMap(ctx context.Context, name string, flush bool) error {
 	}
 	// A forced remove swaps an open map's table for an error target, which is
 	// the same as pulling the disk from under a filesystem still flushing.
-	if out, err := runTimeout(ctx, t.log, 5*time.Second, "dmsetup", "info", "-c", "--noheadings", "-o", "open", name); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && n > 0 {
-			return fmt.Errorf("detach: multipath map %s is still open (%d); not forcing its removal", name, n)
-		}
+	if n := t.openCount(ctx, name); n > 0 {
+		return fmt.Errorf("detach: multipath map %s is still open (%d); not forcing its removal", name, n)
 	}
 	t.log.Warn("multipath -f failed; forcing removal with dmsetup", "map", name)
 	if _, err := runTimeout(ctx, t.log, 10*time.Second, "dmsetup", "remove", "--force", "--retry", name); err != nil {
@@ -726,7 +751,9 @@ const purePrefix = "naa.624a9370"
 // the new one. On staging that cross-wrote volumes.
 //
 // Only paths whose serial starts with arrayPrefix are judged: LUN numbers are
-// per array, and another array's paths are none of this map's business. A map
+// per array, and another array's paths are none of this map's business. Nor
+// are this array's paths off iSCSI (Fibre Channel, a VM's pass-through disk):
+// they sit under another host object, with LUN numbers of its own. A map
 // whose every path is stale has queueing switched off first, so whatever still
 // holds it gets I/O errors rather than hanging, and is removed unflushed
 // afterwards (its buffers belong to a volume it no longer reaches). Only a
@@ -749,6 +776,10 @@ func (t *iscsi) Sweep(ctx context.Context, want map[int]string, arrayPrefix stri
 		id := strings.ToLower(strings.TrimSpace(string(b)))
 		serial, ok := strings.CutPrefix(id, purePrefix)
 		if !ok || !strings.HasPrefix(serial, arrayPrefix) {
+			continue
+		}
+		if !onISCSI(p) {
+			t.log.Debug("leaving path alone: not on an iSCSI session", "dev", filepath.Base(p), "path_serial", serial)
 			continue
 		}
 		lun, ok := pathLUN(p)
@@ -871,4 +902,21 @@ func pathLUN(sysBlock string) (int, bool) {
 	}
 	n, err := strconv.Atoi(f[3])
 	return n, err == nil
+}
+
+// onISCSI reports whether a SCSI disk hangs off an iSCSI session: the kernel
+// then puts its device at .../hostH/sessionN/targetH:C:T/H:C:T:L.
+func onISCSI(sysBlock string) bool {
+	target, err := filepath.EvalSymlinks(filepath.Join(sysBlock, "device"))
+	if err != nil {
+		return false
+	}
+	for _, dir := range strings.Split(filepath.ToSlash(target), "/") {
+		if n, ok := strings.CutPrefix(dir, "session"); ok {
+			if _, err := strconv.Atoi(n); err == nil {
+				return true
+			}
+		}
+	}
+	return false
 }

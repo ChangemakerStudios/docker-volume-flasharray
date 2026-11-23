@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -119,6 +121,10 @@ func FromEnv() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("FA_TRANSPORT must be %q or %q, got %q", TransportISCSI, TransportNVMeTCP, c.Transport)
 	}
+	// It names the mkfs binary to run.
+	if !fsTypeName.MatchString(c.FSType) {
+		return nil, fmt.Errorf("FA_FS_TYPE=%q is not a filesystem type (xfs, ext4)", c.FSType)
+	}
 
 	size, err := ParseSize(getenv("FA_DEFAULT_SIZE", "32GiB"))
 	if err != nil {
@@ -152,6 +158,9 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("FA_UNMOUNT_LINGER: %w", err)
 	}
+	if err := ValidateTimeouts(c.AttachTimeout, c.PreemptGrace); err != nil {
+		return nil, err
+	}
 	if err := ValidateLinger(c.UnmountLinger, c.PreemptGrace); err != nil {
 		return nil, err
 	}
@@ -162,6 +171,20 @@ func FromEnv() (*Config, error) {
 	}
 	c.Array = f.Arrays[0]
 	return c, nil
+}
+
+var fsTypeName = regexp.MustCompile(`^[a-z0-9]+$`)
+
+// ValidateTimeouts rejects values every request budget is computed from: a
+// zero or negative attach timeout makes each device wait fail at once.
+func ValidateTimeouts(attach, grace time.Duration) error {
+	if attach <= 0 {
+		return fmt.Errorf("FA_ATTACH_TIMEOUT=%s: must be positive", attach)
+	}
+	if grace < 0 {
+		return fmt.Errorf("FA_PREEMPT_GRACE=%s: must not be negative", grace)
+	}
+	return nil
 }
 
 // ValidateLinger keeps a lingering volume clear of preemption: another node
@@ -248,8 +271,9 @@ func ParseSize(s string) (int64, error) {
 			break
 		}
 	}
+	// ParseFloat also takes "NaN" and "Inf", and a product past int64 wraps.
 	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || f <= 0 {
+	if err != nil || math.IsNaN(f) || f <= 0 || f*float64(mult) >= 1<<62 {
 		return 0, fmt.Errorf("invalid size %q", s)
 	}
 	n := int64(f * float64(mult))

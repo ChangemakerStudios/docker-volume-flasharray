@@ -28,10 +28,17 @@ type fakeArray struct {
 	extra     map[string]map[string]string // other dvfa tags: volume -> key -> value
 	lookupErr error                        // returned by LookupNameTag
 	down      error                        // array unreachable: returned by every read
-	hosts     map[string][]string
-	conns     map[string]map[string]int // volume -> host -> lun
-	nextLUN   int
-	calls     []string
+	hang      bool                         // reads answer only once the caller gives up
+	tagErr    error                        // returned by SetNameTag
+	hostErr   error                        // returned by EnsureHost
+	// createHook, when set, runs in place of CreateVolume's own work.
+	createHook func(name string) error
+	// connectHook runs, with mu held, right after a new connection is made.
+	connectHook func()
+	hosts       map[string][]string
+	conns       map[string]map[string]int // volume -> host -> lun
+	nextLUN     int
+	calls       []string
 }
 
 func newFakeArray() *fakeArray {
@@ -40,7 +47,19 @@ func newFakeArray() *fakeArray {
 
 func (f *fakeArray) rec(s string) { f.calls = append(f.calls, s) }
 
-func (f *fakeArray) GetVolume(_ context.Context, name string) (*flasharray.Volume, error) {
+// blackholed is a management endpoint that accepts nothing and refuses nothing.
+func (f *fakeArray) blackholed(ctx context.Context) error {
+	if !f.hang {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeArray) GetVolume(ctx context.Context, name string) (*flasharray.Volume, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down != nil {
@@ -58,6 +77,9 @@ func (f *fakeArray) CreateVolume(_ context.Context, name string, size int64) (*f
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rec("create:" + name)
+	if f.createHook != nil {
+		return nil, f.createHook(name)
+	}
 	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: size, Created: time.Now()}
 	f.vols[name] = v
 	return v, nil
@@ -150,11 +172,17 @@ func (f *fakeArray) DestroyVolume(_ context.Context, name string, eradicate bool
 func (f *fakeArray) SetNameTag(_ context.Context, volume, value string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tagErr != nil {
+		return f.tagErr
+	}
 	f.tags[volume] = value
 	return nil
 }
 
-func (f *fakeArray) ListNameTags(_ context.Context, prefix string) (map[string]string, error) {
+func (f *fakeArray) ListNameTags(ctx context.Context, prefix string) (map[string]string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down != nil {
@@ -174,7 +202,10 @@ func (f *fakeArray) destroyed(name string) bool {
 	return ok && v.Destroyed
 }
 
-func (f *fakeArray) LookupNameTag(_ context.Context, value string) (string, error) {
+func (f *fakeArray) LookupNameTag(ctx context.Context, value string) (string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.lookupErr != nil {
@@ -207,6 +238,9 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 func (f *fakeArray) EnsureHost(_ context.Context, name string, iqns, nqns []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hostErr != nil {
+		return "", f.hostErr
+	}
 	f.hosts[name] = append(iqns, nqns...)
 	return name, nil
 }
@@ -226,6 +260,9 @@ func (f *fakeArray) Connect(_ context.Context, host, volume string) (int, error)
 	}
 	f.conns[volume][host] = f.nextLUN
 	f.nextLUN++
+	if f.connectHook != nil {
+		f.connectHook()
+	}
 	return f.conns[volume][host], nil
 }
 
@@ -388,6 +425,8 @@ func (t *fakeTransport) CheckLUN(context.Context, string, int) error {
 type fakeMounter struct {
 	mu        sync.Mutex
 	formatted map[string]bool
+	existing  map[string]string // dev -> filesystem it already carries
+	fstypes   map[string]string // target -> filesystem type it was mounted as
 	mounted   map[string]string // target -> dev
 	opts      map[string]string // target -> mount options
 	busy      map[string]int    // dev -> Busy calls left that report busy; <0 = forever
@@ -396,6 +435,7 @@ type fakeMounter struct {
 	shutdowns []string          // mountpoints Shutdown was called for
 	// inUseChecks counts InUseByContainer calls.
 	inUseChecks int
+	umountErr   error // returned by Unmount
 }
 
 func (m *fakeMounter) Shutdown(target string) error {
@@ -406,7 +446,7 @@ func (m *fakeMounter) Shutdown(target string) error {
 }
 
 func newFakeMounter() *fakeMounter {
-	return &fakeMounter{formatted: map[string]bool{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, inUse: map[string]bool{}}
+	return &fakeMounter{formatted: map[string]bool{}, existing: map[string]string{}, fstypes: map[string]string{}, mounted: map[string]string{}, opts: map[string]string{}, busy: map[string]int{}, inUse: map[string]bool{}}
 }
 func (m *fakeMounter) Busy(dev string) (bool, error) {
 	m.mu.Lock()
@@ -417,17 +457,20 @@ func (m *fakeMounter) Busy(dev string) (bool, error) {
 	}
 	return n != 0, nil
 }
-func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, _ string, _ []string, allowFormat bool) (bool, error) {
+func (m *fakeMounter) EnsureFilesystem(_ context.Context, dev, fstype string, _ []string, allowFormat bool) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if have := m.existing[dev]; have != "" {
+		return have, false, nil
+	}
 	if m.formatted[dev] {
-		return false, nil
+		return fstype, false, nil
 	}
 	if !allowFormat {
-		return false, fmt.Errorf("%s: %w", dev, mounter.ErrNoFilesystem)
+		return "", false, fmt.Errorf("%s: %w", dev, mounter.ErrNoFilesystem)
 	}
 	m.formatted[dev] = true
-	return true, nil
+	return fstype, true, nil
 }
 func (m *fakeMounter) MountedAt(dev string) (string, error) {
 	m.mu.Lock()
@@ -451,9 +494,10 @@ func (m *fakeMounter) InUseByContainer(mountpoint string) (bool, error) {
 	m.inUseChecks++
 	return m.inUse[mountpoint], nil
 }
-func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) error {
+func (m *fakeMounter) Mount(_ context.Context, dev, target, fstype, opts string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.fstypes[target] = fstype
 	m.mounted[target] = dev
 	m.opts[target] = opts
 	return nil
@@ -461,6 +505,9 @@ func (m *fakeMounter) Mount(_ context.Context, dev, target, _, opts string) erro
 func (m *fakeMounter) Unmount(_ context.Context, target string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.umountErr != nil {
+		return m.umountErr
+	}
 	delete(m.mounted, target)
 	return nil
 }
@@ -1463,6 +1510,33 @@ func TestGetAnswersFromKnownVolumesWhileArrayDown(t *testing.T) {
 	}
 }
 
+// A management endpoint that hangs instead of refusing must not hold Get or
+// List past Docker's 1 minute: the known-volume answer would reach nobody.
+func TestGetAndListFallBackWithinTheirBudget(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := queryBudget
+	queryBudget = 50 * time.Millisecond
+	t.Cleanup(func() { queryBudget = old })
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fa.hang = true
+
+	start := time.Now()
+	g, err := d.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_unreachable"] == nil {
+		t.Fatalf("Get against a hanging array = %+v, %v", g, err)
+	}
+	l, err := d.List()
+	if err != nil || len(l.Volumes) != 1 || l.Volumes[0].Name != "v" {
+		t.Fatalf("List against a hanging array = %+v, %v", l, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Get and List took %s, past their budget", took)
+	}
+}
+
 func TestListReconcilesKnownVolumesAndFallsBack(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
@@ -2060,4 +2134,286 @@ func TestLingerTearsDownALostFilesystem(t *testing.T) {
 	eventually(t, "lost filesystem not torn down", func() bool {
 		return tr.detachCount() == 1 && !fa.connected(an, "node1")
 	})
+}
+
+// An adopted volume keeps the filesystem it came with, whatever FA_FS_TYPE says.
+func TestMountUsesTheFilesystemOnTheDevice(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.MountOptions = "discard"
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	fm.existing[tr.dev(fa.vols[d.arrayName("v")].Serial)] = "ext4"
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm.fstypes[r.Mountpoint] != "ext4" || fm.opts[r.Mountpoint] != "discard" {
+		t.Fatalf("mounted as %q with %q, want ext4 without nouuid", fm.fstypes[r.Mountpoint], fm.opts[r.Mountpoint])
+	}
+}
+
+// An untagged volume is missing from List, and under a fresh array name no
+// node can find it at all.
+func TestCreateFailsWhenTheNewVolumeCannotBeTagged(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	fa.tagErr = errors.New("HTTP 503")
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err == nil {
+		t.Fatal("create reported an untagged volume as made")
+	}
+	if v, ok := fa.vols["node1-v"]; ok && !v.Destroyed {
+		t.Fatal("left the untagged volume in place")
+	}
+	fa.tagErr = nil
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	an, err := fa.LookupNameTag(context.Background(), "node1/v")
+	if err != nil || fa.vols[an] == nil || fa.vols[an].Destroyed {
+		t.Fatalf("retry left no tagged volume: %q, %v", an, err)
+	}
+}
+
+// One an earlier Create could not tag, nor destroy again, is tagged by the retry.
+func TestCreateTagsAnExistingUntaggedVolume(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if _, err := fa.CreateVolume(context.Background(), "node1-v", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.tags["node1-v"] != "node1/v" {
+		t.Fatalf("tags = %v", fa.tags)
+	}
+}
+
+// The computed array name of one Docker volume can be a volume adopted under
+// another name; the two must not share it.
+func TestComputedNameClaimedByAnotherDockerVolumeIsRefused(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if _, err := fa.CreateVolume(context.Background(), "node1-data", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "other", Options: map[string]string{"import": "node1-data"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "data"}); !errors.Is(err, errClaimed) {
+		t.Fatalf("create of a name whose array volume is another's = %v", err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "data", ID: "c"}); !errors.Is(err, errClaimed) {
+		t.Fatalf("mount = %v", err)
+	}
+	if err := d.Remove(&plugin.RemoveRequest{Name: "data"}); !errors.Is(err, errClaimed) || fa.vols["node1-data"].Destroyed {
+		t.Fatalf("remove = %v, destroyed = %v", err, fa.vols["node1-data"].Destroyed)
+	}
+}
+
+// Scope is global, so two nodes can create one name at the same moment.
+func TestCreateUsesAVolumeAnotherNodeCreatedAtTheSameMoment(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	fa.createHook = func(name string) error {
+		fa.vols[name] = &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", 77), Provisioned: 1 << 30, Created: time.Now()}
+		fa.tags[name] = "node1/v"
+		return errors.New("POST /volumes: HTTP 400: volume already exists")
+	}
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatalf("create lost the race and failed: %v", err)
+	}
+	if g, err := d.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Status["array_name"] != "node1-v" {
+		t.Fatalf("get = %+v, %v", g, err)
+	}
+}
+
+// Two nodes mounting at the same moment both find the volume free and both
+// connect; the one that then sees the other must not go on to mount.
+func TestMountBacksOffWhenAnotherHostConnectsAtTheSameMoment(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.connectHook = func() { fa.conns[an]["node2"] = 99 }
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("mounted a volume another host had connected at the same moment")
+	}
+	if fa.connected(an, "node1") || len(fm.mounted) != 0 {
+		t.Fatal("did not back out of its own connection")
+	}
+	if !fa.connected(an, "node2") {
+		t.Fatal("disconnected the other host")
+	}
+
+	// The other host let go; the retry mounts.
+	fa.mu.Lock()
+	fa.connectHook = nil
+	delete(fa.conns[an], "node2")
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+}
+
+// After another node preempts this one, the device under the mount is dead.
+func TestMountRefusesAMountTheArrayNoLongerConnectsHere(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c2"}); err != nil {
+		t.Fatalf("second mount of a live volume: %v", err)
+	}
+	fa.mu.Lock()
+	delete(fa.conns[an], "node1")
+	fa.conns[an]["node2"] = 5
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c3"}); err == nil {
+		t.Fatal("handed out a mount whose volume another host took")
+	}
+	fa.down = errors.New("HTTP 503")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c4"}); err != nil {
+		t.Fatalf("a mounted volume must still be served while the array is down: %v", err)
+	}
+}
+
+// A detach that fails after the filesystem is unmounted used to leave the
+// volume connected until another node preempted it.
+func TestFailedDetachIsRetried(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := teardownRetry
+	teardownRetry = 10 * time.Millisecond
+	t.Cleanup(func() { teardownRetry = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	tr.mu.Lock()
+	tr.detachErr = errors.New("map is still open")
+	tr.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("unmount hid the failed detach")
+	}
+	if !fa.connected(an, "node1") {
+		t.Fatal("disconnected on the array under a device the host still holds")
+	}
+	tr.mu.Lock()
+	tr.detachErr = nil
+	tr.mu.Unlock()
+	eventually(t, "failed detach never retried", func() bool { return !fa.connected(an, "node1") })
+}
+
+// Likewise an umount that fails: the volume was left mounted with no refs and
+// nothing to try again.
+func TestFailedUnmountIsRetried(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := teardownRetry
+	teardownRetry = 10 * time.Millisecond
+	t.Cleanup(func() { teardownRetry = old })
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	fm.umountErr = errors.New("target is busy")
+	fm.mu.Unlock()
+	if err := d.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err == nil {
+		t.Fatal("unmount hid the failed umount")
+	}
+	fm.mu.Lock()
+	fm.umountErr = nil
+	fm.mu.Unlock()
+	eventually(t, "failed umount never retried", func() bool { return !fa.connected(an, "node1") })
+}
+
+// A Mount Docker never pairs with an Unmount must not pin the volume for good.
+func TestOrphanedRefsAreReapedWithoutAnUnmount(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "never-unmounted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.reapOrphans(context.Background())
+	if !fa.connected(an, "node1") {
+		t.Fatal("reaped a ref young enough to belong to a starting container")
+	}
+	refPending = 0
+	t.Cleanup(func() { refPending = 2 * time.Minute })
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = true
+	fm.mu.Unlock()
+	d.reapOrphans(context.Background())
+	if !fa.connected(an, "node1") {
+		t.Fatal("reaped a volume a container still has mounted")
+	}
+	fm.mu.Lock()
+	fm.inUse[r.Mountpoint] = false
+	fm.mu.Unlock()
+	d.reapOrphans(context.Background())
+	if fa.connected(an, "node1") || fm.isMounted(r.Mountpoint) {
+		t.Fatal("orphaned mount left in place")
+	}
+}
+
+// With no driver to answer Get, Docker substitutes local volumes; so a node
+// that has served volumes starts even when the array cannot be reached.
+func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	r, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(r.Mountpoint, 0o755); err != nil { // the fake mounter doesn't create it
+		t.Fatal(err)
+	}
+
+	outage := errors.New("dial tcp: i/o timeout")
+	fa.mu.Lock()
+	fa.hostErr, fa.down = outage, outage
+	fa.mu.Unlock()
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm})
+	if err != nil {
+		t.Fatalf("restart during an outage: %v", err)
+	}
+	if g, err := d2.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume.Mountpoint == "" {
+		t.Fatalf("Get after an offline start = %+v, %v", g, err)
+	}
+	if _, err := d2.Mount(&plugin.MountRequest{Name: "w", ID: "c"}); err == nil {
+		t.Fatal("mounted without the array")
+	}
+
+	// The array is back: the host object is found on first need.
+	fa.mu.Lock()
+	fa.hostErr, fa.down = nil, nil
+	fa.mu.Unlock()
+	if err := d2.Unmount(&plugin.UnmountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.connected(an, "node1") {
+		t.Fatal("volume recovered at an offline start was not released")
+	}
+
+	// A first start has nothing to answer from, and fails where a wrong
+	// endpoint or token is most likely.
+	fresh := *d.cfg
+	fresh.MountRoot = t.TempDir()
+	fa.hostErr = outage
+	if _, err := New(context.Background(), &fresh, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()}); err == nil {
+		t.Fatal("first start without the array must fail")
+	}
 }

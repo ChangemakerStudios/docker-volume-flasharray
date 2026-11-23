@@ -75,14 +75,26 @@ func TestDeviceIdentityChecks(t *testing.T) {
 	}
 }
 
-// fakePath builds sys/<sd>/device -> scsi/<hctl> holding the cached wwid and a
-// delete file, the sysfs shape of one SCSI path.
+// scsiDir is a fake iSCSI path's device directory: under a session, as the
+// kernel files one.
+func scsiDir(root, hctl string) string {
+	return filepath.Join(root, "scsi", "session1", hctl)
+}
+
+// fakePath builds sys/<sd>/device -> scsiDir(hctl) holding the cached wwid and
+// a delete file, the sysfs shape of one iSCSI path.
 func fakePath(t *testing.T, root, sd, hctl, wwid string) {
+	t.Helper()
+	fakePathIn(t, root, scsiDir(root, hctl), sd, wwid)
+}
+
+// fakePathIn is fakePath with the device directory, whose last element is the
+// H:C:T:L, anywhere.
+func fakePathIn(t *testing.T, root, dir, sd, wwid string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("H:C:T:L is not a valid file name on Windows")
 	}
-	dir := filepath.Join(root, "scsi", hctl)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +113,7 @@ func fakePath(t *testing.T, root, sd, hctl, wwid string) {
 
 func deleted(t *testing.T, root, hctl string) bool {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(root, "scsi", hctl, "delete"))
+	b, err := os.ReadFile(filepath.Join(scsiDir(root, hctl), "delete"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +182,35 @@ func TestSweepCrossedOnly(t *testing.T) {
 	}
 }
 
+// This array's LUNs can also reach the node outside the plugin's sessions,
+// under another host object whose LUN numbers this host's map knows nothing of.
+func TestSweepLeavesPathsOffISCSIAlone(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	fc := filepath.Join(root, "scsi", "rport-7:0-0", "target7:0:0", "7:0:0:4")
+	fakePathIn(t, root, fc, "sda", "naa.624a93706fef9ab1157343ec000000bb") // LUN 4 carries cc for this host
+	rdm := filepath.Join(root, "scsi", "target2:0:1", "2:0:1:9")
+	fakePathIn(t, root, rdm, "sdb", "naa.624a93706fef9ab1157343ec000000dd")      // LUN 9 not connected to this host
+	fakePath(t, root, "sdc", "34:0:0:4", "naa.624a93706fef9ab1157343ec000000bb") // the same stale identity over iSCSI
+
+	tr := &iscsi{log: slog.Default()}
+	want := map[int]string{4: "6fef9ab1157343ec000000cc"}
+	if err := tr.Sweep(context.Background(), want, "6fef9ab1157343ec", -1, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{fc, rdm} {
+		if b, err := os.ReadFile(filepath.Join(dir, "delete")); err != nil || string(b) == "1" {
+			t.Fatalf("deleted a path that is not on an iSCSI session: %s (%v)", dir, err)
+		}
+	}
+	if !deleted(t, root, "34:0:0:4") {
+		t.Fatal("kept a stale iSCSI path")
+	}
+}
+
 func TestCheckLUN(t *testing.T) {
 	root := t.TempDir()
 	old := sysClassBlock
@@ -210,7 +251,7 @@ func TestSweepFailsOnlyForItsOwnLUN(t *testing.T) {
 	t.Cleanup(func() { sysClassBlock = old })
 
 	fakePath(t, root, "sda", "34:0:0:5", "naa.624a93706fef9ab1157343ec000000aa")
-	stuck := filepath.Join(root, "scsi", "34:0:0:5", "delete")
+	stuck := filepath.Join(scsiDir(root, "34:0:0:5"), "delete")
 	if err := os.Remove(stuck); err != nil {
 		t.Fatal(err)
 	}
@@ -659,5 +700,109 @@ func TestConnectLogsInAgainWhenSessionsAreGone(t *testing.T) {
 	connect()
 	if logins != 2 {
 		t.Fatalf("logins after the session went away = %d, want 2", logins)
+	}
+}
+
+// A detach refused because the map is open must leave it as it was: with
+// queueing already off, whatever holds it fails I/O on the next path loss.
+func TestDetachLeavesAnOpenMapQueueing(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+	const serial = "6fef9ab1157343ec000000aa"
+	fakePath(t, root, "sda", "34:0:0:3", "naa.624a9370"+serial)
+	cmds := fakeMultipath(t, WWID(serial), nil)
+	inner := runner
+	runner = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+		if name == "dmsetup" && len(args) > 0 && args[0] == "info" {
+			return "1\n", nil
+		}
+		return inner(ctx, log, name, args...)
+	}
+
+	tr := &iscsi{log: slog.Default()}
+	if err := tr.Detach(context.Background(), serial, "", map[int]string{3: serial}); err == nil {
+		t.Fatal("detached a map something still has open")
+	}
+	if ran(*cmds, "multipathd disablequeueing map mpathq") || ran(*cmds, "dmsetup message mpathq 0 fail_if_no_path") {
+		t.Fatalf("switched queueing off on a map left in place: %v", *cmds)
+	}
+	if deleted(t, root, "34:0:0:3") {
+		t.Fatal("deleted a path under a map left in place")
+	}
+}
+
+// fakeNVMe builds sys/<node> with the identity files a namespace node has.
+func fakeNVMe(t *testing.T, root, node string, files map[string]string) {
+	t.Helper()
+	dir := filepath.Join(root, "sys", node)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range files {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The serial is split around Pure's OUI inside the NGUID, and the per-path
+// nodes of native multipath carry the same identity without a /dev node.
+func TestNVMeDeviceMatching(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassBlock
+	sysClassBlock = filepath.Join(root, "sys")
+	t.Cleanup(func() { sysClassBlock = old })
+
+	const serial = "6FEF9AB1157343EC000000AA"
+	const nguid = "006fef9ab1157343" + "24a937" + "ec000000aa"
+	if got := nvmeNGUID(serial); got != nguid {
+		t.Fatalf("nguid = %s, want %s", got, nguid)
+	}
+	fakeNVMe(t, root, "nvme0c0n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0c1n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0n1", map[string]string{"wwid": "eui." + nguid})
+	fakeNVMe(t, root, "nvme0n1p1", nil)
+	fakeNVMe(t, root, "nvme0n2", map[string]string{"wwid": "eui.006fef9ab115734324a937ec000000bb"})
+
+	tr := &nvmeTCP{log: slog.Default()}
+	if got := tr.FindDevice(context.Background(), serial); got != "/dev/nvme0n1" {
+		t.Fatalf("device = %q, want the head node /dev/nvme0n1", got)
+	}
+	if got := tr.FindDevice(context.Background(), "6fef9ab1157343ec000000cc"); got != "" {
+		t.Fatalf("matched %q for a volume that is not attached", got)
+	}
+
+	// A namespace that also reports a UUID puts that in wwid; nguid still has it.
+	fakeNVMe(t, root, "nvme1n1", map[string]string{
+		"wwid":  "uuid.4a1b2c3d-0000-4000-8000-000000000001",
+		"nguid": "006fef9a-b115-7343-24a9-37ec000000dd",
+	})
+	if got := tr.FindDevice(context.Background(), "6fef9ab1157343ec000000dd"); got != "/dev/nvme1n1" {
+		t.Fatalf("device by nguid file = %q", got)
+	}
+}
+
+func TestLiveControllers(t *testing.T) {
+	root := t.TempDir()
+	old := sysClassNVMe
+	sysClassNVMe = root
+	t.Cleanup(func() { sysClassNVMe = old })
+	dir := filepath.Join(root, "nvme3")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range map[string]string{
+		"subsysnqn": "nqn.2010-06.com.purestorage:flasharray.test\n",
+		"address":   "traddr=198.51.100.10,trsvcid=4420,src_addr=198.51.100.20\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := liveControllers()
+	if !live["nqn.2010-06.com.purestorage:flasharray.test|198.51.100.10:4420"] || len(live) != 1 {
+		t.Fatalf("live = %v", live)
 	}
 }

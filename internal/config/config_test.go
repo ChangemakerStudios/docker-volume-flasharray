@@ -67,3 +67,28 @@ func TestValidateLinger(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSizeRejectsWhatFloatParsingLetsThrough(t *testing.T) {
+	for _, s := range []string{"NaN", "Inf", "+Inf", "infinityG", "1e30G", "9999999999T"} {
+		if n, err := ParseSize(s); err == nil {
+			t.Errorf("ParseSize(%q) = %d, want an error", s, n)
+		}
+	}
+}
+
+func TestValidateTimeouts(t *testing.T) {
+	for _, tc := range []struct {
+		attach, grace time.Duration
+		ok            bool
+	}{
+		{60 * time.Second, 90 * time.Second, true},
+		{time.Second, 0, true},
+		{0, 90 * time.Second, false},
+		{-time.Second, 90 * time.Second, false},
+		{60 * time.Second, -time.Second, false},
+	} {
+		if err := ValidateTimeouts(tc.attach, tc.grace); (err == nil) != tc.ok {
+			t.Errorf("ValidateTimeouts(%s, %s) = %v", tc.attach, tc.grace, err)
+		}
+	}
+}
