@@ -1458,6 +1458,62 @@ func TestCloneRetryPastADestroyedCopy(t *testing.T) {
 	}
 }
 
+// While a clone is being made it carries its source's tag. A List in that
+// moment must not decide which of the two the source's name means: cached, the
+// clone would stay, and the source's Mount and Remove would act on it.
+func TestListDuringACloneDoesNotMapTheSourceToTheCopy(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "pg"}); err != nil {
+		t.Fatal(err)
+	}
+	src, clone := d.arrayName("pg"), d.arrayName("pg_copy")
+	// Another node, which has never resolved pg.
+	cfg := *d.cfg
+	cfg.MountRoot = t.TempDir()
+	d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := []*Driver{d, d2}
+
+	if _, err := fa.CopyVolume(context.Background(), src, clone); err != nil { // copied, not yet retagged
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ { // which of the two a map walk meets last is random
+		for _, n := range nodes {
+			l, err := n.List()
+			if err != nil || len(l.Volumes) != 1 || l.Volumes[0].Name != "pg" {
+				t.Fatalf("list during the clone = %+v, %v", l, err)
+			}
+			if an := n.cachedName("pg"); an != "" && an != src {
+				t.Fatalf("pg resolved to %s", an)
+			}
+			if an := n.known["pg"]; an != "" && an != src {
+				t.Fatalf("pg recorded for the outage fallback as %s", an)
+			}
+		}
+	}
+
+	if err := fa.SetNameTag(context.Background(), clone, "node1/pg_copy"); err != nil { // Create's retag
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		if _, err := n.List(); err != nil {
+			t.Fatal(err)
+		}
+		if n.cachedName("pg") != src || n.cachedName("pg_copy") != clone {
+			t.Fatalf("after the clone: pg=%s pg_copy=%s", n.cachedName("pg"), n.cachedName("pg_copy"))
+		}
+	}
+	if err := d2.Remove(&plugin.RemoveRequest{Name: "pg"}); err != nil {
+		t.Fatal(err)
+	}
+	if v := fa.vols[clone]; v == nil || v.Destroyed {
+		t.Fatal("removing the source destroyed the clone")
+	}
+}
+
 // The driver never rewrites a filesystem UUID; xfs_admin -U is a write to the volume.
 func TestXFSMountsUseNouuid(t *testing.T) {
 	for _, tc := range []struct{ fstype, opts, want string }{

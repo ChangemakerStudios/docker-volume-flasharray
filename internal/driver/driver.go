@@ -1874,14 +1874,39 @@ func (d *Driver) List() (*plugin.ListResponse, error) {
 		return d.listResponse(byName), nil
 	}
 	byName := make(map[string]string, len(tags))
-	d.mu.Lock()
+	twice := map[string]bool{}
 	for an, val := range tags {
 		name := strings.TrimPrefix(val, prefix)
-		d.names[name] = an
+		if _, ok := byName[name]; ok {
+			twice[name] = true
+		}
 		byName[name] = an
 	}
+	known := make(map[string]string, len(byName))
+	d.mu.Lock()
+	for name, an := range byName {
+		if twice[name] {
+			// A clone carries its source's tag until Create gives it its own.
+			// Which volume the name means is not List's to guess, and a wrong
+			// guess would stay: the clone is live, so nothing re-resolves it,
+			// and the source's Mount and Remove would then act on the clone.
+			if an = d.names[name]; an == "" {
+				an = d.known[name]
+			}
+			byName[name] = an
+			if an == "" {
+				continue
+			}
+		} else {
+			d.names[name] = an
+		}
+		known[name] = an
+	}
 	d.mu.Unlock()
-	d.replaceKnown(byName)
+	if len(twice) > 0 {
+		d.log.Warn("name tag on more than one volume; keeping what this node had resolved", "volumes", slices.Sorted(maps.Keys(twice)))
+	}
+	d.replaceKnown(known)
 	return d.listResponse(byName), nil
 }
 
