@@ -91,6 +91,9 @@ type mountState struct {
 	// Both are guarded by Driver.mu.
 	linger    *time.Timer
 	lingerGen int
+	// heldLogged is set once a deferred teardown has said a container still
+	// holds the mount, which it finds again every interval the container runs.
+	heldLogged bool
 }
 
 // Deps lets tests inject fakes.
@@ -1630,7 +1633,10 @@ func (d *Driver) lingerExpired(an string, st *mountState, gen int) {
 	if lost := d.lostMount(st); lost {
 		d.log.Info("tearing down a volume whose filesystem was unmounted outside this plugin", "volume", st.dockerName)
 	} else if inUse, err := d.mnt.InUseByContainer(st.mountpoint); err != nil || inUse {
-		d.log.Warn("not tearing down yet: a container may still have the volume mounted", "volume", st.dockerName, "err", err)
+		if err != nil || !st.heldLogged {
+			d.log.Warn("not tearing down yet: a container may still have the volume mounted; checking again every interval", "volume", st.dockerName, "err", err)
+			st.heldLogged = err == nil
+		}
 		d.retryTeardown(an, st)
 		return
 	}
