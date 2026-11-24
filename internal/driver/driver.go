@@ -514,7 +514,11 @@ var (
 )
 
 func (d *Driver) ctxWithin(limit time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), min(d.cfg.AttachTimeout+maxReleaseWait+30*time.Second, limit))
+	return context.WithTimeout(context.Background(), d.budget(limit))
+}
+
+func (d *Driver) budget(limit time.Duration) time.Duration {
+	return min(d.cfg.AttachTimeout+maxReleaseWait+30*time.Second, limit)
 }
 
 // Create implements plugin.Driver.
@@ -558,12 +562,23 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		// them: one under the computed name that is tagged for another Docker
 		// volume (a clone destroyed before it got its own tag, or an import
 		// removed since) is in the way like any destroyed volume, not a claim.
+		// Looked at under the lock: a Create here may be about to destroy it.
 		cn := d.arrayName(req.Name)
-		if dv, gerr := d.array.GetVolume(ctx, cn); gerr == nil && dv.Destroyed {
-			if unlock, err = d.lockCtx(ctx, cn); err != nil {
-				return err
+		cunlock, lerr := d.lockCtx(ctx, cn)
+		if lerr != nil {
+			return lerr
+		}
+		unlock = cunlock
+		if dv, gerr := d.array.GetVolume(ctx, cn); gerr == nil {
+			switch {
+			case dv.Destroyed:
+				an, v, err = cn, dv, nil
+			case source != "" && d.unfinishedClone(ctx, source, cn, dv):
+				if err := d.cloneSettled(req.Name, cn, dv); err != nil {
+					return err
+				}
+				return d.finishClone(ctx, req.Name, cn, dv, source)
 			}
-			an, v = cn, dv
 		}
 	}
 	if err == nil && !v.Destroyed {
@@ -583,6 +598,13 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	}
 	if err == nil { // destroyed, awaiting eradication: leave it recoverable and make a new one
 		old := an
+		if source != "" {
+			// Copied beside it before, with the answer lost, the copy is under a
+			// name only that Create knew; another copy would leave it behind.
+			if done, err := d.finishLeftClone(ctx, req.Name, source, old); done || err != nil {
+				return err
+			}
+		}
 		if an, err = d.freshArrayName(ctx, old); err != nil {
 			return err
 		}
@@ -605,6 +627,17 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		ev, gerr := d.array.GetVolume(ctx, an)
 		if gerr != nil || ev.Destroyed {
 			return err
+		}
+		if source != "" && d.unfinishedClone(ctx, source, an, ev) {
+			// Claim would refuse its source's tag. The copy is this call's when
+			// its answer was lost; when the array refused it as existing, it is
+			// another node's, which may still be tagging or destroying it.
+			if flasharray.IsAlreadyExists(err) {
+				if serr := d.cloneSettled(req.Name, an, ev); serr != nil {
+					return serr
+				}
+			}
+			return d.finishClone(ctx, req.Name, an, ev, source)
 		}
 		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
 		v = ev
@@ -674,6 +707,74 @@ func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharra
 		return nil, fmt.Errorf("clone %s to %s: %w", src, an, err)
 	}
 	return v, nil
+}
+
+// unfinishedClone reports whether v, live under an, is a copy of source that
+// never got its own tag: the copy's answer was lost, or the tag write after
+// it failed along with the clean-up. It still carries its source's tag, so
+// claim refuses it for good, and lookups of the source find two volumes. For
+// that reason it goes by the copy's own source field rather than resolving
+// source. Array names are case-insensitive and come back in the array's
+// spelling.
+func (d *Driver) unfinishedClone(ctx context.Context, source, an string, v *flasharray.Volume) bool {
+	src := v.Source
+	if src == "" || strings.EqualFold(src, an) {
+		return false
+	}
+	st, err := d.nameTag(ctx, src)
+	if err != nil || st == "" {
+		return false
+	}
+	if st != d.tagValue(source) && !strings.EqualFold(src, source) && !strings.EqualFold(src, d.arrayName(source)) {
+		return false
+	}
+	ct, err := d.nameTag(ctx, an)
+	return err == nil && ct == st
+}
+
+// cloneSettled refuses an unfinished clone younger than a Create can take,
+// clean-up included: one on another node may still be tagging it, or about
+// to destroy it because that failed.
+func (d *Driver) cloneSettled(dockerName, an string, v *flasharray.Volume) error {
+	settle := d.budget(time.Hour) + cleanupBudget
+	if age := time.Since(v.Created); age < settle {
+		return fmt.Errorf("volume %s: %s is a copy made %s ago that does not carry its own tag yet, and a create elsewhere may still be finishing it; retry in %s",
+			dockerName, an, age.Round(time.Second), (settle - age).Round(time.Second))
+	}
+	return nil
+}
+
+// finishLeftClone finishes an unfinished clone of source that an earlier
+// Create copied beside the destroyed volume under base (see freshArrayName).
+func (d *Driver) finishLeftClone(ctx context.Context, dockerName, source, base string) (bool, error) {
+	prefix := base
+	if len(prefix) > 50 { // freshArrayName shortens a long base to fit its suffix
+		prefix = strings.TrimRight(prefix[:50], "-")
+	}
+	vols, err := d.array.ListVolumes(ctx, prefix)
+	if err != nil {
+		return false, err
+	}
+	slices.SortFunc(vols, func(a, b *flasharray.Volume) int { return a.Created.Compare(b.Created) })
+	for _, v := range vols {
+		if strings.EqualFold(v.Name, base) || !d.unfinishedClone(ctx, source, v.Name, v) {
+			continue
+		}
+		if err := d.cloneSettled(dockerName, v.Name, v); err != nil {
+			return false, err
+		}
+		return true, d.finishClone(ctx, dockerName, v.Name, v, source)
+	}
+	return false, nil
+}
+
+func (d *Driver) finishClone(ctx context.Context, dockerName, an string, v *flasharray.Volume, source string) error {
+	if err := d.array.SetNameTag(ctx, an, d.tagValue(dockerName)); err != nil {
+		return fmt.Errorf("create volume %s: tag %s, a copy of %s left without its own tag: %w", dockerName, an, source, err)
+	}
+	d.remember(dockerName, an)
+	d.log.Warn("finished a clone left tagged as its source", "volume", dockerName, "array_name", an, "serial", v.Serial, "source", source)
+	return nil
 }
 
 // mountOptions adds nouuid for XFS. A copy of a volume carries its source's
@@ -837,7 +938,17 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		if parked, err := d.freshArrayName(ctx, an); err != nil {
 			d.log.Warn("no free name to move the removed volume to; the name stays taken until eradication", "array_name", an, "err", err)
 		} else if err := d.array.RenameVolume(ctx, an, parked); err != nil {
-			d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+			// The array may have renamed it and the answer been lost. Destroying
+			// under the old name then finds nothing, and the volume would be
+			// reported removed while it lives on, tagged, under the new one.
+			switch pv, gerr := d.array.GetVolume(ctx, parked); {
+			case gerr == nil && pv.Serial == v.Serial:
+				an = parked
+			case gerr == nil || flasharray.IsNotFound(gerr):
+				d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+			default:
+				return fmt.Errorf("volume %s: cannot tell whether %s was renamed to %s (%v): %w", req.Name, an, parked, err, gerr)
+			}
 		} else {
 			an = parked
 		}

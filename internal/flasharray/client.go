@@ -43,6 +43,8 @@ type Volume struct {
 	Written   int64
 	Destroyed bool
 	Created   time.Time
+	// Source is the volume this one was copied from, "" for none or one gone.
+	Source string
 }
 
 // Connection is a host<->volume connection.
@@ -279,6 +281,13 @@ const maxAttempts = 4
 // 5xx and transport errors only for non-POST, since a POST whose response was
 // lost may already have created the object.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, out any) error {
+	return c.send(ctx, method, path, q, body, out, method != http.MethodPost)
+}
+
+// send is do with the choice spelled out: repeatable says the request may be
+// sent again after a 5xx or a lost response. That is a property of the
+// operation, not of its method.
+func (c *Client) send(ctx context.Context, method, path string, q url.Values, body any, out any, repeatable bool) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -317,7 +326,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
-			if method != http.MethodPost && attempt < maxAttempts && ctx.Err() == nil {
+			if repeatable && attempt < maxAttempts && ctx.Err() == nil {
 				c.log.Warn("request failed; retrying", "method", method, "path", path, "attempt", attempt, "err", err)
 				if c.backoff(ctx, attempt, "") == nil {
 					continue
@@ -335,7 +344,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 			c.mu.Unlock()
 			continue
 		}
-		retryable := code == http.StatusTooManyRequests || code >= 500 && method != http.MethodPost
+		retryable := code == http.StatusTooManyRequests || code >= 500 && repeatable
 		if retryable && attempt < maxAttempts {
 			msg := readErr(resp)
 			resp.Body.Close()
@@ -395,6 +404,12 @@ func isAlreadyDestroyed(err error) bool {
 // IsNotFound reports whether err wraps ErrNotFound.
 func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 
+// IsAlreadyExists reports the array's refusal to create an object whose name
+// is taken.
+func IsAlreadyExists(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
 // --- volumes ---------------------------------------------------------------
 
 type volumeItem struct {
@@ -406,6 +421,9 @@ type volumeItem struct {
 	Space       struct {
 		Virtual *int64 `json:"virtual"`
 	} `json:"space"`
+	Source struct {
+		Name string `json:"name"`
+	} `json:"source"`
 }
 
 type page[T any] struct {
@@ -426,6 +444,7 @@ func (v volumeItem) toVolume() *Volume {
 		Written:     written,
 		Destroyed:   v.Destroyed,
 		Created:     time.UnixMilli(v.Created).UTC(),
+		Source:      v.Source.Name,
 	}
 }
 
@@ -486,9 +505,11 @@ func (c *Client) DestroyVolume(ctx context.Context, name string, eradicate bool)
 	return err
 }
 
-// RenameVolume renames an array volume; its serial, data and tags stay.
+// RenameVolume renames an array volume; its serial, data and tags stay. Sent
+// once: repeated after a lost response it finds the old name gone, and the
+// caller is told a rename failed that took effect.
 func (c *Client) RenameVolume(ctx context.Context, name, newName string) error {
-	return c.do(ctx, http.MethodPatch, "/volumes", url.Values{"names": {name}}, map[string]any{"name": newName}, nil)
+	return c.send(ctx, http.MethodPatch, "/volumes", url.Values{"names": {name}}, map[string]any{"name": newName}, nil, false)
 }
 
 // --- tags ------------------------------------------------------------------
@@ -717,7 +738,7 @@ func (c *Client) Connect(ctx context.Context, host, volume string) (int, error) 
 	q := url.Values{"host_names": {host}, "volume_names": {volume}}
 	var out page[connItem]
 	err := c.do(ctx, http.MethodPost, "/connections", q, nil, &out)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists") {
+	if IsAlreadyExists(err) {
 		err = c.do(ctx, http.MethodGet, "/connections", q, nil, &out)
 	}
 	if err != nil {
