@@ -102,6 +102,9 @@ type Deps struct {
 	Transport transport.Transport
 	Mounter   mounter.Mounter
 	Logger    *slog.Logger
+	// ArrayUnanswered says the array did not answer when its client was made,
+	// a moment ago: a start that can do without it does not wait a second time.
+	ArrayUnanswered bool
 }
 
 // New builds a driver and prepares the host object / sessions.
@@ -137,7 +140,13 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	// is most likely.
 	hctx, hcancel := ctx, context.CancelFunc(func() {})
 	if drv.hasKnown() {
-		hctx, hcancel = context.WithTimeout(ctx, startArrayWait)
+		wait := startArrayWait
+		if d.ArrayUnanswered {
+			// Requests are queueing on the socket and Docker gives a Get one
+			// minute: on hardware the second wait brought the first to 59 s.
+			wait = 0
+		}
+		hctx, hcancel = context.WithTimeout(ctx, wait)
 	}
 	err := drv.requireHost(hctx)
 	hcancel()
@@ -543,6 +552,19 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 	an, v, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer func() { unlock() }() // unlock is swapped when a destroyed volume forces a new array name
 
+	if errors.Is(err, errClaimed) {
+		// A destroyed volume keeps its tags, and the array still answers for
+		// them: one under the computed name that is tagged for another Docker
+		// volume (a clone destroyed before it got its own tag, or an import
+		// removed since) is in the way like any destroyed volume, not a claim.
+		cn := d.arrayName(req.Name)
+		if dv, gerr := d.array.GetVolume(ctx, cn); gerr == nil && dv.Destroyed {
+			if unlock, err = d.lockCtx(ctx, cn); err != nil {
+				return err
+			}
+			an, v = cn, dv
+		}
+	}
 	if err == nil && !v.Destroyed {
 		// Found by its computed name, it may be one an earlier Create could
 		// not tag; untagged it is missing from List on every node.
@@ -586,14 +608,22 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
 		v = ev
 	}
-	if err := d.claim(ctx, an, req.Name); err != nil {
+	if created {
+		// The array copies tags with a volume, so a clone arrives tagged as its
+		// source and claim would refuse it; a volume this call made is ours.
+		err = d.array.SetNameTag(ctx, an, d.tagValue(req.Name))
+	} else {
+		err = d.claim(ctx, an, req.Name)
+	}
+	if err != nil {
 		// Untagged, the volume is missing from List, and under a fresh array
-		// name no node can find it at all: each would create its own.
+		// name no node can find it at all: each would create its own. A clone
+		// left with its source's tag makes lookups of the source ambiguous.
 		if created {
 			cctx, cancel := cleanupCtx(ctx)
 			defer cancel()
 			if derr := d.array.DestroyVolume(cctx, an, d.cfg.EradicateOnRemove); derr != nil {
-				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array untagged", "volume", req.Name, "array_name", an, "err", derr)
+				d.log.Error("could not tag the new volume, nor destroy it again; it is left on the array without its own name tag", "volume", req.Name, "array_name", an, "source", source, "err", derr)
 			}
 		}
 		return fmt.Errorf("create volume %s: tag %s: %w", req.Name, an, err)
@@ -1031,6 +1061,20 @@ var (
 // still put a path into a live map that reaches another volume. It also
 // looks, less often, for mounts only orphaned refs keep (reapOrphans).
 func (d *Driver) RunPathCheck(ctx context.Context) {
+	// On its own goroutine: a path check can wait a long time for the host's
+	// lock, and a hold record is only worth watching between Docker's retries.
+	go func() {
+		h := time.NewTicker(holdWatchInterval)
+		defer h.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.C:
+				d.watchHolds(ctx)
+			}
+		}
+	}()
 	t := time.NewTicker(pathCheckInterval)
 	defer t.Stop()
 	o := time.NewTicker(orphanCheckInterval)
@@ -1252,6 +1296,45 @@ func (d *Driver) clearHeld(an string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.heldSince, an)
+}
+
+const (
+	holdWatchInterval = 5 * time.Second
+	holdWatchTimeout  = 10 * time.Second
+)
+
+// watchHolds drops the hold record of a volume that was released, or changed
+// hands, while no Mount here was waiting for it. Between Docker's retries
+// nothing looked, so a holder that let go and attached again kept the first
+// sighting's start time: on hardware a node was preempted 31 s into a new
+// attachment. A record a waiting Mount is refreshing is left to that Mount,
+// and an array that cannot be asked proves nothing.
+func (d *Driver) watchHolds(ctx context.Context) {
+	now := time.Now()
+	idle := map[string]holdState{}
+	d.mu.Lock()
+	for an, h := range d.heldSince {
+		switch quiet := now.Sub(h.seen); {
+		case quiet > staleHold:
+			delete(d.heldSince, an)
+		case quiet > 2*releasePoll:
+			idle[an] = h
+		}
+	}
+	d.mu.Unlock()
+	for an, h := range idle {
+		cctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
+		others, err := d.otherHosts(cctx, an)
+		cancel()
+		if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
+			continue
+		}
+		d.mu.Lock()
+		if d.heldSince[an] == h {
+			delete(d.heldSince, an)
+		}
+		d.mu.Unlock()
+	}
 }
 
 // clearLeftover runs before this host connects an. A device for the volume
@@ -1853,14 +1936,39 @@ func (d *Driver) List() (*plugin.ListResponse, error) {
 		return d.listResponse(byName), nil
 	}
 	byName := make(map[string]string, len(tags))
-	d.mu.Lock()
+	twice := map[string]bool{}
 	for an, val := range tags {
 		name := strings.TrimPrefix(val, prefix)
-		d.names[name] = an
+		if _, ok := byName[name]; ok {
+			twice[name] = true
+		}
 		byName[name] = an
 	}
+	known := make(map[string]string, len(byName))
+	d.mu.Lock()
+	for name, an := range byName {
+		if twice[name] {
+			// A clone carries its source's tag until Create gives it its own.
+			// Which volume the name means is not List's to guess, and a wrong
+			// guess would stay: the clone is live, so nothing re-resolves it,
+			// and the source's Mount and Remove would then act on the clone.
+			if an = d.names[name]; an == "" {
+				an = d.known[name]
+			}
+			byName[name] = an
+			if an == "" {
+				continue
+			}
+		} else {
+			d.names[name] = an
+		}
+		known[name] = an
+	}
 	d.mu.Unlock()
-	d.replaceKnown(byName)
+	if len(twice) > 0 {
+		d.log.Warn("name tag on more than one volume; keeping what this node had resolved", "volumes", slices.Sorted(maps.Keys(twice)))
+	}
+	d.replaceKnown(known)
 	return d.listResponse(byName), nil
 }
 
