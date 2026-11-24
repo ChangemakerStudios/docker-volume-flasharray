@@ -31,6 +31,7 @@ type fakeArray struct {
 	hang      bool                         // reads answer only once the caller gives up
 	tagErr    error                        // returned by SetNameTag
 	hostErr   error                        // returned by EnsureHost
+	slowConns map[string]bool              // volumes whose ListConnections answers only once the caller gives up
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
 	// connectHook runs, with mu held, right after a new connection is made.
@@ -301,9 +302,15 @@ func (f *fakeArray) HostLUNs(_ context.Context, host string) (map[int]string, er
 	}
 	return out, nil
 }
-func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flasharray.Connection, error) {
+func (f *fakeArray) ListConnections(ctx context.Context, volume string) ([]flasharray.Connection, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.slowConns[volume] {
+		f.mu.Unlock()
+		<-ctx.Done()
+		f.mu.Lock()
+		return nil, ctx.Err()
+	}
 	if v, ok := f.vols[volume]; ok && v.Destroyed {
 		// What the array answers for a volume in the destroyed state.
 		return nil, errors.New("GET /connections: HTTP 400: " + volume + ": Volume has been destroyed.")
@@ -2024,6 +2031,53 @@ func TestHoldRecordDroppedWhenHolderLetGoBetweenRetries(t *testing.T) {
 	}
 	if !fa.connected(an, "other") {
 		t.Fatal("preempted a holder that had let go and attached again")
+	}
+}
+
+// Asked one after another, a volume whose answer is slow cost every volume
+// behind it its look, and a holder could let go and attach again unseen.
+func TestHoldWatchDoesNotQueueBehindASlowLookup(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := holdState{hosts: "other", since: time.Now().Add(-time.Hour), seen: time.Now().Add(-10 * time.Second)}
+	slow := []string{"s1", "s2", "s3"}
+	for _, n := range append(slow, "v") {
+		_ = d.Create(&plugin.CreateRequest{Name: n})
+	}
+	fa.mu.Lock()
+	fa.slowConns = map[string]bool{}
+	for _, n := range slow {
+		fa.slowConns[d.arrayName(n)] = true
+	}
+	fa.mu.Unlock()
+	d.mu.Lock()
+	for _, n := range append(slow, "v") {
+		d.heldSince[d.arrayName(n)] = old
+	}
+	d.mu.Unlock()
+	held := func(n string) bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.heldSince[d.arrayName(n)] == old
+	}
+
+	// v has no connection left: its holder let go.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.watchHolds(ctx); close(done) }()
+	for deadline := time.Now().Add(2 * time.Second); held("v") && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	released := !held("v")
+	cancel()
+	<-done
+	if !released {
+		t.Fatal("a released volume kept its record behind lookups that had not answered")
+	}
+	for _, n := range slow {
+		if !held(n) {
+			t.Fatalf("dropped the record of %s, whose lookup never answered", n)
+		}
 	}
 }
 

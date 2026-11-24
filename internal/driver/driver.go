@@ -1298,9 +1298,12 @@ func (d *Driver) clearHeld(an string) {
 	delete(d.heldSince, an)
 }
 
+// A pass ends before the next is due, so one volume's slow answer costs no
+// other volume a look.
 const (
 	holdWatchInterval = 5 * time.Second
-	holdWatchTimeout  = 10 * time.Second
+	holdWatchTimeout  = 4 * time.Second
+	holdWatchWorkers  = 8
 )
 
 // watchHolds drops the hold record of a volume that was released, or changed
@@ -1308,7 +1311,7 @@ const (
 // nothing looked, so a holder that let go and attached again kept the first
 // sighting's start time: on hardware a node was preempted 31 s into a new
 // attachment. A record a waiting Mount is refreshing is left to that Mount,
-// and an array that cannot be asked proves nothing.
+// and an array that cannot be asked, or not in time, proves nothing.
 func (d *Driver) watchHolds(ctx context.Context) {
 	now := time.Now()
 	idle := map[string]holdState{}
@@ -1322,19 +1325,32 @@ func (d *Driver) watchHolds(ctx context.Context) {
 		}
 	}
 	d.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
+	defer cancel()
+	slots := make(chan struct{}, holdWatchWorkers)
+	var wg sync.WaitGroup
 	for an, h := range idle {
-		cctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
-		others, err := d.otherHosts(cctx, an)
-		cancel()
-		if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
-			continue
-		}
-		d.mu.Lock()
-		if d.heldSince[an] == h {
-			delete(d.heldSince, an)
-		}
-		d.mu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				return
+			}
+			others, err := d.otherHosts(ctx, an)
+			if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
+				return
+			}
+			d.mu.Lock()
+			if d.heldSince[an] == h {
+				delete(d.heldSince, an)
+			}
+			d.mu.Unlock()
+		}()
 	}
+	wg.Wait()
 }
 
 // clearLeftover runs before this host connects an. A device for the volume
