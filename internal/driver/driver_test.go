@@ -31,6 +31,7 @@ type fakeArray struct {
 	hang      bool                         // reads answer only once the caller gives up
 	tagErr    error                        // returned by SetNameTag
 	hostErr   error                        // returned by EnsureHost
+	slowConns map[string]bool              // volumes whose ListConnections answers only once the caller gives up
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
 	// connectHook runs, with mu held, right after a new connection is made.
@@ -246,6 +247,9 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 }
 
 func (f *fakeArray) EnsureHost(ctx context.Context, name string, iqns, nqns []string) (string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -301,9 +305,15 @@ func (f *fakeArray) HostLUNs(_ context.Context, host string) (map[int]string, er
 	}
 	return out, nil
 }
-func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flasharray.Connection, error) {
+func (f *fakeArray) ListConnections(ctx context.Context, volume string) ([]flasharray.Connection, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.slowConns[volume] {
+		f.mu.Unlock()
+		<-ctx.Done()
+		f.mu.Lock()
+		return nil, ctx.Err()
+	}
 	if v, ok := f.vols[volume]; ok && v.Destroyed {
 		// What the array answers for a volume in the destroyed state.
 		return nil, errors.New("GET /connections: HTTP 400: " + volume + ": Volume has been destroyed.")
@@ -2027,6 +2037,53 @@ func TestHoldRecordDroppedWhenHolderLetGoBetweenRetries(t *testing.T) {
 	}
 }
 
+// Asked one after another, a volume whose answer is slow cost every volume
+// behind it its look, and a holder could let go and attach again unseen.
+func TestHoldWatchDoesNotQueueBehindASlowLookup(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := holdState{hosts: "other", since: time.Now().Add(-time.Hour), seen: time.Now().Add(-10 * time.Second)}
+	slow := []string{"s1", "s2", "s3"}
+	for _, n := range append(slow, "v") {
+		_ = d.Create(&plugin.CreateRequest{Name: n})
+	}
+	fa.mu.Lock()
+	fa.slowConns = map[string]bool{}
+	for _, n := range slow {
+		fa.slowConns[d.arrayName(n)] = true
+	}
+	fa.mu.Unlock()
+	d.mu.Lock()
+	for _, n := range append(slow, "v") {
+		d.heldSince[d.arrayName(n)] = old
+	}
+	d.mu.Unlock()
+	held := func(n string) bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.heldSince[d.arrayName(n)] == old
+	}
+
+	// v has no connection left: its holder let go.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.watchHolds(ctx); close(done) }()
+	for deadline := time.Now().Add(2 * time.Second); held("v") && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	released := !held("v")
+	cancel()
+	<-done
+	if !released {
+		t.Fatal("a released volume kept its record behind lookups that had not answered")
+	}
+	for _, n := range slow {
+		if !held(n) {
+			t.Fatalf("dropped the record of %s, whose lookup never answered", n)
+		}
+	}
+}
+
 // --- slow devices and maps that change under a mount -----------------------
 
 func (f *fakeArray) disconnectCalls() int {
@@ -2569,14 +2626,14 @@ func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
 	}
 }
 
-// The client's own ask went unanswered a moment before: waiting for the array
-// again holds up the requests Docker has already queued on the socket.
+// The client's own ask used up the wait: waiting for the array again holds up
+// the requests Docker has already queued on the socket.
 func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
 	_ = d.Create(&plugin.CreateRequest{Name: "v"})
 
-	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, ArrayUnanswered: true})
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: time.Now().Add(-startArrayWait)})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -2592,5 +2649,31 @@ func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
 	}
 	if d2.hostName() == "" {
 		t.Fatal("host object not settled by the first mount")
+	}
+}
+
+// An array that answered the client and then hangs, or a pinned API version,
+// leaves the client's wait unspent: start still has only what is left of the
+// one wait, or a Get queued since the socket opened outlasts Docker's minute.
+func TestStartCountsItsWaitFromWhenTheSocketOpened(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	oldWait, oldBudget := startArrayWait, queryBudget
+	startArrayWait, queryBudget = 2*time.Second, 50*time.Millisecond
+	t.Cleanup(func() { startArrayWait, queryBudget = oldWait, oldBudget })
+	fa.hang = true
+
+	began := time.Now()
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: began.Add(100*time.Millisecond - startArrayWait)})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	g, err := d2.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_unreachable"] == nil {
+		t.Fatalf("Get after the start = %+v, %v", g, err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("start and the first Get took %s with 100ms of the wait left", took)
 	}
 }

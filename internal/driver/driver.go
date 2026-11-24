@@ -102,9 +102,9 @@ type Deps struct {
 	Transport transport.Transport
 	Mounter   mounter.Mounter
 	Logger    *slog.Logger
-	// ArrayUnanswered says the array did not answer when its client was made,
-	// a moment ago: a start that can do without it does not wait a second time.
-	ArrayUnanswered bool
+	// SocketOpen is when the plugin socket began queueing Docker's requests;
+	// zero means now. See startArrayWait.
+	SocketOpen time.Time
 }
 
 // New builds a driver and prepares the host object / sessions.
@@ -140,13 +140,11 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	// is most likely.
 	hctx, hcancel := ctx, context.CancelFunc(func() {})
 	if drv.hasKnown() {
-		wait := startArrayWait
-		if d.ArrayUnanswered {
-			// Requests are queueing on the socket and Docker gives a Get one
-			// minute: on hardware the second wait brought the first to 59 s.
-			wait = 0
+		open := d.SocketOpen
+		if open.IsZero() {
+			open = time.Now()
 		}
-		hctx, hcancel = context.WithTimeout(ctx, wait)
+		hctx, hcancel = context.WithDeadline(ctx, open.Add(startArrayWait))
 	}
 	err := drv.requireHost(hctx)
 	hcancel()
@@ -168,8 +166,11 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 }
 
 // startArrayWait bounds the wait for the array at start when the plugin can
-// come up without it. A variable so tests needn't wait.
-var startArrayWait = 20 * time.Second
+// come up without it, counted from when the socket opened: Docker's minute
+// for a Get runs while the request queues there, so this plus queryBudget
+// must stay inside it. Counted from later, a first Get took 59 s on hardware.
+// A variable so tests needn't wait.
+var startArrayWait = 10 * time.Second
 
 func (d *Driver) hostName() string {
 	s, _ := d.host.Load().(string)
@@ -1298,9 +1299,12 @@ func (d *Driver) clearHeld(an string) {
 	delete(d.heldSince, an)
 }
 
+// A pass ends before the next is due, so one volume's slow answer costs no
+// other volume a look.
 const (
 	holdWatchInterval = 5 * time.Second
-	holdWatchTimeout  = 10 * time.Second
+	holdWatchTimeout  = 4 * time.Second
+	holdWatchWorkers  = 8
 )
 
 // watchHolds drops the hold record of a volume that was released, or changed
@@ -1308,7 +1312,7 @@ const (
 // nothing looked, so a holder that let go and attached again kept the first
 // sighting's start time: on hardware a node was preempted 31 s into a new
 // attachment. A record a waiting Mount is refreshing is left to that Mount,
-// and an array that cannot be asked proves nothing.
+// and an array that cannot be asked, or not in time, proves nothing.
 func (d *Driver) watchHolds(ctx context.Context) {
 	now := time.Now()
 	idle := map[string]holdState{}
@@ -1322,19 +1326,32 @@ func (d *Driver) watchHolds(ctx context.Context) {
 		}
 	}
 	d.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
+	defer cancel()
+	slots := make(chan struct{}, holdWatchWorkers)
+	var wg sync.WaitGroup
 	for an, h := range idle {
-		cctx, cancel := context.WithTimeout(ctx, holdWatchTimeout)
-		others, err := d.otherHosts(cctx, an)
-		cancel()
-		if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
-			continue
-		}
-		d.mu.Lock()
-		if d.heldSince[an] == h {
-			delete(d.heldSince, an)
-		}
-		d.mu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				return
+			}
+			others, err := d.otherHosts(ctx, an)
+			if err != nil || strings.Join(slices.Sorted(slices.Values(others)), ",") == h.hosts {
+				return
+			}
+			d.mu.Lock()
+			if d.heldSince[an] == h {
+				delete(d.heldSince, an)
+			}
+			d.mu.Unlock()
+		}()
 	}
+	wg.Wait()
 }
 
 // clearLeftover runs before this host connects an. A device for the volume
