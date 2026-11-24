@@ -153,31 +153,20 @@ func (h *Handler) handle(path string, fn func(body []byte) (any, error)) {
 // ServeHTTP lets the handler be used in tests with httptest.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
-// ListenUnix opens /run/docker/plugins/<name>.sock. Docker dials the socket for
-// about 12 s after starting a plugin and disables the plugin when nothing
-// listens, so this comes before any start-up work that can wait on the array;
-// requests queue on the socket until Serve.
-func ListenUnix(name string) (net.Listener, error) { return listenUnix(socketDir, name) }
-
-func listenUnix(dir, name string) (net.Listener, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+// ServeUnix listens on /run/docker/plugins/<name>.sock until ctx is cancelled.
+func (h *Handler) ServeUnix(ctx context.Context, name string) error {
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		return err
 	}
-	path := filepath.Join(dir, name+".sock")
+	path := filepath.Join(socketDir, name+".sock")
 	_ = os.Remove(path)
 	l, err := net.Listen("unix", path)
 	if err != nil {
-		return nil, fmt.Errorf("listen %s: %w", path, err)
+		return fmt.Errorf("listen %s: %w", path, err)
 	}
 	if err := os.Chmod(path, 0o660); err != nil {
-		_ = l.Close()
-		return nil, err
+		return err
 	}
-	return l, nil
-}
-
-// Serve answers on l until ctx is cancelled.
-func (h *Handler) Serve(ctx context.Context, l net.Listener) error {
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -185,7 +174,7 @@ func (h *Handler) Serve(ctx context.Context, l net.Listener) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	err := srv.Serve(l)
+	err = srv.Serve(l)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
