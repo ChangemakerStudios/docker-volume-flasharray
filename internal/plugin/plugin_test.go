@@ -2,11 +2,14 @@ package plugin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type stubDriver struct{ created []string }
@@ -89,5 +92,55 @@ func TestProtocol(t *testing.T) {
 	_, out = post(t, h, "/VolumeDriver.Capabilities", nil)
 	if out["Capabilities"].(map[string]any)["Scope"] != "global" {
 		t.Fatalf("capabilities: %v", out)
+	}
+}
+
+// Docker gives a starting plugin about 12 s to listen and disables it
+// otherwise, so the socket opens before start-up work that can wait on the
+// array. A request made meanwhile is answered once Serve runs.
+func TestSocketListensBeforeServe(t *testing.T) {
+	l, err := listenUnix(t.TempDir(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.DialTimeout("unix", l.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("nothing listens before Serve: %v", err)
+	}
+	_ = c.Close()
+
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", l.Addr().String())
+	}}}
+	got := make(chan string, 1)
+	go func() {
+		resp, err := client.Post("http://plugin/VolumeDriver.Capabilities", contentType, nil)
+		if err != nil {
+			got <- err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		got <- resp.Status
+	}()
+	select {
+	case s := <-got:
+		t.Fatalf("answered before Serve: %s", s)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- NewHandler(&stubDriver{}, nil).Serve(ctx, l) }()
+	select {
+	case s := <-got:
+		if s != "200 OK" {
+			t.Fatalf("queued request: %s", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued request never answered")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve: %v", err)
 	}
 }
