@@ -1884,6 +1884,30 @@ func TestGetAnswersFromKnownVolumesWhileArrayDown(t *testing.T) {
 	}
 }
 
+// Docker 29 asks for an empty name at start-up, and every node asks about
+// other drivers' volumes: neither is a failure, and the empty name never
+// reaches the array. An unreachable array still is a failure.
+func TestGetSaysNoSuchVolumeForNamesItDoesNotHave(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if _, err := d.Get(&plugin.GetRequest{Name: "other"}); !errors.Is(err, plugin.ErrNoSuchVolume) {
+		t.Fatalf("Get of a volume the array does not have = %v, want ErrNoSuchVolume", err)
+	}
+	fa.hang = true
+	start := time.Now()
+	if _, err := d.Get(&plugin.GetRequest{Name: ""}); !errors.Is(err, plugin.ErrNoSuchVolume) {
+		t.Fatalf("Get of an empty name = %v, want ErrNoSuchVolume", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Get of an empty name waited on the array for %s", took)
+	}
+	fa.hang = false
+	fa.down = errors.New("dial tcp: i/o timeout")
+	if _, err := d.Get(&plugin.GetRequest{Name: "other"}); err == nil || errors.Is(err, plugin.ErrNoSuchVolume) {
+		t.Fatalf("Get with the array down = %v, want a failure that is not ErrNoSuchVolume", err)
+	}
+}
+
 // A management endpoint that hangs instead of refusing must not hold Get or
 // List past Docker's 1 minute: the known-volume answer would reach nobody.
 func TestGetAndListFallBackWithinTheirBudget(t *testing.T) {

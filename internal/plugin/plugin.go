@@ -61,6 +61,12 @@ type (
 	CapabilitiesResponse struct{ Capabilities Capability }
 )
 
+// ErrNoSuchVolume marks a Get for a name this driver does not have. Docker
+// asks every plugin about names that belong to other drivers, and asks for an
+// empty name at start-up, so such an answer is logged at debug, not as a
+// failure.
+var ErrNoSuchVolume = errors.New("no such volume")
+
 // errResponse is what every endpoint returns on failure.
 type errResponse struct {
 	Err string `json:"Err"`
@@ -140,7 +146,11 @@ func (h *Handler) handle(path string, fn func(body []byte) (any, error)) {
 		resp, err := fn(body)
 		w.Header().Set("Content-Type", contentType)
 		if err != nil {
-			h.log.Warn("request failed", "path", path, "err", err, "took", time.Since(start).Round(time.Millisecond))
+			level := slog.LevelWarn
+			if errors.Is(err, ErrNoSuchVolume) {
+				level = slog.LevelDebug
+			}
+			h.log.Log(r.Context(), level, "request failed", "path", path, "err", err, "took", time.Since(start).Round(time.Millisecond))
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(errResponse{Err: err.Error()})
 			return

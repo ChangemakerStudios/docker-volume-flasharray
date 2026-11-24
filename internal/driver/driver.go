@@ -2009,15 +2009,19 @@ func (d *Driver) Path(req *plugin.PathRequest) (*plugin.PathResponse, error) {
 
 // Get implements plugin.Driver.
 func (d *Driver) Get(req *plugin.GetRequest) (*plugin.GetResponse, error) {
+	if req.Name == "" {
+		return nil, fmt.Errorf("empty volume name: %w", plugin.ErrNoSuchVolume)
+	}
 	ctx, cancel := d.ctxWithin(queryBudget)
 	defer cancel()
 	an, v, err := d.lookup(ctx, req.Name)
 	if err != nil {
-		if !flasharray.IsNotFound(err) {
-			if kv, ok := d.knownVolume(req.Name, err); ok {
-				d.log.Warn("array unreachable; answering from known volumes so Docker does not substitute a local volume", "volume", req.Name, "array_name", kv.Status["array_name"], "err", err)
-				return &plugin.GetResponse{Volume: kv}, nil
-			}
+		if flasharray.IsNotFound(err) {
+			return nil, fmt.Errorf("volume %s: %w: %w", req.Name, plugin.ErrNoSuchVolume, err)
+		}
+		if kv, ok := d.knownVolume(req.Name, err); ok {
+			d.log.Warn("array unreachable; answering from known volumes so Docker does not substitute a local volume", "volume", req.Name, "array_name", kv.Status["array_name"], "err", err)
+			return &plugin.GetResponse{Volume: kv}, nil
 		}
 		return nil, fmt.Errorf("volume %s: %w", req.Name, err)
 	}

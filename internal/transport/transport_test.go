@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -700,6 +701,57 @@ func TestConnectLogsInAgainWhenSessionsAreGone(t *testing.T) {
 	connect()
 	if logins != 2 {
 		t.Fatalf("logins after the session went away = %d, want 2", logins)
+	}
+}
+
+// Right after boot the node.startup update failed on fresh node records and
+// succeeded a moment later; only a second failure is worth a warning.
+func TestConnectRetriesTheStartupUpdateOnce(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	portal := ln.Addr().String()
+	const iqn = "iqn.2010-06.com.purestorage:flasharray.test"
+	oldRunner, oldDelay := runner, startupRetryDelay
+	t.Cleanup(func() { runner, startupRetryDelay = oldRunner, oldDelay })
+	startupRetryDelay = time.Millisecond
+
+	for _, tc := range []struct {
+		name      string
+		failures  int
+		wantTries int
+		wantWarn  bool
+	}{
+		{"fails once", 1, 2, false},
+		{"fails twice", 2, 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tries, logins := 0, 0
+			runner = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+				cmd := name + " " + strings.Join(args, " ")
+				switch {
+				case strings.Contains(cmd, "node.startup"):
+					tries++
+					if tries <= tc.failures {
+						return "", errors.New("iscsiadm: exit status 7")
+					}
+				case strings.HasSuffix(cmd, "--login"):
+					logins++
+				}
+				return "", nil
+			}
+			var buf bytes.Buffer
+			tr := &iscsi{log: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+			if err := tr.Connect(context.Background(), []flasharray.Port{{IQN: iqn, Portal: portal}}); err != nil {
+				t.Fatal(err)
+			}
+			warned := strings.Contains(buf.String(), "node.startup=manual failed")
+			if tries != tc.wantTries || warned != tc.wantWarn || logins != 1 {
+				t.Fatalf("tries=%d warned=%v logins=%d, want %d %v 1", tries, warned, logins, tc.wantTries, tc.wantWarn)
+			}
+		})
 	}
 }
 

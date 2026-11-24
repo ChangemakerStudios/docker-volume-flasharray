@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,6 +28,12 @@ func (s *stubDriver) List() (*ListResponse, error) {
 	return &ListResponse{Volumes: []*Volume{{Name: "a"}}}, nil
 }
 func (s *stubDriver) Get(r *GetRequest) (*GetResponse, error) {
+	switch r.Name {
+	case "missing":
+		return nil, fmt.Errorf("volume missing: %w", ErrNoSuchVolume)
+	case "bad":
+		return nil, errors.New("array unreachable")
+	}
 	return &GetResponse{Volume: &Volume{Name: r.Name, Mountpoint: "/mnt/x"}}, nil
 }
 func (s *stubDriver) Remove(*RemoveRequest) error { return nil }
@@ -92,6 +101,24 @@ func TestProtocol(t *testing.T) {
 	_, out = post(t, h, "/VolumeDriver.Capabilities", nil)
 	if out["Capabilities"].(map[string]any)["Scope"] != "global" {
 		t.Fatalf("capabilities: %v", out)
+	}
+}
+
+// Docker asks every plugin about other drivers' volumes, and about an empty
+// name at start-up: "not mine" is still an error to Docker but not a warning.
+func TestNoSuchVolumeIsNotLoggedAsAFailure(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&stubDriver{}, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	code, out := post(t, h, "/VolumeDriver.Get", map[string]any{"Name": "missing"})
+	if code != 500 || out["Err"] != "volume missing: no such volume" {
+		t.Fatalf("get missing: %d %v", code, out)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("a volume this driver does not have was logged as a failure: %s", buf.String())
+	}
+	if code, _ := post(t, h, "/VolumeDriver.Get", map[string]any{"Name": "bad"}); code != 500 || !strings.Contains(buf.String(), "request failed") {
+		t.Fatalf("a real failure was not logged: %d %q", code, buf.String())
 	}
 }
 
