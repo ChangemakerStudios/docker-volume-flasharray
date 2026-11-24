@@ -1,0 +1,128 @@
+// Command docker-volume-flasharray is a Docker managed volume plugin for Pure
+// Storage FlashArray over iSCSI or NVMe/TCP.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/config"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/driver"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/flasharray"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/mounter"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/plugin"
+	"github.com/ChangemakerStudios/docker-volume-flasharray/internal/transport"
+)
+
+// socketName is the plugin socket; Docker addresses the driver as "flasharray".
+const socketName = "flasharray"
+
+var version = "dev" // set by -ldflags
+
+func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-version", "--version", "version":
+			fmt.Println("docker-volume-flasharray", version)
+			return
+		case "adopt":
+			if err := runAdopt(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.FromEnv()
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}))
+	slog.SetDefault(log)
+	log.Info("starting docker-volume-flasharray", "version", version, "namespace", cfg.Namespace,
+		"transport", cfg.Transport, "array", cfg.Array.Endpoint, "fs", cfg.FSType, "default_size", cfg.DefaultSize,
+		"host_name", cfg.HostName, "allowed_cidrs", cfg.AllowedCIDRs, "preempt_rwo", cfg.PreemptRWO,
+		"eradicate_on_remove", cfg.EradicateOnRemove, "attach_timeout", cfg.AttachTimeout)
+
+	// Before anything that can wait on the array: started while the array's
+	// management address hung, the plugin was disabled by Docker for want of
+	// a socket, and with no driver Docker substitutes local volumes.
+	l, err := plugin.ListenUnix(socketName)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	opened := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	array, err := flasharray.New(ctx, flasharray.Options{
+		Endpoint:           cfg.Array.Endpoint,
+		APIToken:           cfg.Array.APIToken,
+		APIVersion:         cfg.Array.APIVersion,
+		InsecureSkipVerify: cfg.Array.InsecureSkipVerify,
+		Logger:             log,
+		// See driver.New: a node that has served volumes starts without the array.
+		LazyVersion: driver.HasKnownVolumes(cfg.MountRoot),
+	})
+	if err != nil {
+		return fmt.Errorf("flasharray client: %w", err)
+	}
+	tr, err := transport.New(string(cfg.Transport), transport.Options{
+		AllowedCIDRs: cfg.AllowedCIDRs,
+		Timeout:      cfg.AttachTimeout,
+		Logger:       log,
+	})
+	if err != nil {
+		return err
+	}
+	drv, err := driver.New(ctx, cfg, driver.Deps{
+		Array:      array,
+		Transport:  tr,
+		Mounter:    mounter.New(log),
+		Logger:     log,
+		SocketOpen: opened,
+	})
+	if err != nil {
+		return err
+	}
+
+	h := plugin.NewHandler(drv, log)
+	log.Info("serving", "socket", "/run/docker/plugins/"+socketName+".sock")
+	srvCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	go drv.RunPathCheck(srvCtx)
+	err = h.Serve(srvCtx, l)
+	// Docker kills a plugin about 10s after asking it to stop.
+	sctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	drv.Shutdown(sctx)
+	return err
+}
+
+func parseLevel(s string) slog.Level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
