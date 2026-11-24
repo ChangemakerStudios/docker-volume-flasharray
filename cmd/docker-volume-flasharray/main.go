@@ -65,6 +65,7 @@ func run() error {
 		return err
 	}
 	defer l.Close()
+	opened := time.Now()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -90,12 +91,11 @@ func run() error {
 		return err
 	}
 	drv, err := driver.New(ctx, cfg, driver.Deps{
-		Array:     array,
-		Transport: tr,
-		Mounter:   mounter.New(log),
-		Logger:    log,
-		// No version means New's ask went unanswered (LazyVersion let it pass).
-		ArrayUnanswered: array.Version() == "",
+		Array:      array,
+		Transport:  tr,
+		Mounter:    mounter.New(log),
+		Logger:     log,
+		SocketOpen: opened,
 	})
 	if err != nil {
 		return err

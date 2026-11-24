@@ -102,9 +102,9 @@ type Deps struct {
 	Transport transport.Transport
 	Mounter   mounter.Mounter
 	Logger    *slog.Logger
-	// ArrayUnanswered says the array did not answer when its client was made,
-	// a moment ago: a start that can do without it does not wait a second time.
-	ArrayUnanswered bool
+	// SocketOpen is when the plugin socket began queueing Docker's requests;
+	// zero means now. See startArrayWait.
+	SocketOpen time.Time
 }
 
 // New builds a driver and prepares the host object / sessions.
@@ -140,13 +140,11 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 	// is most likely.
 	hctx, hcancel := ctx, context.CancelFunc(func() {})
 	if drv.hasKnown() {
-		wait := startArrayWait
-		if d.ArrayUnanswered {
-			// Requests are queueing on the socket and Docker gives a Get one
-			// minute: on hardware the second wait brought the first to 59 s.
-			wait = 0
+		open := d.SocketOpen
+		if open.IsZero() {
+			open = time.Now()
 		}
-		hctx, hcancel = context.WithTimeout(ctx, wait)
+		hctx, hcancel = context.WithDeadline(ctx, open.Add(startArrayWait))
 	}
 	err := drv.requireHost(hctx)
 	hcancel()
@@ -168,8 +166,11 @@ func New(ctx context.Context, cfg *config.Config, d Deps) (*Driver, error) {
 }
 
 // startArrayWait bounds the wait for the array at start when the plugin can
-// come up without it. A variable so tests needn't wait.
-var startArrayWait = 20 * time.Second
+// come up without it, counted from when the socket opened: Docker's minute
+// for a Get runs while the request queues there, so this plus queryBudget
+// must stay inside it. Counted from later, a first Get took 59 s on hardware.
+// A variable so tests needn't wait.
+var startArrayWait = 10 * time.Second
 
 func (d *Driver) hostName() string {
 	s, _ := d.host.Load().(string)

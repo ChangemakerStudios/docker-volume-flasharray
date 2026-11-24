@@ -247,6 +247,9 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 }
 
 func (f *fakeArray) EnsureHost(ctx context.Context, name string, iqns, nqns []string) (string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -2623,14 +2626,14 @@ func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
 	}
 }
 
-// The client's own ask went unanswered a moment before: waiting for the array
-// again holds up the requests Docker has already queued on the socket.
+// The client's own ask used up the wait: waiting for the array again holds up
+// the requests Docker has already queued on the socket.
 func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
 	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
 	d := newTestDriver(t, fa, tr, fm)
 	_ = d.Create(&plugin.CreateRequest{Name: "v"})
 
-	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, ArrayUnanswered: true})
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: time.Now().Add(-startArrayWait)})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -2646,5 +2649,31 @@ func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
 	}
 	if d2.hostName() == "" {
 		t.Fatal("host object not settled by the first mount")
+	}
+}
+
+// An array that answered the client and then hangs, or a pinned API version,
+// leaves the client's wait unspent: start still has only what is left of the
+// one wait, or a Get queued since the socket opened outlasts Docker's minute.
+func TestStartCountsItsWaitFromWhenTheSocketOpened(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	oldWait, oldBudget := startArrayWait, queryBudget
+	startArrayWait, queryBudget = 2*time.Second, 50*time.Millisecond
+	t.Cleanup(func() { startArrayWait, queryBudget = oldWait, oldBudget })
+	fa.hang = true
+
+	began := time.Now()
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: began.Add(100*time.Millisecond - startArrayWait)})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	g, err := d2.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_unreachable"] == nil {
+		t.Fatalf("Get after the start = %+v, %v", g, err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("start and the first Get took %s with 100ms of the wait left", took)
 	}
 }
