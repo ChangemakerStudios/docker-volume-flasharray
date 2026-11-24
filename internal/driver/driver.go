@@ -837,7 +837,17 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 		if parked, err := d.freshArrayName(ctx, an); err != nil {
 			d.log.Warn("no free name to move the removed volume to; the name stays taken until eradication", "array_name", an, "err", err)
 		} else if err := d.array.RenameVolume(ctx, an, parked); err != nil {
-			d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+			// The array may have renamed it and the answer been lost. Destroying
+			// under the old name then finds nothing, and the volume would be
+			// reported removed while it lives on, tagged, under the new one.
+			switch pv, gerr := d.array.GetVolume(ctx, parked); {
+			case gerr == nil && pv.Serial == v.Serial:
+				an = parked
+			case gerr == nil || flasharray.IsNotFound(gerr):
+				d.log.Warn("moving the removed volume out of its name failed; the name stays taken until eradication", "array_name", an, "err", err)
+			default:
+				return fmt.Errorf("volume %s: cannot tell whether %s was renamed to %s (%v): %w", req.Name, an, parked, err, gerr)
+			}
 		} else {
 			an = parked
 		}

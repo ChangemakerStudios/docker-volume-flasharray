@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newTestClient serves the api_version and login endpoints and hands every
@@ -63,6 +64,29 @@ func TestRetries(t *testing.T) {
 				t.Fatalf("err=%v requests=%d, want %d", err, n.Load(), tc.wantN)
 			}
 		})
+	}
+}
+
+// A rename is a PATCH, and not one to send twice: the second finds the old
+// name gone and reports a failure for a rename that took effect.
+func TestRenameIsSentOnce(t *testing.T) {
+	var n atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	if err := c.RenameVolume(context.Background(), "a", "b"); err == nil || n.Load() != 1 {
+		t.Fatalf("err=%v requests=%d, want an error after 1", err, n.Load())
+	}
+
+	n.Store(0)
+	c = newTestClient(t, func(http.ResponseWriter, *http.Request) {
+		n.Add(1)
+		time.Sleep(300 * time.Millisecond) // the answer comes too late to be read
+	})
+	c.http.Timeout = 50 * time.Millisecond
+	if err := c.RenameVolume(context.Background(), "a", "b"); err == nil || n.Load() != 1 {
+		t.Fatalf("lost answer: err=%v requests=%d, want an error after 1", err, n.Load())
 	}
 }
 

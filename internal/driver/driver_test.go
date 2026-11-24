@@ -32,6 +32,9 @@ type fakeArray struct {
 	tagErr    error                        // returned by SetNameTag
 	hostErr   error                        // returned by EnsureHost
 	slowConns map[string]bool              // volumes whose ListConnections answers only once the caller gives up
+	// renameHook runs, with mu held, after RenameVolume did its work; an error
+	// from it is the array's answer getting lost.
+	renameHook func() error
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
 	// connectHook runs, with mu held, right after a new connection is made.
@@ -160,6 +163,9 @@ func (f *fakeArray) RenameVolume(_ context.Context, name, newName string) error 
 	if c, ok := f.conns[name]; ok {
 		f.conns[newName] = c
 		delete(f.conns, name)
+	}
+	if f.renameHook != nil {
+		return f.renameHook()
 	}
 	return nil
 }
@@ -1016,6 +1022,64 @@ func TestRemoveFreesNameForRecreate(t *testing.T) {
 	}
 	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
 		t.Fatalf("mount of the recreated volume: %v", err)
+	}
+}
+
+// The array renamed the volume and its answer was lost. Destroying under the
+// old name then found nothing, which read as done: Docker was told the volume
+// was removed while it lived on under the new name, tagged, and the next
+// create of the name got it back with its data.
+func TestRemoveFindsAVolumeRenamedWithoutAnAnswer(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	oldSerial := fa.vols[d.arrayName("v")].Serial
+	live := func() bool {
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		for _, v := range fa.vols {
+			if v.Serial == oldSerial && !v.Destroyed {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The array cannot be asked where the volume went: nothing is known, and
+	// nothing may be reported removed.
+	outage := errors.New("dial tcp: i/o timeout")
+	fa.renameHook = func() error { fa.down = outage; return outage }
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err == nil {
+		t.Fatal("reported a volume removed that it could not find again")
+	}
+	if !live() {
+		t.Fatal("volume destroyed although the remove failed")
+	}
+	fa.mu.Lock()
+	fa.down, fa.renameHook = nil, nil
+	fa.mu.Unlock()
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if live() {
+		t.Fatal("volume still live under the name it was moved to")
+	}
+
+	// The array can be asked, and has the volume under the new name.
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	oldSerial = fa.vols[d.arrayName("v")].Serial
+	fa.renameHook = func() error { return outage }
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if live() {
+		t.Fatal("volume reported removed but still live under the name it was moved to")
+	}
+	fa.renameHook = nil
+	if _, err := d.Get(&plugin.GetRequest{Name: "v"}); err == nil {
+		t.Fatal("Get still answered for the removed volume")
 	}
 }
 
