@@ -21,18 +21,18 @@ jobs:
       semVer: ${{ steps.gitversion.outputs.semVer }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: install GitVersion
-        uses: gittools/actions/gitversion/setup@v4.7.0
+        uses: gittools/actions/gitversion/setup@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
         with:
           versionSpec: '6.x'
       - name: determine version
         id: gitversion
-        uses: gittools/actions/gitversion/execute@v4.7.0
+        uses: gittools/actions/gitversion/execute@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
       - name: install go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -40,10 +40,12 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -d .; exit 1; }
       - run: go vet ./...
       - run: go test ./... -race -count=1
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.15.0
       - name: build binary
         run: |
           CGO_ENABLED=0 go build -trimpath \
@@ -51,7 +53,7 @@ jobs:
             -o bin/docker-volume-flasharray ./cmd/docker-volume-flasharray
           bin/docker-volume-flasharray -version
       - name: upload binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-volume-flasharray
           path: bin/docker-volume-flasharray
@@ -70,9 +72,9 @@ jobs:
       SEMVER: ${{ needs.go.outputs.semVer }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: build rootfs
         # Managed plugins are their own artifact type: buildx exports the
         # rootfs, `docker plugin create` wraps it with plugin/config.json.
@@ -93,7 +95,7 @@ jobs:
           docker run --rm --entrypoint sh dvfa-smoke:ci -c 'nsenter --version && mkfs.xfs -V && blkid -V && blockdev --help >/dev/null'
       - name: login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
