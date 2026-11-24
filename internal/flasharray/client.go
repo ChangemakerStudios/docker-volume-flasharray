@@ -404,6 +404,12 @@ func isAlreadyDestroyed(err error) bool {
 // IsNotFound reports whether err wraps ErrNotFound.
 func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 
+// IsAlreadyExists reports the array's refusal to create an object whose name
+// is taken.
+func IsAlreadyExists(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
 // --- volumes ---------------------------------------------------------------
 
 type volumeItem struct {
@@ -732,7 +738,7 @@ func (c *Client) Connect(ctx context.Context, host, volume string) (int, error) 
 	q := url.Values{"host_names": {host}, "volume_names": {volume}}
 	var out page[connItem]
 	err := c.do(ctx, http.MethodPost, "/connections", q, nil, &out)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists") {
+	if IsAlreadyExists(err) {
 		err = c.do(ctx, http.MethodGet, "/connections", q, nil, &out)
 	}
 	if err != nil {

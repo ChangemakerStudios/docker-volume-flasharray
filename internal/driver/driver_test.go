@@ -43,8 +43,10 @@ type fakeArray struct {
 	conns       map[string]map[string]int // volume -> host -> lun
 	nextLUN     int
 	calls       []string
-	// copyHook is renameHook for CopyVolume.
-	copyHook func() error
+	// copyHook is renameHook for CopyVolume; beforeCopy runs, with mu held,
+	// before it does anything.
+	copyHook   func() error
+	beforeCopy func(name string)
 }
 
 func newFakeArray() *fakeArray {
@@ -95,9 +97,15 @@ func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flashar
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rec("copy:" + source + ":" + name)
+	if f.beforeCopy != nil {
+		f.beforeCopy(name)
+	}
 	src, ok := f.vols[source]
 	if !ok {
 		return nil, flasharray.ErrNotFound
+	}
+	if _, taken := f.vols[name]; taken {
+		return nil, errors.New("POST /volumes: HTTP 400: volume already exists")
 	}
 	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now(), Source: source}
 	f.vols[name] = v
@@ -238,12 +246,20 @@ func (f *fakeArray) LookupNameTag(ctx context.Context, value string) (string, er
 	if f.down != nil {
 		return "", f.down
 	}
+	var found []string
 	for an, v := range f.tags {
 		if v == value && !f.destroyed(an) {
-			return an, nil
+			found = append(found, an)
 		}
 	}
-	return "", flasharray.ErrNotFound
+	switch len(found) {
+	case 0:
+		return "", flasharray.ErrNotFound
+	case 1:
+		return found[0], nil
+	}
+	// As the client does: which of them the name means is not for it to pick.
+	return "", fmt.Errorf("tag %s=%q is on more than one volume (%s)", flasharray.TagKeyName, value, strings.Join(found, ", "))
 }
 
 func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray.Volume, error) {
@@ -1542,20 +1558,49 @@ func TestCloneRetryPastADestroyedCopy(t *testing.T) {
 	}
 }
 
-// The array made the copy and its answer was lost. The copy stayed live under
-// the clone's name with its source's tag: every retry was refused as another
-// volume's, and the source's tag was on two volumes.
+// The array made the copy and its answer was lost. The copy stayed live with
+// its source's tag: every retry was refused as another volume's, and the
+// source's tag was on two volumes, so no node that had not resolved the source
+// could look it up.
 func TestCloneFinishedAfterTheCopysAnswerWasLost(t *testing.T) {
 	outage := errors.New("dial tcp: i/o timeout")
 	clone := &plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}
-	check := func(t *testing.T, d *Driver, fa *fakeArray) {
-		t.Helper()
-		an := d.arrayName("pg_copy")
-		if v := fa.vols[an]; v == nil || v.Destroyed || fa.tags[an] != "node1/pg_copy" {
-			t.Fatalf("clone = %+v, tag %q", v, fa.tags[an])
+	setup := func(t *testing.T) (*Driver, *fakeArray, string) {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		if err := d.Create(&plugin.CreateRequest{Name: "pg"}); err != nil {
+			t.Fatal(err)
 		}
-		if src, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || src != d.arrayName("pg") {
-			t.Fatalf("source no longer resolves to itself: %q, %v", src, err)
+		return d, fa, d.arrayName("pg")
+	}
+	// Another node, which has never resolved pg.
+	otherNode := func(t *testing.T, d *Driver, fa *fakeArray) *Driver {
+		cfg := *d.cfg
+		cfg.MountRoot = t.TempDir()
+		d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: &fakeTransport{}, Mounter: newFakeMounter()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d2
+	}
+	// Past what a create elsewhere could still be doing with it.
+	settle := func(fa *fakeArray, src string) {
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		for _, v := range fa.vols {
+			if v.Source == src {
+				v.Created = v.Created.Add(-time.Hour)
+			}
+		}
+	}
+	check := func(t *testing.T, fa *fakeArray, src string) {
+		t.Helper()
+		an, err := fa.LookupNameTag(context.Background(), "node1/pg_copy")
+		if err != nil || fa.vols[an].Source != src {
+			t.Fatalf("clone resolves to %q (%+v), %v", an, fa.vols[an], err)
+		}
+		if got, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || got != src {
+			t.Fatalf("source no longer resolves to itself: %q, %v", got, err)
 		}
 		n := 0
 		for _, c := range fa.calls {
@@ -1569,20 +1614,16 @@ func TestCloneFinishedAfterTheCopysAnswerWasLost(t *testing.T) {
 	}
 
 	t.Run("array still answers", func(t *testing.T) {
-		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-		d := newTestDriver(t, fa, tr, fm)
-		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		d, fa, src := setup(t)
 		fa.copyHook = func() error { return outage }
 		if err := d.Create(clone); err != nil {
 			t.Fatal(err)
 		}
-		check(t, d, fa)
+		check(t, fa, src)
 	})
 
 	t.Run("found on the retry", func(t *testing.T) {
-		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-		d := newTestDriver(t, fa, tr, fm)
-		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		d, fa, src := setup(t)
 		fa.copyHook = func() error { fa.down = outage; return outage }
 		if err := d.Create(clone); err == nil {
 			t.Fatal("create reported a clone it could not look for")
@@ -1590,34 +1631,102 @@ func TestCloneFinishedAfterTheCopysAnswerWasLost(t *testing.T) {
 		fa.mu.Lock()
 		fa.down, fa.copyHook = nil, nil
 		fa.mu.Unlock()
+		d2 := otherNode(t, d, fa)
+		if err := d2.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over a copy a create elsewhere may still be finishing: %v", err)
+		}
+		settle(fa, src)
 		// Not this volume's to take without the source that made it.
-		if err := d.Create(&plugin.CreateRequest{Name: "pg_copy"}); !errors.Is(err, errClaimed) {
+		if err := d2.Create(&plugin.CreateRequest{Name: "pg_copy"}); !errors.Is(err, errClaimed) {
 			t.Fatalf("plain create over the unfinished clone = %v, want errClaimed", err)
 		}
 		_ = d.Create(&plugin.CreateRequest{Name: "other"})
-		if err := d.Create(&plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "other"}}); !errors.Is(err, errClaimed) {
+		if err := d2.Create(&plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "other"}}); !errors.Is(err, errClaimed) {
 			t.Fatalf("clone of another source over the unfinished clone = %v, want errClaimed", err)
 		}
+		if err := d2.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		check(t, fa, src)
+	})
+
+	// With the clone's name taken by a destroyed volume, the copy went under a
+	// name only the lost Create knew, and a retry made a second one.
+	t.Run("beside a destroyed volume", func(t *testing.T) {
+		d, fa, src := setup(t)
+		_ = d.Create(&plugin.CreateRequest{Name: "pg_copy"})
+		cn := d.arrayName("pg_copy")
+		fa.vols[cn].Destroyed = true
+		fa.copyHook = func() error { fa.down = outage; return outage }
+		if err := d.Create(clone); err == nil {
+			t.Fatal("create reported a clone it could not look for")
+		}
+		fa.mu.Lock()
+		fa.down, fa.copyHook = nil, nil
+		fa.mu.Unlock()
+		d2 := otherNode(t, d, fa)
+		if err := d2.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over a copy a create elsewhere may still be finishing: %v", err)
+		}
+		settle(fa, src)
+		if err := d2.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		check(t, fa, src)
+	})
+
+	// The array refused the copy because another node had just made it: that
+	// node may yet tag it, or destroy it because tagging failed.
+	t.Run("another node's copy", func(t *testing.T) {
+		d, fa, src := setup(t)
+		cn := d.arrayName("pg_copy")
+		fa.beforeCopy = func(string) {
+			fa.vols[cn] = &flasharray.Volume{Name: cn, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now(), Source: src}
+			fa.tags[cn] = "node1/pg"
+			fa.beforeCopy = nil
+		}
+		if err := d.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over another node's copy at once: %v", err)
+		}
+		if fa.tags[cn] != "node1/pg" {
+			t.Fatalf("retagged another node's copy: %q", fa.tags[cn])
+		}
+		settle(fa, src)
 		if err := d.Create(clone); err != nil {
 			t.Fatalf("retry: %v", err)
 		}
-		check(t, d, fa)
+		if fa.tags[cn] != "node1/pg_copy" {
+			t.Fatalf("abandoned copy not finished: %q", fa.tags[cn])
+		}
 	})
 
 	// Carrying the source's tag is not enough: only the array saying it is a
 	// copy of that source makes a volume this clone.
 	t.Run("not a copy of the source", func(t *testing.T) {
-		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
-		d := newTestDriver(t, fa, tr, fm)
-		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		d, fa, _ := setup(t)
 		an := d.arrayName("pg_copy")
-		fa.vols[an] = &flasharray.Volume{Name: an, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now()}
+		fa.vols[an] = &flasharray.Volume{Name: an, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now().Add(-time.Hour)}
 		fa.tags[an] = "node1/pg"
 		if err := d.Create(clone); !errors.Is(err, errClaimed) {
 			t.Fatalf("create over a volume that is no copy of the source = %v, want errClaimed", err)
 		}
 		if fa.tags[an] != "node1/pg" {
 			t.Fatalf("retagged a volume that is no copy of the source: %q", fa.tags[an])
+		}
+	})
+
+	// The array matches names in any case and answers in its own spelling.
+	t.Run("source named in another case", func(t *testing.T) {
+		d, fa, src := setup(t)
+		an := d.arrayName("pg_copy")
+		v := &flasharray.Volume{Name: an, Source: src}
+		fa.vols[an], fa.tags[an] = v, "node1/pg"
+		if !d.unfinishedClone(context.Background(), strings.ToUpper(src), an, v) {
+			t.Fatal("source given as an array name in another case not recognised")
+		}
+		self := &flasharray.Volume{Name: an, Source: strings.ToUpper(an)}
+		if d.unfinishedClone(context.Background(), "pg", an, self) {
+			t.Fatal("a volume taken for a copy of itself")
 		}
 	})
 }
