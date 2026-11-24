@@ -2,7 +2,7 @@
 #
 # Builds the plugin rootfs. Not meant to be run as a normal container — see
 # Makefile / .github/workflows/release.yml for how it becomes a managed plugin.
-# Images are pinned by digest; Dependabot moves the pins.
+# Images are pinned by digest; move a pin by hand with the tag beside it.
 
 FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm@sha256:b754301872c53d3dff666ec39e3fae971dc6f5ecd5a9b01fdefabbebb0f59901 AS build
 WORKDIR /src
