@@ -7,6 +7,10 @@ updates:
     schedule: { interval: weekly }
     groups:
       actions: { patterns: ["*"] }
+    ignore:
+      # v5 needs GitVersion 7; build.yml installs 6.x (#8).
+      - dependency-name: gittools/actions/*
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker
     directory: /
     target-branch: develop
