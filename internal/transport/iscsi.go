@@ -83,6 +83,30 @@ func (t *iscsi) InitiatorIDs() ([]string, []string, error) {
 	return nil, nil, fmt.Errorf("%s has no InitiatorName", initiatorNameFile)
 }
 
+// startupRetryDelay is a variable so tests needn't wait.
+var startupRetryDelay = time.Second
+
+// setStartupManual tries twice: right after boot the update failed on 3 of 8
+// fresh node records, presumably while iscsid still held them, and a moment
+// later it succeeded.
+func setStartupManual(ctx context.Context, log *slog.Logger, p flasharray.Port) error {
+	update := func() error {
+		_, err := runner(ctx, log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual")
+		return err
+	}
+	err := update()
+	if err == nil {
+		return nil
+	}
+	log.Debug("set node.startup=manual failed; trying again", "portal", p.Portal, "err", err)
+	select {
+	case <-ctx.Done():
+		return err
+	case <-time.After(startupRetryDelay):
+	}
+	return update()
+}
+
 // Connect logs in to every eligible portal that has no session. It asks
 // iscsiadm each time instead of remembering its own logins: the Pure plugin
 // logs out every session on the host and deletes the node records whenever
@@ -114,7 +138,7 @@ func (t *iscsi) Connect(ctx context.Context, ports []flasharray.Port) error {
 		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "new"); err != nil {
 			t.log.Debug("node record create", "portal", p.Portal, "err", err)
 		}
-		if _, err := runner(ctx, t.log, "iscsiadm", "-m", "node", "-T", p.IQN, "-p", p.Portal, "-o", "update", "-n", "node.startup", "-v", "manual"); err != nil {
+		if err := setStartupManual(ctx, t.log, p); err != nil {
 			t.log.Warn("set node.startup=manual failed; host iscsid may also log in at boot", "portal", p.Portal, "err", err)
 		}
 		// Ride out a controller failover or switch reload instead of failing I/O;
