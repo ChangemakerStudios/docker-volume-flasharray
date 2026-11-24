@@ -120,6 +120,15 @@ func TestVolumeWrittenFromSpaceVirtual(t *testing.T) {
 	}
 }
 
+func TestVolumeSource(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[{"name":"c","serial":"ABC","source":{"name":"v","id":"x"}}]}`))
+	})
+	if v, err := c.GetVolume(context.Background(), "c"); err != nil || v.Source != "v" {
+		t.Fatalf("v=%+v err=%v", v, err)
+	}
+}
+
 func TestNameTagsSkipDestroyedVolumes(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

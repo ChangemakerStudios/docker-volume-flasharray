@@ -559,11 +559,15 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		// volume (a clone destroyed before it got its own tag, or an import
 		// removed since) is in the way like any destroyed volume, not a claim.
 		cn := d.arrayName(req.Name)
-		if dv, gerr := d.array.GetVolume(ctx, cn); gerr == nil && dv.Destroyed {
+		dv, gerr := d.array.GetVolume(ctx, cn)
+		if gerr == nil && (dv.Destroyed || source != "" && d.unfinishedClone(ctx, source, cn, dv)) {
 			if unlock, err = d.lockCtx(ctx, cn); err != nil {
 				return err
 			}
 			an, v = cn, dv
+			if !dv.Destroyed {
+				return d.finishClone(ctx, req.Name, an, v, source)
+			}
 		}
 	}
 	if err == nil && !v.Destroyed {
@@ -605,6 +609,11 @@ func (d *Driver) Create(req *plugin.CreateRequest) error {
 		ev, gerr := d.array.GetVolume(ctx, an)
 		if gerr != nil || ev.Destroyed {
 			return err
+		}
+		if source != "" && d.unfinishedClone(ctx, source, an, ev) {
+			// The copy was made and its answer lost, or another node is making
+			// the same clone: either way claim would refuse its source's tag.
+			return d.finishClone(ctx, req.Name, an, ev, source)
 		}
 		d.log.Info("another node created the volume at the same moment; using it", "volume", req.Name, "array_name", an)
 		v = ev
@@ -658,11 +667,7 @@ func (d *Driver) freshArrayName(ctx context.Context, base string) (string, error
 // namespace or, failing that, an array volume name (the Pure plugin's
 // `source=` took array names).
 func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharray.Volume, error) {
-	src, sv, err := d.lookup(ctx, source)
-	if flasharray.IsNotFound(err) && src != source {
-		src = source
-		sv, err = d.array.GetVolume(ctx, source)
-	}
+	src, sv, err := d.cloneSource(ctx, source)
 	if err != nil {
 		return nil, fmt.Errorf("clone source %s: %w", source, err)
 	}
@@ -674,6 +679,41 @@ func (d *Driver) cloneVolume(ctx context.Context, source, an string) (*flasharra
 		return nil, fmt.Errorf("clone %s to %s: %w", src, an, err)
 	}
 	return v, nil
+}
+
+func (d *Driver) cloneSource(ctx context.Context, source string) (string, *flasharray.Volume, error) {
+	src, sv, err := d.lookup(ctx, source)
+	if flasharray.IsNotFound(err) && src != source {
+		src = source
+		sv, err = d.array.GetVolume(ctx, source)
+	}
+	return src, sv, err
+}
+
+// unfinishedClone reports whether v, live under an, is a copy of source that
+// never got its own tag: the copy's answer was lost, or the tag write after
+// it failed along with the clean-up. It still carries its source's tag, so
+// claim refuses it for good, and lookups of the source find two volumes.
+func (d *Driver) unfinishedClone(ctx context.Context, source, an string, v *flasharray.Volume) bool {
+	src, _, err := d.cloneSource(ctx, source)
+	if err != nil || src == an || v.Source != src {
+		return false
+	}
+	st, err := d.nameTag(ctx, src)
+	if err != nil {
+		return false
+	}
+	ct, err := d.nameTag(ctx, an)
+	return err == nil && ct == st
+}
+
+func (d *Driver) finishClone(ctx context.Context, dockerName, an string, v *flasharray.Volume, source string) error {
+	if err := d.array.SetNameTag(ctx, an, d.tagValue(dockerName)); err != nil {
+		return fmt.Errorf("create volume %s: tag %s, a copy of %s left without its own tag: %w", dockerName, an, source, err)
+	}
+	d.remember(dockerName, an)
+	d.log.Warn("finished a clone left tagged as its source", "volume", dockerName, "array_name", an, "serial", v.Serial, "source", source)
+	return nil
 }
 
 // mountOptions adds nouuid for XFS. A copy of a volume carries its source's

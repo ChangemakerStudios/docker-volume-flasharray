@@ -43,6 +43,8 @@ type Volume struct {
 	Written   int64
 	Destroyed bool
 	Created   time.Time
+	// Source is the volume this one was copied from, "" for none or one gone.
+	Source string
 }
 
 // Connection is a host<->volume connection.
@@ -413,6 +415,9 @@ type volumeItem struct {
 	Space       struct {
 		Virtual *int64 `json:"virtual"`
 	} `json:"space"`
+	Source struct {
+		Name string `json:"name"`
+	} `json:"source"`
 }
 
 type page[T any] struct {
@@ -433,6 +438,7 @@ func (v volumeItem) toVolume() *Volume {
 		Written:     written,
 		Destroyed:   v.Destroyed,
 		Created:     time.UnixMilli(v.Created).UTC(),
+		Source:      v.Source.Name,
 	}
 }
 

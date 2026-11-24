@@ -43,6 +43,8 @@ type fakeArray struct {
 	conns       map[string]map[string]int // volume -> host -> lun
 	nextLUN     int
 	calls       []string
+	// copyHook is renameHook for CopyVolume.
+	copyHook func() error
 }
 
 func newFakeArray() *fakeArray {
@@ -97,7 +99,7 @@ func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flashar
 	if !ok {
 		return nil, flasharray.ErrNotFound
 	}
-	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now()}
+	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now(), Source: source}
 	f.vols[name] = v
 	// The array copies a volume's tags with it, dvfa:name included.
 	if t, ok := f.tags[source]; ok {
@@ -108,6 +110,11 @@ func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flashar
 			f.extra[name] = map[string]string{}
 		}
 		f.extra[name][k] = t
+	}
+	if f.copyHook != nil {
+		if err := f.copyHook(); err != nil {
+			return nil, err
+		}
 	}
 	return v, nil
 }
@@ -1533,6 +1540,86 @@ func TestCloneRetryPastADestroyedCopy(t *testing.T) {
 	if src, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || src != d.arrayName("pg") {
 		t.Fatalf("source no longer resolves to itself: %q, %v", src, err)
 	}
+}
+
+// The array made the copy and its answer was lost. The copy stayed live under
+// the clone's name with its source's tag: every retry was refused as another
+// volume's, and the source's tag was on two volumes.
+func TestCloneFinishedAfterTheCopysAnswerWasLost(t *testing.T) {
+	outage := errors.New("dial tcp: i/o timeout")
+	clone := &plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}
+	check := func(t *testing.T, d *Driver, fa *fakeArray) {
+		t.Helper()
+		an := d.arrayName("pg_copy")
+		if v := fa.vols[an]; v == nil || v.Destroyed || fa.tags[an] != "node1/pg_copy" {
+			t.Fatalf("clone = %+v, tag %q", v, fa.tags[an])
+		}
+		if src, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || src != d.arrayName("pg") {
+			t.Fatalf("source no longer resolves to itself: %q, %v", src, err)
+		}
+		n := 0
+		for _, c := range fa.calls {
+			if strings.HasPrefix(c, "copy:") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("%d copies made, want 1", n)
+		}
+	}
+
+	t.Run("array still answers", func(t *testing.T) {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		fa.copyHook = func() error { return outage }
+		if err := d.Create(clone); err != nil {
+			t.Fatal(err)
+		}
+		check(t, d, fa)
+	})
+
+	t.Run("found on the retry", func(t *testing.T) {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		fa.copyHook = func() error { fa.down = outage; return outage }
+		if err := d.Create(clone); err == nil {
+			t.Fatal("create reported a clone it could not look for")
+		}
+		fa.mu.Lock()
+		fa.down, fa.copyHook = nil, nil
+		fa.mu.Unlock()
+		// Not this volume's to take without the source that made it.
+		if err := d.Create(&plugin.CreateRequest{Name: "pg_copy"}); !errors.Is(err, errClaimed) {
+			t.Fatalf("plain create over the unfinished clone = %v, want errClaimed", err)
+		}
+		_ = d.Create(&plugin.CreateRequest{Name: "other"})
+		if err := d.Create(&plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "other"}}); !errors.Is(err, errClaimed) {
+			t.Fatalf("clone of another source over the unfinished clone = %v, want errClaimed", err)
+		}
+		if err := d.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		check(t, d, fa)
+	})
+
+	// Carrying the source's tag is not enough: only the array saying it is a
+	// copy of that source makes a volume this clone.
+	t.Run("not a copy of the source", func(t *testing.T) {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		_ = d.Create(&plugin.CreateRequest{Name: "pg"})
+		an := d.arrayName("pg_copy")
+		fa.vols[an] = &flasharray.Volume{Name: an, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now()}
+		fa.tags[an] = "node1/pg"
+		if err := d.Create(clone); !errors.Is(err, errClaimed) {
+			t.Fatalf("create over a volume that is no copy of the source = %v, want errClaimed", err)
+		}
+		if fa.tags[an] != "node1/pg" {
+			t.Fatalf("retagged a volume that is no copy of the source: %q", fa.tags[an])
+		}
+	})
 }
 
 // While a clone is being made it carries its source's tag. A List in that
