@@ -31,6 +31,10 @@ type fakeArray struct {
 	hang      bool                         // reads answer only once the caller gives up
 	tagErr    error                        // returned by SetNameTag
 	hostErr   error                        // returned by EnsureHost
+	slowConns map[string]bool              // volumes whose ListConnections answers only once the caller gives up
+	// renameHook runs, with mu held, after RenameVolume did its work; an error
+	// from it is the array's answer getting lost.
+	renameHook func() error
 	// createHook, when set, runs in place of CreateVolume's own work.
 	createHook func(name string) error
 	// connectHook runs, with mu held, right after a new connection is made.
@@ -39,6 +43,10 @@ type fakeArray struct {
 	conns       map[string]map[string]int // volume -> host -> lun
 	nextLUN     int
 	calls       []string
+	// copyHook is renameHook for CopyVolume; beforeCopy runs, with mu held,
+	// before it does anything.
+	copyHook   func() error
+	beforeCopy func(name string)
 }
 
 func newFakeArray() *fakeArray {
@@ -89,12 +97,33 @@ func (f *fakeArray) CopyVolume(_ context.Context, source, name string) (*flashar
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rec("copy:" + source + ":" + name)
+	if f.beforeCopy != nil {
+		f.beforeCopy(name)
+	}
 	src, ok := f.vols[source]
 	if !ok {
 		return nil, flasharray.ErrNotFound
 	}
-	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now()}
+	if _, taken := f.vols[name]; taken {
+		return nil, errors.New("POST /volumes: HTTP 400: volume already exists")
+	}
+	v := &flasharray.Volume{Name: name, Serial: fmt.Sprintf("%024x", len(f.vols)+1), Provisioned: src.Provisioned, Created: time.Now(), Source: source}
 	f.vols[name] = v
+	// The array copies a volume's tags with it, dvfa:name included.
+	if t, ok := f.tags[source]; ok {
+		f.tags[name] = t
+	}
+	for k, t := range f.extra[source] {
+		if f.extra[name] == nil {
+			f.extra[name] = map[string]string{}
+		}
+		f.extra[name][k] = t
+	}
+	if f.copyHook != nil {
+		if err := f.copyHook(); err != nil {
+			return nil, err
+		}
+	}
 	return v, nil
 }
 
@@ -149,6 +178,9 @@ func (f *fakeArray) RenameVolume(_ context.Context, name, newName string) error 
 	if c, ok := f.conns[name]; ok {
 		f.conns[newName] = c
 		delete(f.conns, name)
+	}
+	if f.renameHook != nil {
+		return f.renameHook()
 	}
 	return nil
 }
@@ -214,12 +246,20 @@ func (f *fakeArray) LookupNameTag(ctx context.Context, value string) (string, er
 	if f.down != nil {
 		return "", f.down
 	}
+	var found []string
 	for an, v := range f.tags {
 		if v == value && !f.destroyed(an) {
-			return an, nil
+			found = append(found, an)
 		}
 	}
-	return "", flasharray.ErrNotFound
+	switch len(found) {
+	case 0:
+		return "", flasharray.ErrNotFound
+	case 1:
+		return found[0], nil
+	}
+	// As the client does: which of them the name means is not for it to pick.
+	return "", fmt.Errorf("tag %s=%q is on more than one volume (%s)", flasharray.TagKeyName, value, strings.Join(found, ", "))
 }
 
 func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray.Volume, error) {
@@ -235,9 +275,15 @@ func (f *fakeArray) ListVolumes(_ context.Context, prefix string) ([]*flasharray
 	return out, nil
 }
 
-func (f *fakeArray) EnsureHost(_ context.Context, name string, iqns, nqns []string) (string, error) {
+func (f *fakeArray) EnsureHost(ctx context.Context, name string, iqns, nqns []string) (string, error) {
+	if err := f.blackholed(ctx); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if f.hostErr != nil {
 		return "", f.hostErr
 	}
@@ -288,9 +334,15 @@ func (f *fakeArray) HostLUNs(_ context.Context, host string) (map[int]string, er
 	}
 	return out, nil
 }
-func (f *fakeArray) ListConnections(_ context.Context, volume string) ([]flasharray.Connection, error) {
+func (f *fakeArray) ListConnections(ctx context.Context, volume string) ([]flasharray.Connection, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.slowConns[volume] {
+		f.mu.Unlock()
+		<-ctx.Done()
+		f.mu.Lock()
+		return nil, ctx.Err()
+	}
 	if v, ok := f.vols[volume]; ok && v.Destroyed {
 		// What the array answers for a volume in the destroyed state.
 		return nil, errors.New("GET /connections: HTTP 400: " + volume + ": Volume has been destroyed.")
@@ -996,6 +1048,64 @@ func TestRemoveFreesNameForRecreate(t *testing.T) {
 	}
 }
 
+// The array renamed the volume and its answer was lost. Destroying under the
+// old name then found nothing, which read as done: Docker was told the volume
+// was removed while it lived on under the new name, tagged, and the next
+// create of the name got it back with its data.
+func TestRemoveFindsAVolumeRenamedWithoutAnAnswer(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	oldSerial := fa.vols[d.arrayName("v")].Serial
+	live := func() bool {
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		for _, v := range fa.vols {
+			if v.Serial == oldSerial && !v.Destroyed {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The array cannot be asked where the volume went: nothing is known, and
+	// nothing may be reported removed.
+	outage := errors.New("dial tcp: i/o timeout")
+	fa.renameHook = func() error { fa.down = outage; return outage }
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err == nil {
+		t.Fatal("reported a volume removed that it could not find again")
+	}
+	if !live() {
+		t.Fatal("volume destroyed although the remove failed")
+	}
+	fa.mu.Lock()
+	fa.down, fa.renameHook = nil, nil
+	fa.mu.Unlock()
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if live() {
+		t.Fatal("volume still live under the name it was moved to")
+	}
+
+	// The array can be asked, and has the volume under the new name.
+	if err := d.Create(&plugin.CreateRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	oldSerial = fa.vols[d.arrayName("v")].Serial
+	fa.renameHook = func() error { return outage }
+	if err := d.Remove(&plugin.RemoveRequest{Name: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if live() {
+		t.Fatal("volume reported removed but still live under the name it was moved to")
+	}
+	fa.renameHook = nil
+	if _, err := d.Get(&plugin.GetRequest{Name: "v"}); err == nil {
+		t.Fatal("Get still answered for the removed volume")
+	}
+}
+
 // Destroyed by other means (the array UI): Get keeps answering, so a stack's
 // external volume fails loudly instead of Docker creating an empty local one.
 // An explicit create still gets a fresh volume beside it.
@@ -1398,8 +1508,12 @@ func TestCloneFromSource(t *testing.T) {
 	if c == nil || c.Provisioned != 10<<30 {
 		t.Fatalf("clone = %+v", c)
 	}
+	// The array hands the clone its source's tag; it must end up with its own.
 	if fa.tags[an] != "node1/pg_copy" {
 		t.Fatalf("name tag = %q", fa.tags[an])
+	}
+	if src := fa.tags[d.arrayName("pg")]; src != "node1/pg" {
+		t.Fatalf("source's name tag = %q", src)
 	}
 	// The clone carries its source's filesystem UUID; nouuid mounts both side by side.
 	for _, name := range []string{"pg", "pg_copy"} {
@@ -1410,6 +1524,266 @@ func TestCloneFromSource(t *testing.T) {
 		if fm.opts[r.Mountpoint] != "nouuid" {
 			t.Fatalf("%s opts = %q, want nouuid", name, fm.opts[r.Mountpoint])
 		}
+	}
+}
+
+// A clone destroyed before it got its own tag stays under the computed name,
+// tagged as its source, until the array eradicates it. Seen on hardware: every
+// retry of the clone was refused as another volume's.
+func TestCloneRetryPastADestroyedCopy(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "pg", Options: map[string]string{"size": "10GiB"}}); err != nil {
+		t.Fatal(err)
+	}
+	clone := &plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}
+	fa.tagErr = errors.New("HTTP 503")
+	if err := d.Create(clone); err == nil {
+		t.Fatal("create reported a clone it could not tag")
+	}
+	left := d.arrayName("pg_copy")
+	if v := fa.vols[left]; v == nil || !v.Destroyed || fa.tags[left] != "node1/pg" {
+		t.Fatalf("want the failed clone destroyed and still tagged as its source: %+v, tag %q", v, fa.tags[left])
+	}
+	fa.tagErr = nil
+	if err := d.Create(clone); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	an, err := fa.LookupNameTag(context.Background(), "node1/pg_copy")
+	if err != nil || an == left || fa.vols[an] == nil || fa.vols[an].Destroyed {
+		t.Fatalf("retry left no live clone beside the destroyed one: %q, %v", an, err)
+	}
+	if src, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || src != d.arrayName("pg") {
+		t.Fatalf("source no longer resolves to itself: %q, %v", src, err)
+	}
+}
+
+// The array made the copy and its answer was lost. The copy stayed live with
+// its source's tag: every retry was refused as another volume's, and the
+// source's tag was on two volumes, so no node that had not resolved the source
+// could look it up.
+func TestCloneFinishedAfterTheCopysAnswerWasLost(t *testing.T) {
+	outage := errors.New("dial tcp: i/o timeout")
+	clone := &plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "pg"}}
+	setup := func(t *testing.T) (*Driver, *fakeArray, string) {
+		fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+		d := newTestDriver(t, fa, tr, fm)
+		if err := d.Create(&plugin.CreateRequest{Name: "pg"}); err != nil {
+			t.Fatal(err)
+		}
+		return d, fa, d.arrayName("pg")
+	}
+	// Another node, which has never resolved pg.
+	otherNode := func(t *testing.T, d *Driver, fa *fakeArray) *Driver {
+		cfg := *d.cfg
+		cfg.MountRoot = t.TempDir()
+		d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: &fakeTransport{}, Mounter: newFakeMounter()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d2
+	}
+	// Past what a create elsewhere could still be doing with it.
+	settle := func(fa *fakeArray, src string) {
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		for _, v := range fa.vols {
+			if v.Source == src {
+				v.Created = v.Created.Add(-time.Hour)
+			}
+		}
+	}
+	check := func(t *testing.T, fa *fakeArray, src string) {
+		t.Helper()
+		an, err := fa.LookupNameTag(context.Background(), "node1/pg_copy")
+		if err != nil || fa.vols[an].Source != src {
+			t.Fatalf("clone resolves to %q (%+v), %v", an, fa.vols[an], err)
+		}
+		if got, err := fa.LookupNameTag(context.Background(), "node1/pg"); err != nil || got != src {
+			t.Fatalf("source no longer resolves to itself: %q, %v", got, err)
+		}
+		n := 0
+		for _, c := range fa.calls {
+			if strings.HasPrefix(c, "copy:") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("%d copies made, want 1", n)
+		}
+	}
+
+	t.Run("array still answers", func(t *testing.T) {
+		d, fa, src := setup(t)
+		fa.copyHook = func() error { return outage }
+		if err := d.Create(clone); err != nil {
+			t.Fatal(err)
+		}
+		check(t, fa, src)
+	})
+
+	t.Run("found on the retry", func(t *testing.T) {
+		d, fa, src := setup(t)
+		fa.copyHook = func() error { fa.down = outage; return outage }
+		if err := d.Create(clone); err == nil {
+			t.Fatal("create reported a clone it could not look for")
+		}
+		fa.mu.Lock()
+		fa.down, fa.copyHook = nil, nil
+		fa.mu.Unlock()
+		d2 := otherNode(t, d, fa)
+		if err := d2.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over a copy a create elsewhere may still be finishing: %v", err)
+		}
+		settle(fa, src)
+		// Not this volume's to take without the source that made it.
+		if err := d2.Create(&plugin.CreateRequest{Name: "pg_copy"}); !errors.Is(err, errClaimed) {
+			t.Fatalf("plain create over the unfinished clone = %v, want errClaimed", err)
+		}
+		_ = d.Create(&plugin.CreateRequest{Name: "other"})
+		if err := d2.Create(&plugin.CreateRequest{Name: "pg_copy", Options: map[string]string{"source": "other"}}); !errors.Is(err, errClaimed) {
+			t.Fatalf("clone of another source over the unfinished clone = %v, want errClaimed", err)
+		}
+		if err := d2.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		check(t, fa, src)
+	})
+
+	// With the clone's name taken by a destroyed volume, the copy went under a
+	// name only the lost Create knew, and a retry made a second one.
+	t.Run("beside a destroyed volume", func(t *testing.T) {
+		d, fa, src := setup(t)
+		_ = d.Create(&plugin.CreateRequest{Name: "pg_copy"})
+		cn := d.arrayName("pg_copy")
+		fa.vols[cn].Destroyed = true
+		fa.copyHook = func() error { fa.down = outage; return outage }
+		if err := d.Create(clone); err == nil {
+			t.Fatal("create reported a clone it could not look for")
+		}
+		fa.mu.Lock()
+		fa.down, fa.copyHook = nil, nil
+		fa.mu.Unlock()
+		d2 := otherNode(t, d, fa)
+		if err := d2.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over a copy a create elsewhere may still be finishing: %v", err)
+		}
+		settle(fa, src)
+		if err := d2.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		check(t, fa, src)
+	})
+
+	// The array refused the copy because another node had just made it: that
+	// node may yet tag it, or destroy it because tagging failed.
+	t.Run("another node's copy", func(t *testing.T) {
+		d, fa, src := setup(t)
+		cn := d.arrayName("pg_copy")
+		fa.beforeCopy = func(string) {
+			fa.vols[cn] = &flasharray.Volume{Name: cn, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now(), Source: src}
+			fa.tags[cn] = "node1/pg"
+			fa.beforeCopy = nil
+		}
+		if err := d.Create(clone); err == nil || !strings.Contains(err.Error(), "retry in") {
+			t.Fatalf("took over another node's copy at once: %v", err)
+		}
+		if fa.tags[cn] != "node1/pg" {
+			t.Fatalf("retagged another node's copy: %q", fa.tags[cn])
+		}
+		settle(fa, src)
+		if err := d.Create(clone); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if fa.tags[cn] != "node1/pg_copy" {
+			t.Fatalf("abandoned copy not finished: %q", fa.tags[cn])
+		}
+	})
+
+	// Carrying the source's tag is not enough: only the array saying it is a
+	// copy of that source makes a volume this clone.
+	t.Run("not a copy of the source", func(t *testing.T) {
+		d, fa, _ := setup(t)
+		an := d.arrayName("pg_copy")
+		fa.vols[an] = &flasharray.Volume{Name: an, Serial: "00000000000000000000beef", Provisioned: 1 << 30, Created: time.Now().Add(-time.Hour)}
+		fa.tags[an] = "node1/pg"
+		if err := d.Create(clone); !errors.Is(err, errClaimed) {
+			t.Fatalf("create over a volume that is no copy of the source = %v, want errClaimed", err)
+		}
+		if fa.tags[an] != "node1/pg" {
+			t.Fatalf("retagged a volume that is no copy of the source: %q", fa.tags[an])
+		}
+	})
+
+	// The array matches names in any case and answers in its own spelling.
+	t.Run("source named in another case", func(t *testing.T) {
+		d, fa, src := setup(t)
+		an := d.arrayName("pg_copy")
+		v := &flasharray.Volume{Name: an, Source: src}
+		fa.vols[an], fa.tags[an] = v, "node1/pg"
+		if !d.unfinishedClone(context.Background(), strings.ToUpper(src), an, v) {
+			t.Fatal("source given as an array name in another case not recognised")
+		}
+		self := &flasharray.Volume{Name: an, Source: strings.ToUpper(an)}
+		if d.unfinishedClone(context.Background(), "pg", an, self) {
+			t.Fatal("a volume taken for a copy of itself")
+		}
+	})
+}
+
+// While a clone is being made it carries its source's tag. A List in that
+// moment must not decide which of the two the source's name means: cached, the
+// clone would stay, and the source's Mount and Remove would act on it.
+func TestListDuringACloneDoesNotMapTheSourceToTheCopy(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	if err := d.Create(&plugin.CreateRequest{Name: "pg"}); err != nil {
+		t.Fatal(err)
+	}
+	src, clone := d.arrayName("pg"), d.arrayName("pg_copy")
+	// Another node, which has never resolved pg.
+	cfg := *d.cfg
+	cfg.MountRoot = t.TempDir()
+	d2, err := New(context.Background(), &cfg, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := []*Driver{d, d2}
+
+	if _, err := fa.CopyVolume(context.Background(), src, clone); err != nil { // copied, not yet retagged
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ { // which of the two a map walk meets last is random
+		for _, n := range nodes {
+			l, err := n.List()
+			if err != nil || len(l.Volumes) != 1 || l.Volumes[0].Name != "pg" {
+				t.Fatalf("list during the clone = %+v, %v", l, err)
+			}
+			if an := n.cachedName("pg"); an != "" && an != src {
+				t.Fatalf("pg resolved to %s", an)
+			}
+			if an := n.known["pg"]; an != "" && an != src {
+				t.Fatalf("pg recorded for the outage fallback as %s", an)
+			}
+		}
+	}
+
+	if err := fa.SetNameTag(context.Background(), clone, "node1/pg_copy"); err != nil { // Create's retag
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		if _, err := n.List(); err != nil {
+			t.Fatal(err)
+		}
+		if n.cachedName("pg") != src || n.cachedName("pg_copy") != clone {
+			t.Fatalf("after the clone: pg=%s pg_copy=%s", n.cachedName("pg"), n.cachedName("pg_copy"))
+		}
+	}
+	if err := d2.Remove(&plugin.RemoveRequest{Name: "pg"}); err != nil {
+		t.Fatal(err)
+	}
+	if v := fa.vols[clone]; v == nil || v.Destroyed {
+		t.Fatal("removing the source destroyed the clone")
 	}
 }
 
@@ -1873,6 +2247,100 @@ func TestStaleHoldRecordRestartsGrace(t *testing.T) {
 	}
 	if !fa.connected(an, "other") {
 		t.Fatal("preempted on a stale hold record")
+	}
+}
+
+// A holder that lets go and attaches again between Docker's retries is live:
+// its grace starts over. Seen on hardware, where the first sighting's start
+// time stood and the node was preempted 31 s into its new attachment.
+func TestHoldRecordDroppedWhenHolderLetGoBetweenRetries(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, 5*time.Millisecond
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	// A Mount here gave up waiting ten seconds ago, with the grace long spent.
+	old := holdState{hosts: "other", since: time.Now().Add(-2 * time.Hour), seen: time.Now().Add(-10 * time.Second)}
+	d.heldSince[an] = old
+
+	fa.conns[an] = map[string]int{"other": 7}
+	d.watchHolds(context.Background())
+	if d.heldSince[an] != old {
+		t.Fatal("dropped the record of a host that still holds the volume")
+	}
+
+	fa.mu.Lock()
+	fa.vols[an].Destroyed = true // the fake then fails ListConnections
+	fa.mu.Unlock()
+	d.watchHolds(context.Background())
+	if d.heldSince[an] != old {
+		t.Fatal("dropped the record on an array error")
+	}
+	fa.mu.Lock()
+	fa.vols[an].Destroyed = false
+	delete(fa.conns, an) // the holder lets go
+	fa.mu.Unlock()
+	d.watchHolds(context.Background())
+	if _, held := d.heldSince[an]; held {
+		t.Fatal("kept the record of a volume its holder released")
+	}
+
+	fa.mu.Lock()
+	fa.conns[an] = map[string]int{"other": 7} // and attaches again
+	fa.mu.Unlock()
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait out a fresh grace, got %v", err)
+	}
+	if !fa.connected(an, "other") {
+		t.Fatal("preempted a holder that had let go and attached again")
+	}
+}
+
+// Asked one after another, a volume whose answer is slow cost every volume
+// behind it its look, and a holder could let go and attach again unseen.
+func TestHoldWatchDoesNotQueueBehindASlowLookup(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	old := holdState{hosts: "other", since: time.Now().Add(-time.Hour), seen: time.Now().Add(-10 * time.Second)}
+	slow := []string{"s1", "s2", "s3"}
+	for _, n := range append(slow, "v") {
+		_ = d.Create(&plugin.CreateRequest{Name: n})
+	}
+	fa.mu.Lock()
+	fa.slowConns = map[string]bool{}
+	for _, n := range slow {
+		fa.slowConns[d.arrayName(n)] = true
+	}
+	fa.mu.Unlock()
+	d.mu.Lock()
+	for _, n := range append(slow, "v") {
+		d.heldSince[d.arrayName(n)] = old
+	}
+	d.mu.Unlock()
+	held := func(n string) bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.heldSince[d.arrayName(n)] == old
+	}
+
+	// v has no connection left: its holder let go.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.watchHolds(ctx); close(done) }()
+	for deadline := time.Now().Add(2 * time.Second); held("v") && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	released := !held("v")
+	cancel()
+	<-done
+	if !released {
+		t.Fatal("a released volume kept its record behind lookups that had not answered")
+	}
+	for _, n := range slow {
+		if !held(n) {
+			t.Fatalf("dropped the record of %s, whose lookup never answered", n)
+		}
 	}
 }
 
@@ -2415,5 +2883,57 @@ func TestStartsWithoutTheArrayOnceVolumesAreKnown(t *testing.T) {
 	fa.hostErr = outage
 	if _, err := New(context.Background(), &fresh, Deps{Array: fa, Transport: tr, Mounter: newFakeMounter()}); err == nil {
 		t.Fatal("first start without the array must fail")
+	}
+}
+
+// The client's own ask used up the wait: waiting for the array again holds up
+// the requests Docker has already queued on the socket.
+func TestStartDoesNotWaitTwiceForAnArrayThatDidNotAnswer(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: time.Now().Add(-startArrayWait)})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if d2.hostName() != "" {
+		t.Fatal("asked the array for the host object at start")
+	}
+	if g, err := d2.Get(&plugin.GetRequest{Name: "v"}); err != nil || g.Volume == nil {
+		t.Fatalf("Get after the start = %+v, %v", g, err)
+	}
+	// The host object is settled when first needed.
+	if _, err := d2.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if d2.hostName() == "" {
+		t.Fatal("host object not settled by the first mount")
+	}
+}
+
+// An array that answered the client and then hangs, or a pinned API version,
+// leaves the client's wait unspent: start still has only what is left of the
+// one wait, or a Get queued since the socket opened outlasts Docker's minute.
+func TestStartCountsItsWaitFromWhenTheSocketOpened(t *testing.T) {
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	oldWait, oldBudget := startArrayWait, queryBudget
+	startArrayWait, queryBudget = 2*time.Second, 50*time.Millisecond
+	t.Cleanup(func() { startArrayWait, queryBudget = oldWait, oldBudget })
+	fa.hang = true
+
+	began := time.Now()
+	d2, err := New(context.Background(), d.cfg, Deps{Array: fa, Transport: tr, Mounter: fm, SocketOpen: began.Add(100*time.Millisecond - startArrayWait)})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	g, err := d2.Get(&plugin.GetRequest{Name: "v"})
+	if err != nil || g.Volume.Status["array_unreachable"] == nil {
+		t.Fatalf("Get after the start = %+v, %v", g, err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("start and the first Get took %s with 100ms of the wait left", took)
 	}
 }

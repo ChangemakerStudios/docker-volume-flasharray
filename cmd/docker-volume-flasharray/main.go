@@ -57,6 +57,16 @@ func run() error {
 		"host_name", cfg.HostName, "allowed_cidrs", cfg.AllowedCIDRs, "preempt_rwo", cfg.PreemptRWO,
 		"eradicate_on_remove", cfg.EradicateOnRemove, "attach_timeout", cfg.AttachTimeout)
 
+	// Before anything that can wait on the array: started while the array's
+	// management address hung, the plugin was disabled by Docker for want of
+	// a socket, and with no driver Docker substitutes local volumes.
+	l, err := plugin.ListenUnix(socketName)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	opened := time.Now()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -81,10 +91,11 @@ func run() error {
 		return err
 	}
 	drv, err := driver.New(ctx, cfg, driver.Deps{
-		Array:     array,
-		Transport: tr,
-		Mounter:   mounter.New(log),
-		Logger:    log,
+		Array:      array,
+		Transport:  tr,
+		Mounter:    mounter.New(log),
+		Logger:     log,
+		SocketOpen: opened,
 	})
 	if err != nil {
 		return err
@@ -95,7 +106,7 @@ func run() error {
 	srvCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	go drv.RunPathCheck(srvCtx)
-	err = h.ServeUnix(srvCtx, socketName)
+	err = h.Serve(srvCtx, l)
 	// Docker kills a plugin about 10s after asking it to stop.
 	sctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
