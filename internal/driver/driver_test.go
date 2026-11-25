@@ -799,6 +799,48 @@ func TestMountPreemptsOnlyAfterGrace(t *testing.T) {
 	}
 }
 
+// A grace that fits the Mount's budget is waited out in one attempt: a failed
+// attempt fails the task, which pauses or rolls back a start-first update.
+func TestMountWaitsOutTheGraceInOneAttempt(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, time.Minute
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = 50 * time.Millisecond
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"fenced-node": 7}
+
+	if _, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if fa.connected(an, "fenced-node") {
+		t.Fatal("fenced-node not preempted")
+	}
+}
+
+// The wait stops short of the Mount's deadline, keeping time to attach.
+func TestReleaseWaitLeavesTimeToAttach(t *testing.T) {
+	releasePoll, maxReleaseWait = time.Millisecond, time.Minute
+	oldBudget, oldReserve := mountBudget, attachReserve
+	mountBudget, attachReserve = 300*time.Millisecond, 250*time.Millisecond
+	t.Cleanup(func() { mountBudget, attachReserve = oldBudget, oldReserve })
+	fa, tr, fm := newFakeArray(), &fakeTransport{}, newFakeMounter()
+	d := newTestDriver(t, fa, tr, fm)
+	d.cfg.PreemptGrace = time.Hour
+	_ = d.Create(&plugin.CreateRequest{Name: "v"})
+	an := d.arrayName("v")
+	fa.conns[an] = map[string]int{"other": 7}
+
+	start := time.Now()
+	_, err := d.Mount(&plugin.MountRequest{Name: "v", ID: "c"})
+	if err == nil || !strings.Contains(err.Error(), "waiting up to") {
+		t.Fatalf("expected to wait for other, got %v", err)
+	}
+	if waited := time.Since(start); waited >= mountBudget {
+		t.Fatalf("waited %s, past the mount budget", waited)
+	}
+}
+
 // The grace belongs to the holder: a host that only just took the volume is
 // live and must get the full grace, however long an earlier holder kept it.
 func TestPreemptGraceRestartsWhenHolderChanges(t *testing.T) {

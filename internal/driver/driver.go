@@ -518,7 +518,7 @@ func (d *Driver) ctxWithin(limit time.Duration) (context.Context, context.Cancel
 }
 
 func (d *Driver) budget(limit time.Duration) time.Duration {
-	return min(d.cfg.AttachTimeout+maxReleaseWait+30*time.Second, limit)
+	return min(d.cfg.AttachTimeout+time.Minute, limit)
 }
 
 // Create implements plugin.Driver.
@@ -964,7 +964,8 @@ func (d *Driver) Remove(req *plugin.RemoveRequest) error {
 
 // Mount implements plugin.Driver.
 func (d *Driver) Mount(req *plugin.MountRequest) (*plugin.MountResponse, error) {
-	ctx, cancel := d.ctxWithin(mountBudget)
+	// All of it, not budget(): takeOver may spend most of it waiting out the grace.
+	ctx, cancel := context.WithTimeout(context.Background(), mountBudget)
 	defer cancel()
 	an, vol, unlock, err := d.resolveLocked(ctx, req.Name)
 	defer unlock()
@@ -1320,10 +1321,15 @@ func (d *Driver) releaseHost(ctx context.Context, an, serial, dev string) (detac
 	return detachErr, disconnectErr
 }
 
-// releasePoll and maxReleaseWait are variables so tests needn't wait.
+// A Mount waits for the other host up to its deadline less attachReserve, the
+// time kept to attach after a preempt, so the default grace fits one attempt.
+// Each failed attempt is a failed task, which pauses or rolls back a
+// start-first update that moves a volume to another node. maxReleaseWait caps
+// the wait for tests. Variables so tests needn't wait.
 var (
 	releasePoll    = 2 * time.Second
-	maxReleaseWait = 30 * time.Second
+	attachReserve  = 15 * time.Second
+	maxReleaseWait = mountBudget
 )
 
 // takeOver makes sure no other host holds an. A block volume is single-writer.
@@ -1342,6 +1348,9 @@ func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
 	}
 	held := d.markHeld(an, others)
 	wait := min(d.cfg.PreemptGrace-time.Since(held), maxReleaseWait)
+	if dl, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(dl)-attachReserve)
+	}
 	deadline := time.Now().Add(wait)
 	for len(others) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
 		select {

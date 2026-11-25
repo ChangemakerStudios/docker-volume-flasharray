@@ -161,15 +161,20 @@ func (m *execMounter) FilesystemMounted(target string) (bool, error) {
 	return src != "" && src != guardSource, nil
 }
 
-// topMountSource returns the source of the most recent mount on target (later
-// mountinfo lines stack on earlier ones), or "" when nothing is mounted there.
 func topMountSource(target string) (string, error) {
+	src, _, err := topMount(target)
+	return src, err
+}
+
+// topMount returns the source and major:minor of the most recent mount on
+// target (later mountinfo lines stack on earlier ones), or "" when nothing is
+// mounted there.
+func topMount(target string) (src, majmin string, err error) {
 	f, err := os.Open(mountinfoPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer f.Close()
-	var top string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
@@ -178,12 +183,12 @@ func topMountSource(target string) (string, error) {
 		}
 		for i := 6; i+2 < len(fields); i++ {
 			if fields[i] == "-" {
-				top = unescape(fields[i+2])
+				src, majmin = unescape(fields[i+2]), fields[2]
 				break
 			}
 		}
 	}
-	return top, sc.Err()
+	return src, majmin, sc.Err()
 }
 
 func (m *execMounter) IsMounted(target string) (bool, error) {
@@ -279,14 +284,14 @@ func (m *execMounter) Shutdown(target string) error {
 }
 
 // InUseByContainer only sees namespaces that still have a process in them,
-// which is what matters: a stopped container's namespace has none.
+// which is what matters: a stopped container's namespace has none. The device
+// comes from mountinfo, not stat: stat fails with EIO on a filesystem shut
+// down by a preempt, and teardown then retried forever.
 func (m *execMounter) InUseByContainer(mountpoint string) (bool, error) {
-	var st syscall.Stat_t
-	if err := syscall.Stat(mountpoint, &st); err != nil {
+	_, want, err := topMount(mountpoint)
+	if err != nil || want == "" {
 		return false, err
 	}
-	dev := uint64(st.Dev) // uint32 on some arches
-	want := fmt.Sprintf("%d:%d", (dev>>8)&0xfff|(dev>>32)&^0xfff, dev&0xff|(dev>>12)&^0xff)
 
 	seen := map[string]bool{}
 	for _, p := range []string{"1", "self"} {

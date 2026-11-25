@@ -188,8 +188,8 @@ func ValidateTimeouts(attach, grace time.Duration) error {
 }
 
 // ValidateLinger keeps a lingering volume clear of preemption: another node
-// waiting for it gives up a Mount attempt after 30s and preempts after the
-// grace, and a lingering volume is still mounted on this one.
+// waiting for it preempts after the grace, and a lingering volume is still
+// mounted on this one.
 func ValidateLinger(linger, grace time.Duration) error {
 	switch {
 	case linger < 0:

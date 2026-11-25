@@ -430,13 +430,15 @@ different arrays). The FlashArray host object is per node: it is found by
 the node's IQN/NQN and created as `FA_HOST_NAME` (hostname) if missing.
 
 A block volume is single-writer. On a drain swarm starts the new task while
-the old one is still stopping, so a mount first waits (up to 30s per attempt)
-for the other host to release the volume itself, which its unmount does once
-the old container is gone. Only a host that keeps it past `FA_PREEMPT_GRACE`,
-counted across Docker's retries and restarted whenever the holder changes,
-is presumed dead and has its connection
-taken over (`FA_PREEMPT_RWO=true`); until then the mount fails with a
-"waiting for … to release" error and swarm retries. A grace of `0` restores
+the old one is still stopping, so a mount first waits for the other host to
+release the volume itself, which its unmount does once the old container is
+gone. Only a host that keeps it past `FA_PREEMPT_GRACE`, counted across
+Docker's retries and restarted whenever the holder changes, is presumed dead
+and has its connection taken over (`FA_PREEMPT_RWO=true`). One mount attempt
+waits until 15 seconds short of Docker's 2-minute limit, so the default grace
+of 90 seconds is waited out and the takeover done in one attempt; with a
+longer grace the attempt fails with a "waiting for … to release" error and
+swarm retries. A grace of `0` restores
 immediate takeover, which cut writes a live node was still flushing and
 corrupted XFS. Two nodes that mount a free volume at the same moment both
 connect it; each then looks for the other, and one that sees it disconnects
@@ -466,7 +468,9 @@ is 0), so no other node preempts a volume that is only lingering.
 **Services on these volumes must update and roll back `stop-first`** (swarm's
 default). With `start-first` the old task keeps the volume until the new one
 is healthy, the new one cannot mount until the old one lets go, and after
-`FA_PREEMPT_GRACE` the old, still-live task is preempted mid-write.
+`FA_PREEMPT_GRACE` the old, still-live task is preempted mid-write. Because
+the new task's mount waits out the grace in one attempt, the update itself
+does not fail on the way.
 
 ## Migrating from the Pure plugin
 
