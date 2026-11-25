@@ -1351,18 +1351,32 @@ func (d *Driver) takeOver(ctx context.Context, an, dockerName string) error {
 	if dl, ok := ctx.Deadline(); ok {
 		wait = min(wait, time.Until(dl)-attachReserve)
 	}
-	deadline := time.Now().Add(wait)
-	for len(others) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
+	// The polls run on their own deadline so a slow answer can't eat the
+	// attach reserve.
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	for len(others) > 0 {
 		select {
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 		case <-time.After(releasePoll):
 		}
-		if others, err = d.otherHosts(ctx, an); err != nil {
+		if waitCtx.Err() != nil {
+			break
+		}
+		cur, err := d.otherHosts(waitCtx, an)
+		if err != nil {
+			if ctx.Err() == nil && waitCtx.Err() != nil {
+				// Whether the holder let go is unknown, so neither release nor preempt.
+				return fmt.Errorf("volume %s is attached to host %s and the array did not answer before the wait ran out: %w", dockerName, strings.Join(others, ","), err)
+			}
 			return err
 		}
-		if len(others) > 0 {
+		if others = cur; len(others) > 0 {
 			held = d.markHeld(an, others)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if len(others) == 0 {
 		d.clearHeld(an)
