@@ -1,11 +1,9 @@
 package mounter
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -63,19 +61,20 @@ func TestMountedAt(t *testing.T) {
 	}
 }
 
+// The device comes from mountinfo, so a filesystem shut down by a preempt,
+// whose mountpoint stat fails with EIO, is still checked.
 func TestInUseByContainer(t *testing.T) {
-	mp := t.TempDir()
-	var st syscall.Stat_t
-	if err := syscall.Stat(mp, &st); err != nil {
+	const mp, majmin = "/mnt/flasharray/v", "253:3"
+	fixture := filepath.Join(t.TempDir(), "mountinfo")
+	info := "300 29 0:90 / " + mp + " ro,relatime shared:149 - tmpfs " + guardSource + " ro,size=4k,mode=555\n" +
+		"301 300 " + majmin + " / " + mp + " rw,relatime shared:150 - xfs /dev/mapper/mpatha rw,attr2\n"
+	if err := os.WriteFile(fixture, []byte(info), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dev := uint64(st.Dev)
-	majmin := fmt.Sprintf("%d:%d", (dev>>8)&0xfff|(dev>>32)&^0xfff, dev&0xff|(dev>>12)&^0xff)
-
 	proc := t.TempDir()
-	old := procRoot
-	procRoot = proc
-	t.Cleanup(func() { procRoot = old })
+	oldInfo, oldProc := mountinfoPath, procRoot
+	mountinfoPath, procRoot = fixture, proc
+	t.Cleanup(func() { mountinfoPath, procRoot = oldInfo, oldProc })
 	addProc := func(pid, ns, mountinfo string) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Join(proc, pid, "ns"), 0o755); err != nil {
@@ -104,6 +103,9 @@ func TestInUseByContainer(t *testing.T) {
 	addProc("30", "container", line("/data"))
 	if used, err := m.InUseByContainer(mp); err != nil || !used {
 		t.Fatalf("container namespace missed: used=%v err=%v", used, err)
+	}
+	if used, err := m.InUseByContainer("/mnt/flasharray/gone"); err != nil || used {
+		t.Fatalf("nothing mounted there: used=%v err=%v", used, err)
 	}
 }
 
